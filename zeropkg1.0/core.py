@@ -7,6 +7,9 @@ import tomllib
 import shutil
 from datetime import datetime
 
+# Importa o módulo de dependências
+from plugins import deps
+
 LOGDIR = "logs"
 WORKDIR = "work"
 PKGDIR = "pkgdir"
@@ -153,11 +156,27 @@ def build_pipeline(pkg, quiet=False):
     log_message(f">>>> {pkg} instalado com sucesso! <<<<", log_file, quiet, color="green")
     print(f"Log detalhado: {os.path.abspath(log_file.name)}")
 
-def remove_pipeline(pkg, quiet=False):
-    recipe = load_recipe(pkg)
-    log_file = setup_logging(f"{pkg}-remove")
+def remove_pipeline(pkg, quiet=False, force=False, recursive=False):
+    recipes = deps.load_all_recipes()
+    dependents = deps.get_dependents(pkg, recipes)
 
+    log_file = setup_logging(f"{pkg}-remove")
     env = os.environ.copy()
+
+    if dependents and not force and not recursive:
+        log_message(f"Erro: {pkg} é requerido por: {dependents}", log_file, quiet, color="red")
+        print("Use --force para forçar ou --recursive para remover também os dependentes.")
+        return
+
+    # Se --recursive, remove dependentes antes
+    if recursive:
+        for dep_pkg in dependents:
+            remove_pipeline(dep_pkg, quiet=quiet, force=force, recursive=recursive)
+
+    recipe = recipes.get(pkg)
+    if not recipe:
+        log_message(f"Receita de {pkg} não encontrada.", log_file, quiet, color="red")
+        return
 
     # pre_remove
     run_hooks("pre_remove", recipe, "/", log_file, quiet, env)
@@ -185,13 +204,15 @@ def main():
     remove_cmd = sub.add_parser("remove", help="Remover pacote")
     remove_cmd.add_argument("package", help="Nome do pacote (sem extensão)")
     remove_cmd.add_argument("--quiet", action="store_true", help="Modo silencioso")
+    remove_cmd.add_argument("--force", action="store_true", help="Forçar remoção mesmo com dependentes")
+    remove_cmd.add_argument("--recursive", action="store_true", help="Remover também pacotes dependentes")
 
     args = parser.parse_args()
 
     if args.command == "build":
         build_pipeline(args.package, quiet=args.quiet)
     elif args.command == "remove":
-        remove_pipeline(args.package, quiet=args.quiet)
+        remove_pipeline(args.package, quiet=args.quiet, force=args.force, recursive=args.recursive)
     else:
         parser.print_help()
 
