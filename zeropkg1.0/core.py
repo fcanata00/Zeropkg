@@ -1,158 +1,197 @@
-
 #!/usr/bin/env python3
-import argparse
-import logging
 import os
 import sys
-import time
+import subprocess
+import argparse
+import tomllib
+import shutil
+from datetime import datetime
 
-# futuramente vamos precisar
-# import psutil
-# import tqdm
-# import importlib, pkgutil
+LOGDIR = "logs"
+WORKDIR = "work"
+PKGDIR = "pkgdir"
 
-LOG_DIR = "logs"
-WORK_DIR = "work"
+# ========= Utilidades =========
 
-# ==========================
-# Plugin Management
-# ==========================
-PLUGINS = {}
+def log_message(msg, log_file, quiet=False, color=None):
+    colors = {
+        "green": "\033[92m",
+        "yellow": "\033[93m",
+        "red": "\033[91m",
+        "blue": "\033[94m",
+        "reset": "\033[0m",
+    }
+    prefix = f"{colors.get(color,'')}{msg}{colors['reset'] if color else ''}"
+    if not quiet:
+        print(prefix)
+    log_file.write(f"[{datetime.now()}] {msg}\n")
+    log_file.flush()
 
-def load_plugins():
-    """Carrega automaticamente todos os plugins de zeropkg1.0/plugins"""
-    # TODO: usar pkgutil/importlib para importar dinamicamente
-    # cada plugin deve se auto-registrar chamando register_plugin
-    pass
-
-def register_plugin(kind, name, plugin_class):
-    """Registra um plugin para uso"""
-    if kind not in PLUGINS:
-        PLUGINS[kind] = {}
-    PLUGINS[kind][name] = plugin_class
-
-def get_plugin(kind, name):
-    """Obtém plugin pelo tipo e nome"""
-    return PLUGINS.get(kind, {}).get(name)
-
-# ==========================
-# Pipeline Steps
-# ==========================
-def resolve_dependencies(pkg):
-    """Resolve dependências do pacote"""
-    # TODO: chamar plugin de dependency resolver
-    log_step(pkg, "Resolvendo dependências")
-    pass
-
-def fetch_sources(pkg):
-    """Baixa o tarball/origem"""
-    # TODO: chamar plugin fetcher (http/ftp/git)
-    log_step(pkg, "Baixando fontes")
-    pass
-
-def unpack_sources(pkg):
-    """Descompacta o tarball"""
-    # TODO: chamar plugin unpacker (tar/zip/xz)
-    log_step(pkg, "Descompactando fontes")
-    pass
-
-def apply_patches(pkg):
-    """Aplica patches no código-fonte"""
-    # TODO: chamar plugin patcher
-    log_step(pkg, "Aplicando patches")
-    pass
-
-def run_hooks(pkg, stage):
-    """Executa hooks configurados em cada estágio"""
-    # TODO: chamar plugin hooks
-    log_step(pkg, f"Executando hooks no estágio {stage}")
-    pass
-
-def build_package(pkg):
-    """Executa compilação"""
-    # TODO: plugin builder (autotools/cmake/meson/custom)
-    log_step(pkg, "Construindo pacote")
-    pass
-
-def install_pkgdir(pkg):
-    """Instala no diretório fakeroot"""
-    # TODO: plugin installer
-    log_step(pkg, "Instalando em pkgdir (fakeroot)")
-    pass
-
-def package_tarball(pkg):
-    """Empacota resultado em .pkg.tar.gz"""
-    # TODO: plugin packager
-    log_step(pkg, "Empacotando pacote final")
-    pass
-
-def install_system(pkg):
-    """Instala no sistema (/)"""
-    # TODO: plugin system installer
-    log_step(pkg, "Instalando no sistema /")
-    pass
-
-# ==========================
-# Logging and Output
-# ==========================
 def setup_logging(pkg):
-    os.makedirs(LOG_DIR, exist_ok=True)
-    log_path = os.path.join(LOG_DIR, f"{pkg}-build.log")
-    logging.basicConfig(
-        filename=log_path,
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(message)s"
-    )
-    return log_path
+    os.makedirs(LOGDIR, exist_ok=True)
+    log_path = os.path.join(LOGDIR, f"{pkg}.log")
+    return open(log_path, "w", encoding="utf-8")
 
-def log_step(pkg, message):
-    """Loga no arquivo e imprime na tela"""
-    logging.info(message)
-    print(f">>>> {message} <<<<")
+def load_recipe(pkg):
+    recipe_path = os.path.join("recipes", f"{pkg}.toml")
+    if not os.path.exists(recipe_path):
+        raise FileNotFoundError(f"Receita não encontrada: {recipe_path}")
+    with open(recipe_path, "rb") as f:
+        return tomllib.load(f)
 
-# ==========================
-# Build Pipeline
-# ==========================
+def run_commands(commands, workdir, log_file, quiet=False, env=None):
+    for cmd in commands:
+        log_message(f"Executando: {cmd}", log_file, quiet, color="blue")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=workdir,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env
+        )
+        for line in proc.stdout:
+            decoded = line.decode("utf-8", errors="ignore")
+            log_file.write(decoded)
+            if not quiet:
+                print(decoded, end="")
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(f"Falha ao executar: {cmd}")
+
+def run_hooks(hook_stage, recipe, workdir, log_file, quiet=False, env=None):
+    hooks = recipe.get("hooks", {})
+    if hook_stage in hooks:
+        log_message(f"[HOOK] {hook_stage}", log_file, quiet, color="blue")
+        run_commands(hooks[hook_stage], workdir, log_file, quiet, env)
+
+# ========= Funções principais =========
+
+def fetch_sources(pkg, url, log_file, quiet=False):
+    os.makedirs(WORKDIR, exist_ok=True)
+    filename = os.path.join(WORKDIR, os.path.basename(url))
+    if not os.path.exists(filename):
+        log_message(f">>>> Baixando {pkg} <<<<", log_file, quiet, color="blue")
+        cmd = ["wget", "-O", filename, url]
+        subprocess.check_call(cmd)
+    else:
+        log_message(f"Fonte já existe: {filename}", log_file, quiet)
+    return filename
+
+def unpack_sources(pkg, tarball, log_file, quiet=False):
+    src_dir = os.path.join(WORKDIR, f"{pkg}-src")
+    if os.path.exists(src_dir):
+        shutil.rmtree(src_dir)
+    os.makedirs(src_dir, exist_ok=True)
+    log_message(f">>>> Descompactando {pkg} em {src_dir} <<<<", log_file, quiet, color="yellow")
+    subprocess.check_call(["tar", "--strip-components=1", "-xf", tarball, "-C", src_dir])
+    return src_dir
+
+def apply_patches(pkg, src_dir, patches, log_file, quiet=False):
+    for patch in patches:
+        log_message(f">>>> Aplicando patch {patch['file']} <<<<", log_file, quiet, color="green")
+        subprocess.check_call(
+            ["patch", f"-p{patch['strip']}", "-i", patch["file"]],
+            cwd=src_dir
+        )
+
+# ========= Pipelines =========
+
 def build_pipeline(pkg, quiet=False):
-    log_path = setup_logging(pkg)
+    recipe = load_recipe(pkg)
+    log_file = setup_logging(pkg)
 
-    steps = [
-        resolve_dependencies,
-        fetch_sources,
-        unpack_sources,
-        apply_patches,
-        lambda p: run_hooks(p, "pre-build"),
-        build_package,
-        install_pkgdir,
-        package_tarball,
-        install_system,
-        lambda p: run_hooks(p, "post-build"),
-    ]
+    env = os.environ.copy()
+    env["PKGDIR"] = os.path.abspath(PKGDIR)
 
-    for step in steps:
-        # TODO: se quiet=True → mostrar só status bonito + progresso
-        step(pkg)
-        time.sleep(1)  # simulação
+    # pre_fetch
+    run_hooks("pre_fetch", recipe, ".", log_file, quiet, env)
 
-    print(f">>>> Programa {pkg} instalado com sucesso <<<<")
-    print(f">>>> Para detalhes veja: {log_path} <<<<")
+    # fetch
+    tarball = fetch_sources(pkg, recipe["source"]["url"], log_file, quiet)
 
-# ==========================
-# CLI
-# ==========================
-def main():
-    parser = argparse.ArgumentParser(prog="zeropkg")
-    sub = parser.add_subparsers(dest="command")
+    # post_fetch
+    run_hooks("post_fetch", recipe, ".", log_file, quiet, env)
+
+    # pre_unpack
+    run_hooks("pre_unpack", recipe, ".", log_file, quiet, env)
+
+    # unpack
+    src_dir = unpack_sources(pkg, tarball, log_file, quiet)
+
+    # post_unpack
+    run_hooks("post_unpack", recipe, src_dir, log_file, quiet, env)
+
+    # patches
+    if "patches" in recipe:
+        run_hooks("pre_patch", recipe, src_dir, log_file, quiet, env)
+        apply_patches(pkg, src_dir, recipe["patches"], log_file, quiet)
+        run_hooks("post_patch", recipe, src_dir, log_file, quiet, env)
 
     # build
-    p_build = sub.add_parser("build", help="Compila e instala pacote")
-    p_build.add_argument("package", help="Nome do pacote")
-    p_build.add_argument("--quiet", action="store_true", help="Oculta log detalhado e mostra apenas progresso resumido")
+    if "build" in recipe:
+        run_hooks("pre_build", recipe, src_dir, log_file, quiet, env)
+        run_commands(recipe["build"]["commands"], src_dir, log_file, quiet, env)
+        run_hooks("post_build", recipe, src_dir, log_file, quiet, env)
+
+    # check
+    if "check" in recipe:
+        run_hooks("pre_check", recipe, src_dir, log_file, quiet, env)
+        run_commands(recipe["check"]["commands"], src_dir, log_file, quiet, env)
+        run_hooks("post_check", recipe, src_dir, log_file, quiet, env)
+
+    # install
+    if "install" in recipe:
+        run_hooks("pre_install", recipe, src_dir, log_file, quiet, env)
+        os.makedirs(PKGDIR, exist_ok=True)
+        run_commands(recipe["install"]["commands"], src_dir, log_file, quiet, env)
+        run_hooks("post_install", recipe, src_dir, log_file, quiet, env)
+
+    # final hook
+    run_hooks("post_all", recipe, src_dir, log_file, quiet, env)
+
+    log_message(f">>>> {pkg} instalado com sucesso! <<<<", log_file, quiet, color="green")
+    print(f"Log detalhado: {os.path.abspath(log_file.name)}")
+
+def remove_pipeline(pkg, quiet=False):
+    recipe = load_recipe(pkg)
+    log_file = setup_logging(f"{pkg}-remove")
+
+    env = os.environ.copy()
+
+    # pre_remove
+    run_hooks("pre_remove", recipe, "/", log_file, quiet, env)
+
+    if "remove" in recipe:
+        log_message(f">>>> Removendo {pkg} <<<<", log_file, quiet, color="red")
+        run_commands(recipe["remove"]["commands"], "/", log_file, quiet, env)
+
+    # post_remove
+    run_hooks("post_remove", recipe, "/", log_file, quiet, env)
+
+    log_message(f">>>> {pkg} removido com sucesso! <<<<", log_file, quiet, color="green")
+    print(f"Log detalhado: {os.path.abspath(log_file.name)}")
+
+# ========= CLI =========
+
+def main():
+    parser = argparse.ArgumentParser(description="ZeroPKG - Gerenciador de build")
+    sub = parser.add_subparsers(dest="command")
+
+    build_cmd = sub.add_parser("build", help="Construir pacote")
+    build_cmd.add_argument("package", help="Nome do pacote (sem extensão)")
+    build_cmd.add_argument("--quiet", action="store_true", help="Modo silencioso")
+
+    remove_cmd = sub.add_parser("remove", help="Remover pacote")
+    remove_cmd.add_argument("package", help="Nome do pacote (sem extensão)")
+    remove_cmd.add_argument("--quiet", action="store_true", help="Modo silencioso")
 
     args = parser.parse_args()
 
     if args.command == "build":
         build_pipeline(args.package, quiet=args.quiet)
+    elif args.command == "remove":
+        remove_pipeline(args.package, quiet=args.quiet)
     else:
         parser.print_help()
 
