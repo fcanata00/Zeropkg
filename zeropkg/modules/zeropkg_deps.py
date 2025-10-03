@@ -1,144 +1,125 @@
+#!/usr/bin/env python3
 """
 zeropkg_deps.py
-
-Gerenciamento avançado de dependências no Zeropkg.
-Suporta:
-- Tipos de dependência (build/runtime/optional)
-- Resolução recursiva com detecção de ciclos
-- Comparação de versões básica (>=, <=, ==)
-- Explicação do grafo de dependências
+Gerenciamento avançado de dependências para Zeropkg.
 """
 
-import os
 import logging
-from typing import List, Dict, Set, Optional, Tuple, Any
-from zeropkg_db import connect, get_package
-from zeropkg_toml import parse_toml, PackageMeta
+from collections import defaultdict, deque
+
+from zeropkg_logger import log_event
+from zeropkg_db import DBManager
+from zeropkg_toml import load_toml
 
 logger = logging.getLogger("zeropkg.deps")
 
-class DependencyError(Exception):
-    pass
 
-# --- helpers de versão ---
-def _parse_version_constraint(dep: str) -> Tuple[str, str, Optional[str]]:
-    """
-    Retorna (nome, operador, versão)
-    Ex: "glibc>=2.38" -> ("glibc", ">=", "2.38")
-    """
-    for op in [">=", "<=", "==", ">", "<", "~"]:
-        if op in dep:
-            name, ver = dep.split(op, 1)
-            return name.strip(), op, ver.strip()
-    if ":" in dep:
-        name, ver = dep.split(":", 1)
-        return name.strip(), "==", ver.strip()
-    return dep.strip(), "any", None
+class DependencyResolver:
+    def __init__(self, db_path, ports_dir):
+        self.db = DBManager(db_path)
+        self.ports_dir = ports_dir
 
-def _version_satisfies(installed: str, op: str, required: Optional[str]) -> bool:
-    if not required or op == "any":
-        return True
-    try:
-        def to_tuple(v): return tuple(map(int, v.split(".")))
-        iv, rv = to_tuple(installed), to_tuple(required)
-    except Exception:
-        return True  # fallback: não falhar se versão for estranha
-    if op == "==": return iv == rv
-    if op == ">=": return iv >= rv
-    if op == "<=": return iv <= rv
-    if op == ">":  return iv > rv
-    if op == "<":  return iv < rv
-    if op == "~":  return iv[0] == rv[0]  # mesma major
-    return True
+    def _load_deps_from_toml(self, pkg_name):
+        """Carrega dependências de um pacote via TOML."""
+        meta = load_toml(self.ports_dir, pkg_name)
+        deps = {
+            "runtime": meta.get("dependencies", {}).get("runtime", []),
+            "build": meta.get("dependencies", {}).get("build", []),
+            "optional": meta.get("dependencies", {}).get("optional", []),
+        }
+        return deps
 
-# --- resolução ---
-def resolve_dependencies(meta: PackageMeta,
-                         ports_dir="/usr/ports",
-                         db_path="/var/lib/zeropkg/installed.sqlite3",
-                         include_optional=False) -> List[str]:
-    """
-    Resolve dependências de um pacote (recursivamente).
-    Retorna lista ordenada de pacotes a instalar.
-    """
+    def resolve_graph(self, pkg_name, include_build=False):
+        """
+        Resolve dependências em forma de grafo (BFS).
+        Retorna lista ordenada de pacotes a instalar.
+        """
+        graph = defaultdict(list)
+        visited = set()
+        order = []
+        queue = deque([pkg_name])
 
-    deps = getattr(meta, "dependencies", [])
-    resolved: List[str] = []
-    visiting: Set[str] = set()
-    visited: Set[str] = set()
+        while queue:
+            current = queue.popleft()
+            if current in visited:
+                continue
+            visited.add(current)
 
-    def visit(dep: Any):
-        if isinstance(dep, dict):
-            name = dep.get("name")
-            dtype = dep.get("type", "runtime")
-            constraint = dep.get("version")
-        else:
-            name, op, constraint = _parse_version_constraint(str(dep))
-            dtype, dep = "runtime", dep
+            deps = self._load_deps_from_toml(current)
+            all_deps = deps["runtime"] + (deps["build"] if include_build else [])
+            graph[current] = all_deps
 
-        if dtype == "optional" and not include_optional:
-            logger.info(f"Ignorando dependência opcional: {name}")
-            return
+            for dep in all_deps:
+                if dep not in visited:
+                    queue.append(dep)
 
-        key = f"{name}:{constraint or ''}"
-        if key in visited:
-            return
-        if key in visiting:
-            raise DependencyError(f"Ciclo detectado em dependência: {key}")
-        visiting.add(key)
-
-        # 1. verificar se já instalado
-        conn = connect(db_path)
-        pkg = get_package(conn, name)
-        conn.close()
-        if pkg:
-            if _version_satisfies(pkg["version"], op if 'op' in locals() else "any", constraint):
-                logger.info(f"Dependência já instalada: {name} {pkg['version']}")
-                visiting.remove(key)
-                visited.add(key)
+        # Ordenar pacotes (dependências antes do alvo)
+        def dfs(node, seen, stack):
+            if node in seen:
                 return
-            else:
-                raise DependencyError(f"Versão instalada de {name} não satisfaz {op}{constraint}")
+            seen.add(node)
+            for dep in graph.get(node, []):
+                dfs(dep, seen, stack)
+            stack.append(node)
 
-        # 2. carregar receita do repo
-        metafile = os.path.join(ports_dir, name, f"{name}.toml")
-        if not os.path.isfile(metafile):
-            raise DependencyError(f"Metafile não encontrado para dependência: {dep}")
-        dep_meta = parse_toml(metafile)
+        stack = []
+        dfs(pkg_name, set(), stack)
+        order = stack[::-1]
 
-        # 3. resolver dependências dela primeiro
-        for subdep in getattr(dep_meta, "dependencies", []):
-            visit(subdep)
+        return order
 
-        # 4. adicionar dependência atual
-        resolved.append(name)
-        visiting.remove(key)
-        visited.add(key)
+    def detect_cycles(self, pkg_name):
+        """Detecta ciclos no grafo de dependências."""
+        graph = defaultdict(list)
+        deps = self._load_deps_from_toml(pkg_name)
+        graph[pkg_name] = deps["runtime"] + deps["build"]
 
-    for dep in deps:
-        visit(dep)
+        visited = set()
+        stack = set()
 
-    return resolved
+        def visit(node):
+            if node in stack:
+                return True
+            if node in visited:
+                return False
+            visited.add(node)
+            stack.add(node)
+            for dep in graph.get(node, []):
+                if visit(dep):
+                    return True
+            stack.remove(node)
+            return False
 
-def explain_dependencies(meta: PackageMeta,
-                         ports_dir="/usr/ports",
-                         db_path="/var/lib/zeropkg/installed.sqlite3",
-                         depth=0,
-                         include_optional=False):
-    """Imprime árvore de dependências com indentação."""
-    deps = getattr(meta, "dependencies", [])
-    prefix = "  " * depth
-    for dep in deps:
-        if isinstance(dep, dict):
-            name = dep.get("name")
-            dtype = dep.get("type", "runtime")
-            constraint = dep.get("version")
-            dep_str = f"{name} ({dtype}{' '+constraint if constraint else ''})"
-        else:
-            dep_str = str(dep)
-        print(f"{prefix}└─ {dep_str}")
+        return visit(pkg_name)
 
-        name = dep["name"] if isinstance(dep, dict) else str(dep).split(":")[0]
-        metafile = os.path.join(ports_dir, name, f"{name}.toml")
-        if os.path.isfile(metafile):
-            dep_meta = parse_toml(metafile)
-            explain_dependencies(dep_meta, ports_dir, db_path, depth+1, include_optional)
+    def missing_deps(self, pkg_name):
+        """Retorna dependências faltando (não instaladas)."""
+        deps = self._load_deps_from_toml(pkg_name)
+        missing = []
+        for dep in deps["runtime"] + deps["build"]:
+            if not self.db.is_installed(dep):
+                missing.append(dep)
+        return missing
+
+    def reverse_deps(self, pkg_name):
+        """Encontra pacotes que dependem do pacote dado."""
+        revdeps = []
+        installed = self.db.list_installed()
+        for pkg in installed:
+            deps = self._load_deps_from_toml(pkg)
+            if pkg_name in deps["runtime"] or pkg_name in deps["build"]:
+                revdeps.append(pkg)
+        return revdeps
+
+
+# Funções auxiliares
+def resolve_and_install(resolver, pkg_name, builder, installer, args):
+    """
+    Resolve dependências e instala todas em ordem correta.
+    """
+    order = resolver.resolve_graph(pkg_name, include_build=True)
+    for dep in order:
+        if not resolver.db.is_installed(dep):
+            log_event("deps", "install", f"Instalando dependência {dep}")
+            builder.build(dep, args)
+            installer.install(dep, args)
