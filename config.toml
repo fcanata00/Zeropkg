@@ -1,13 +1,59 @@
-[repo]
-# Diretório local onde ficam as receitas
+[paths]
+# raiz onde os pacotes serão instalados
+# no LFS → use "/mnt/lfs"
+root = "/"
+
+# diretório para armazenar fontes baixados
+cache_dir = "/usr/ports/distfiles"
+
+# diretório temporário de build
+build_root = "/var/zeropkg/build"
+
+# diretório com as receitas (metafiles .toml)
+ports_dir = "/usr/ports"
+
+# banco de dados de pacotes instalados (sqlite3)
+db_path = "/var/lib/zeropkg/installed.sqlite3"
+
+# onde guardar pacotes binários gerados
+packages_dir = "/var/zeropkg/packages"
+
+[options]
+# usar fakeroot por padrão?
+fakeroot = true
+
+# usar chroot por padrão?
+chroot = false
+
+# manter logs detalhados
+verbose_logs = true
+
+# número de jobs paralelos no make
+make_jobs = 4
+
+[repos]
+# repositório local
 local = "/usr/ports"
 
-# URL do repositório remoto (git)
-remote = "https://github.com/fcanata00/Zeropkg-ports.git"
+# repositório remoto principal
+remote = "https://github.com/fcanata00/Zeropkg-Ports.git"
 
-# Branch principal
-branch = "main"
+# mirrors opcionais
+mirrors = [
+    "https://mirror1.example.org/zeropkg",
+    "https://mirror2.example.org/zeropkg"
+]
 
-[sync]
-# Se quiser sobrescrever local ao sync
-force = true
+[network]
+# tempo de timeout em segundos
+timeout = 30
+# número de tentativas antes de falhar
+retries = 3
+
+[chroot]
+# quando for construir um LFS ou sistema isolado
+# onde o Zeropkg vai preparar o chroot
+mounts = ["/dev", "/proc", "/sys", "/run"]
+
+# copiar resolv.conf para ter internet no chroot?
+copy_resolv = true
