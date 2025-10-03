@@ -6,18 +6,6 @@ Gerenciamento do banco de dados SQLite para Zeropkg:
 - builds
 - eventos / logs
 - consultas revdep / depclean
-
-Uso padrão:
-    init_db(path)
-    conn = connect(path)
-    package_id = register_package(conn, meta, pkgfile, files_list, build_id)
-    ...
-    remove_package(conn, name, version)
-    list_installed(conn)
-    get_package(conn, name, version)
-    record_build_start/finish
-    record_event / query_events
-    find_revdeps(conn, pkg_name)
 """
 
 import sqlite3
@@ -101,13 +89,7 @@ def register_package(conn: sqlite3.Connection,
                      pkgfile: Optional[str],
                      files_list: List[Tuple[str, Optional[str]]],
                      build_id: Optional[int] = None) -> int:
-    """
-    Registra um pacote no banco, com sua lista de arquivos.
-    meta: PackageMeta ou objeto com name/version/variant/dependencies
-    files_list: lista de (path, file_hash)
-    build_id: opcional, para ligar build prévio
-    Retorna: package_id (int)
-    """
+    """Registra um pacote no banco, com sua lista de arquivos."""
     deps = getattr(meta, "dependencies", None)
     deps_json = json.dumps(deps) if deps is not None else json.dumps([])
 
@@ -134,7 +116,6 @@ def register_package(conn: sqlite3.Connection,
           "installed"))
     conn.commit()
 
-    # buscar id
     cur.execute("""
         SELECT id FROM packages WHERE name=? AND version=? AND variant IS ?
     """, (getattr(meta, "name", None),
@@ -145,7 +126,6 @@ def register_package(conn: sqlite3.Connection,
         raise RuntimeError("Falha ao recuperar package id")
     pkg_id = row["id"]
 
-    # inserir arquivos
     for path, fhash in files_list:
         try:
             cur.execute("""
@@ -181,10 +161,7 @@ def get_package(conn: sqlite3.Connection, name: str, version: Optional[str] = No
     return dict(row) if row else None
 
 def remove_package(conn: sqlite3.Connection, name: str, version: Optional[str] = None) -> List[str]:
-    """
-    Remove registro do pacote (e arquivos correspondentes pelo ON DELETE CASCADE).
-    Retorna lista de paths de arquivos registrados.
-    """
+    """Remove registro do pacote e retorna lista de paths."""
     cur = conn.cursor()
     if version:
         cur.execute("SELECT id FROM packages WHERE name=? AND version=? LIMIT 1", (name, version))
@@ -237,6 +214,16 @@ def record_event(conn: sqlite3.Connection, level: str, component: str, message: 
     conn.commit()
     return cur.lastrowid
 
+# --- alias para integração com zeropkg_logger ---
+def log_event(pkg_name: str, stage: str, message: str, level: str = "INFO") -> None:
+    """Compatível com zeropkg_logger.log_event → grava evento no DB."""
+    db_path = "/var/lib/zeropkg/installed.sqlite3"
+    conn = connect(db_path)
+    try:
+        record_event(conn, level, f"{pkg_name}:{stage}", message)
+    finally:
+        conn.close()
+
 def query_events(conn: sqlite3.Connection, limit: int = 100) -> List[Dict[str, Any]]:
     cur = conn.cursor()
     cur.execute("""
@@ -245,10 +232,7 @@ def query_events(conn: sqlite3.Connection, limit: int = 100) -> List[Dict[str, A
     return [dict(row) for row in cur.fetchall()]
 
 def find_revdeps(conn: sqlite3.Connection, pkg_name: str) -> List[Dict[str, Any]]:
-    """
-    Retorna os pacotes instalados que dependem de pkg_name.
-    Assume que dependencies_json é JSON de lista de dicts ou strings com 'name' campo.
-    """
+    """Retorna os pacotes instalados que dependem de pkg_name."""
     cur = conn.cursor()
     cur.execute("SELECT id, name, version, dependencies_json FROM packages")
     res = []
