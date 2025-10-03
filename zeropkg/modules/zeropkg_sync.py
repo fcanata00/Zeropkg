@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
+"""
+zeropkg_sync.py - Sincronização de repositório do Zeropkg
+"""
+
 import os
 import subprocess
 import logging
 
-# usa o módulo de config unificado
 from zeropkg_config import get_repo, get_sync
+from zeropkg_logger import log_event
 
 
-def run_cmd(cmd, cwd=None):
+def run_cmd(cmd, cwd=None) -> str:
     logging.info(f"Executando: {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -18,7 +22,7 @@ def run_cmd(cmd, cwd=None):
 
 def sync_repos(local=None, remote=None, branch=None, force=None):
     """
-    Sincroniza o repositório de ports.
+    Sincroniza o(s) repositório(s) de ports.
     Se parâmetros não forem passados, lê do config.
     Retorna dict com status.
     """
@@ -32,14 +36,14 @@ def sync_repos(local=None, remote=None, branch=None, force=None):
 
     os.makedirs(repo_local, exist_ok=True)
 
-    status = {"action": None, "branch": branch, "path": repo_local}
+    status = {"action": None, "branch": branch, "path": repo_local, "commit": None}
 
     if not os.path.exists(os.path.join(repo_local, ".git")):
-        print(f"[*] Clonando {repo_remote} em {repo_local}")
+        log_event("sync", "repo", f"Clonando {repo_remote} em {repo_local}")
         run_cmd(["git", "clone", "-b", branch, repo_remote, repo_local])
         status["action"] = "cloned"
     else:
-        print(f"[*] Atualizando repositório em {repo_local}")
+        log_event("sync", "repo", f"Atualizando repositório em {repo_local}")
         if force:
             run_cmd(["git", "fetch", "--all"], cwd=repo_local)
             run_cmd(["git", "reset", "--hard", f"origin/{branch}"], cwd=repo_local)
@@ -48,5 +52,13 @@ def sync_repos(local=None, remote=None, branch=None, force=None):
             run_cmd(["git", "pull", "origin", branch], cwd=repo_local)
             status["action"] = "updated"
 
-    print("[+] Sincronização concluída com sucesso!")
+    # pegar commit atual
+    try:
+        commit = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_local)
+        status["commit"] = commit.strip()
+        log_event("sync", "repo", f"HEAD atualizado para {commit}")
+    except Exception:
+        status["commit"] = None
+
+    print(f"[+] Sincronização concluída: {status['action']} @ {status['commit'] or 'desconhecido'}")
     return status
