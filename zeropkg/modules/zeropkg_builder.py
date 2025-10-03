@@ -1,22 +1,22 @@
 """
-zeropkg_builder.py
+zeropkg_builder.py - Builder do Zeropkg (versão final)
 
-Builder principal do Zeropkg — versão revisada para LFS:
-- Resolve dependências
-- Suporte a fakeroot/chroot
-- Logs por fase
-- Controle configurável de jobs
-- Retorno estruturado
+- Resolve dependências (zeropkg_deps)
+- Baixa fontes (zeropkg_downloader)
+- Aplica patches/hooks (zeropkg_patcher)
+- Constrói (configure/make)
+- Instala em staging
+- Empacota em tar.xz
+- Instala no root (zeropkg_installer)
+- Registra no DB (build start/finish + vinculação package-build)
 """
 
 import os
 import tarfile
 import shutil
 import subprocess
-import tempfile
 import logging
-from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from zeropkg_downloader import Downloader
 from zeropkg_patcher import Patcher
@@ -28,12 +28,14 @@ from zeropkg_toml import PackageMeta, package_id
 
 logger = logging.getLogger("zeropkg.builder")
 
+
 class BuildError(Exception):
     pass
 
 
 class Builder:
-    def __init__(self, meta: PackageMeta,
+    def __init__(self,
+                 meta: PackageMeta,
                  cache_dir="/usr/ports/distfiles",
                  pkg_cache="/var/zeropkg/packages",
                  build_root="/var/zeropkg/build",
@@ -51,6 +53,9 @@ class Builder:
         self.chroot = chroot
         self.db_path = db_path
 
+    # -------------------------------------
+    # helpers
+    # -------------------------------------
     def _run(self, cmd, cwd=None, env=None, stage="build"):
         log_event(self.meta.name, stage, f"Executando: {cmd}")
         if self.dry_run:
@@ -83,8 +88,14 @@ class Builder:
                     raise BuildError("Tentativa de path traversal no tar")
             tf.extractall(path=dest)
 
+    # -------------------------------------
+    # build principal
+    # -------------------------------------
     def build(self, dir_install: Optional[str] = None) -> Dict[str, Any]:
-        """Executa o build completo do pacote. Retorna dict com status e caminho do pacote."""
+        """
+        Executa o build completo do pacote.
+        Retorna dict com status, caminho do pacote e build_id.
+        """
         os.makedirs(self.build_root, exist_ok=True)
         os.makedirs(self.pkg_cache, exist_ok=True)
 
@@ -112,11 +123,11 @@ class Builder:
 
             # 2. baixar fontes
             dl = Downloader("/usr/ports", self.cache_dir, dry_run=self.dry_run)
-            sources = []
+            sources: List[str] = []
             for s in self.meta.sources:
                 sources.append(dl.fetch(s))
 
-            # 3. extrair fonte
+            # 3. extrair fontes
             srcdir = os.path.join(self.build_root, f"{self.meta.name}-{self.meta.version}")
             if os.path.exists(srcdir):
                 shutil.rmtree(srcdir)
@@ -153,14 +164,17 @@ class Builder:
                 with tarfile.open(pkgfile, "w:xz") as tf:
                     tf.add(staging, arcname="/")
 
-            # 11. instalar no root, se solicitado
+            # 11. instalar no root se solicitado
             if dir_install:
-                installer = Installer(db_path=self.db_path, dry_run=self.dry_run, root=dir_install)
-                installer.install(pkgfile, self.meta)
+                installer = Installer(db_path=self.db_path,
+                                      dry_run=self.dry_run,
+                                      root=dir_install,
+                                      use_fakeroot=self.use_fakeroot)
+                installer.install(pkgfile, self.meta, hooks=self.meta.hooks, build_id=build_id)
 
-            # finalizar build
+            # --- sucesso ---
             conn = connect(self.db_path)
-            record_build_finish(conn, build_id, "success")
+            record_build_finish(conn, build_id, "success", log_path=None)
             conn.close()
             return {"status": "success", "pkgfile": pkgfile, "build_id": build_id}
 
