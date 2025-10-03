@@ -1,10 +1,11 @@
 """
 zeropkg_upgrade.py
 
-Módulo de upgrade para Zeropkg — versão com grafo global.
-- resolve_dependencies individuais
-- upgrade_package
-- upgrade_all agora faz grafo global e ordena pacotes (topological sort)
+Módulo de upgrade para Zeropkg — versão revisada:
+- Remove a versão antiga antes de instalar a nova
+- Executa hooks de pre_remove/post_remove
+- Mantém backup e rollback em caso de falha
+- Suporta upgrade individual e global (grafo com topological sort)
 """
 
 import os
@@ -89,7 +90,11 @@ def upgrade_package(
 ) -> bool:
     """
     Atualiza um pacote para a versão mais nova encontrada.
-    Resolve dependências automaticamente antes do build.
+    Fluxo:
+      1. Resolve dependências
+      2. Remove versão antiga (se instalada)
+      3. Constrói e instala nova versão
+      4. Rollback em caso de falha
     """
     conn = connect(db_path)
     installed = get_package(conn, pkgname)
@@ -143,6 +148,15 @@ def upgrade_package(
             shutil.copy2(old_pkgfile, backup_pkg)
             log_event(pkgname, "upgrade", f"Backup criado: {backup_pkg}")
 
+    # Remover versão antiga antes de instalar
+    if installed:
+        try:
+            inst = Installer(db_path=db_path, dry_run=dry_run, root=root)
+            inst.remove(pkgname, current_version)
+            log_event(pkgname, "upgrade", f"Versão antiga {current_version} removida com sucesso")
+        except Exception as e:
+            log_event(pkgname, "upgrade", f"Falha ao remover versão antiga: {e}", level="warning")
+
     # Construir e instalar nova versão
     try:
         builder = Builder(latest_meta, cache_dir=pkg_cache, pkg_cache=pkg_cache,
@@ -183,7 +197,6 @@ def upgrade_all(
     installed = list_installed(conn)
     conn.close()
 
-    # Construir grafo {pkg: [deps]}
     graph: Dict[str, Set[str]] = {}
     to_upgrade: Dict[str, PackageMeta] = {}
 
@@ -194,12 +207,10 @@ def upgrade_all(
             continue
         latest_meta = parse_toml(latest_path)
         if compare_versions(latest_meta.version, pkg["version"]) > 0:
-            # precisa de upgrade
             to_upgrade[name] = latest_meta
             deps = resolve_dependencies(latest_meta, ports_dir=ports_dir, db_path=db_path)
             graph[name] = set(deps)
 
-    # Topological sort
     order: List[str] = []
     visited: Set[str] = set()
     temp: Set[str] = set()
@@ -220,7 +231,6 @@ def upgrade_all(
     for pkg in to_upgrade:
         visit(pkg)
 
-    # Executar upgrades na ordem
     results: List[Tuple[str, bool]] = []
     for pkg in order:
         try:
