@@ -1,14 +1,12 @@
 """
-zeropkg_builder.py - Builder do Zeropkg (versão final)
+zeropkg_builder.py - Builder do Zeropkg (integrado com novo Downloader)
 
 - Resolve dependências (zeropkg_deps)
-- Baixa fontes (zeropkg_downloader)
-- Aplica patches/hooks (zeropkg_patcher)
-- Constrói (configure/make)
-- Instala em staging
+- Baixa múltiplas fontes com downloader (http, ftp, file, git, rsync, scp)
+- Verifica e aplica patches/hooks
+- Constrói e instala em staging
 - Empacota em tar.xz
-- Instala no root (zeropkg_installer)
-- Registra no DB (build start/finish + vinculação package-build)
+- Integra com Installer e DB
 """
 
 import os
@@ -18,7 +16,7 @@ import subprocess
 import logging
 from typing import Optional, Dict, Any, List
 
-from zeropkg_downloader import Downloader
+from zeropkg_downloader import download_package
 from zeropkg_patcher import Patcher
 from zeropkg_logger import log_event
 from zeropkg_db import connect, record_build_start, record_build_finish
@@ -91,7 +89,7 @@ class Builder:
     # -------------------------------------
     # build principal
     # -------------------------------------
-    def build(self, dir_install: Optional[str] = None) -> Dict[str, Any]:
+    def build(self, dir_install: Optional[str] = None, parallel_download: bool = False) -> Dict[str, Any]:
         """
         Executa o build completo do pacote.
         Retorna dict com status, caminho do pacote e build_id.
@@ -121,19 +119,25 @@ class Builder:
             for dep in deps:
                 log_event(self.meta.name, "deps", f"Dependência requerida: {dep}")
 
-            # 2. baixar fontes
-            dl = Downloader("/usr/ports", self.cache_dir, dry_run=self.dry_run)
-            sources: List[str] = []
-            for s in self.meta.sources:
-                sources.append(dl.fetch(s))
+            # 2. baixar fontes (agora retorna lista de dicts)
+            sources_info: List[Dict[str, Any]] = download_package(
+                self.meta,
+                cache_dir=self.cache_dir,
+                prefer_existing=True,
+                verbose=True,
+                parallel=parallel_download
+            )
 
             # 3. extrair fontes
             srcdir = os.path.join(self.build_root, f"{self.meta.name}-{self.meta.version}")
             if os.path.exists(srcdir):
                 shutil.rmtree(srcdir)
             os.makedirs(srcdir, exist_ok=True)
-            for src in sources:
-                self._extract(src, srcdir)
+
+            for entry in sources_info:
+                src_path = entry["path"]
+                log_event(self.meta.name, "fetch", f"Fonte obtida: {src_path} (cache={entry['from_cache']})")
+                self._extract(src_path, srcdir)
 
             # 4. aplicar patches/hooks pré-configure
             patcher = Patcher(srcdir, env=env, pkg_name=self.meta.name)
