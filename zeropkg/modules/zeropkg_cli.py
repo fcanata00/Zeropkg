@@ -168,6 +168,7 @@ def main():
     parser.add_argument("--revdep", action="store_true", help="Checar dependências quebradas")
     parser.add_argument("-s", "--search", help="Pesquisar pacote")
     parser.add_argument("--info", help="Mostrar informações de pacote")
+    parser.add_argument("--sync", action="store_true", help="Sincroniza o repositório local de ports com o remoto")
 
     parser.add_argument("--dry-run", action="store_true", help="Simular sem aplicar mudanças")
     parser.add_argument("--dir-install", help="Instalar em diretório alternativo (ex: chroot)")
@@ -204,6 +205,9 @@ def main():
         cmd_search(args.search, args)
     elif args.info:
         cmd_info(args.info, args)
+    elif args.sync:
+         from zeropkg_sync import sync_repos
+         sync_repos()
     else:
         parser.print_help()
         sys.exit(1)
