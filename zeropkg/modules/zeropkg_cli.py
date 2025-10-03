@@ -7,6 +7,7 @@ from zeropkg_installer import Installer
 from zeropkg_deps import check_missing
 from zeropkg_depclean import depclean, revdep
 from zeropkg_logger import log_event
+from zeropkg_upgrade import upgrade_package, upgrade_all
 
 PORTS_DIR = "/usr/ports"
 PKG_CACHE = "/var/zeropkg/packages"
@@ -29,6 +30,8 @@ def main():
     parser.add_argument("--info", help="Mostrar informações de um pacote")
     parser.add_argument("--depclean", action="store_true", help="Remover dependências órfãs")
     parser.add_argument("--revdep", action="store_true", help="Checar dependências quebradas")
+    parser.add_argument("-u", "--upgrade", help="Atualizar pacote para a última versão disponível")
+    parser.add_argument("--upgrade-all", action="store_true", help="Atualizar todos os pacotes")
 
     parser.add_argument("--dry-run", action="store_true", help="Simular execução sem aplicar")
     parser.add_argument("--dir-install", help="Instalar em diretório alternativo (chroot)")
@@ -126,6 +129,22 @@ def main():
         print(f"Versão: {meta.version}")
         print(f"Descrição: {getattr(meta, 'description', 'N/A')}")
         print(f"Dependências: {getattr(meta, 'dependencies', [])}")
+
+    elif args.upgrade:
+        pkgname = args.upgrade
+        ok = upgrade_package(pkgname, db_path=DB_PATH, ports_dir=PORTS_DIR,
+                             pkg_cache=PKG_CACHE, dry_run=args.dry_run,
+                             dir_install=args.dir_install, verbose=True)
+        if not ok:
+            sys.exit(1)
+
+    elif args.upgrade_all:
+        results = upgrade_all(db_path=DB_PATH, ports_dir=PORTS_DIR,
+                              pkg_cache=PKG_CACHE, dry_run=args.dry_run,
+                              dir_install=args.dir_install, verbose=True)
+        for name, ok in results:
+            status = "OK" if ok else "FALHA"
+            print(f"{name}: {status}")
 
     else:
         parser.print_help()
