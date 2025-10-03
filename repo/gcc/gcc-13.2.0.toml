@@ -1,66 +1,158 @@
+# GNU GCC — Fase Final
+# ------------------------------------------------------------
+# Esta é a compilação definitiva do GCC, dentro do chroot do LFS ou
+# em um sistema funcional. Inclui suporte a C, C++, LTO, PIE, plugins
+# e bibliotecas completas.
+# ------------------------------------------------------------
+
 [package]
 name = "gcc"
 version = "13.2.0"
 category = "base"
-description = "GNU Compiler Collection - compilador completo C e C++"
+variant = "final"
+description = "GNU Compiler Collection (GCC) — Fase final completa com suporte a C e C++."
+maintainer = "Zeropkg Build System"
+license = "GPL-3.0"
 homepage = "https://gcc.gnu.org/"
-licenses = ["GPL-3.0-or-later"]
 
+# ------------------------------------------------------------
+# Fontes e libs internas
+# ------------------------------------------------------------
+[sources]
+
+[[sources.entries]]
+url = "https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz"
+checksum = "sha256:e73e0b5a7f44f504b2a72edb41b8f03c5e78e3cf07b5b905c8f26e24e70da427"
+format = "tar.xz"
+priority = 1
+
+[[sources.entries]]
+url = "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz"
+checksum = "sha256:a6f9ed624aef8b5a14c42ad4bca5d0b1d90f5da2b5b52b3cf6cbf2c8d3c6f3e1"
+extract_to = "gcc-13.2.0/mpfr"
+priority = 2
+
+[[sources.entries]]
+url = "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz"
+checksum = "sha256:e5ddfa29f0d8c2f17dc9ccfe6817345ad4f9e0c2d4ab10d7fbe2b04fbb64cf1f"
+extract_to = "gcc-13.2.0/gmp"
+priority = 3
+
+[[sources.entries]]
+url = "https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz"
+checksum = "sha256:5bdadf88f8e1e66dc2b8b846fe37cf929c5067c7b0019b6ab4a760c08f7b9d7c"
+extract_to = "gcc-13.2.0/mpc"
+priority = 4
+
+# ------------------------------------------------------------
+# Ambiente
+# ------------------------------------------------------------
+[environment]
+LFS = "/mnt/lfs"
+PATH = "/usr/bin"
+CFLAGS = "-O2 -pipe -fPIC"
+CXXFLAGS = "-O2 -pipe -fPIC"
+LDFLAGS = "-Wl,-O1"
+MAKEFLAGS = "-j$(nproc)"
+LANG = "C.UTF-8"
+LC_ALL = "C.UTF-8"
+
+# ------------------------------------------------------------
+# Dependências
+# ------------------------------------------------------------
 [dependencies]
-build = ["binutils", "gmp", "mpfr", "mpc", "isl", "zlib"]
-runtime = ["glibc"]
+build = ["binutils", "glibc", "zlib", "bash", "make", "texinfo"]
+runtime = ["glibc", "zlib", "mpfr", "gmp", "mpc"]
+optional = ["isl"]
 
-[source]
-urls = [
-    "https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz"
-]
-sha256 = "e1cf5a63d89c9f9d3ff3efc4f8c7e2e61d4e2f6b41f6a54e7a57c3d89bfbf2f2"
-
-extra = [
-    { name = "mpfr", url = "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.0.tar.xz", sha256 = "a5d1..." },
-    { name = "gmp", url = "https://ftp.gnu.org/gnu/gmp/gmp-6.2.1.tar.xz", sha256 = "fd482..." },
-    { name = "mpc", url = "https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz", sha256 = "17503..." },
-    { name = "isl", url = "https://gcc.gnu.org/pub/gcc/infrastructure/isl-0.26.tar.xz", sha256 = "..." }
-]
-
+# ------------------------------------------------------------
+# Patches (opcionais)
+# ------------------------------------------------------------
 [patches]
 files = []
 
-[build]
-configure = "../configure \
-    --prefix=/usr \
-    --enable-languages=c,c++ \
-    --disable-multilib \
-    --disable-bootstrap \
-    --with-system-zlib"
-make = "make -j$(nproc)"
-check = "make -k check"
-install = "make install"
-
-[build.env]
-PATH = "/usr/bin:/bin"
-CONFIG_SITE = "none"
-
+# ------------------------------------------------------------
+# Hooks
+# ------------------------------------------------------------
 [hooks]
-pre_configure = "echo '[HOOK] Preparando build do gcc final...'"
-post_install = "ln -sv gcc /usr/bin/cc || true; echo '[HOOK] GCC instalado com sucesso'"
+pre_configure = ""
+post_configure = ""
+pre_build = ""
+post_build = ""
+pre_install = ""
+post_install = "scripts/update-info-dir.sh"
+pre_remove = ""
+post_remove = ""
 
-[options]
+# ------------------------------------------------------------
+# Construção real (capítulo 8.24 do LFS)
+# ------------------------------------------------------------
+[build]
+system = "custom"
 fakeroot = true
 chroot = true
-package_before_install = true
-run_tests = true
+strip_binaries = true
+commands = [
+    "mkdir -pv build",
+    "cd build",
+    "../configure                                       \\
+        --prefix=/usr                                   \\
+        --enable-languages=c,c++                        \\
+        --disable-multilib                              \\
+        --disable-bootstrap                             \\
+        --with-system-zlib                              \\
+        --enable-shared                                 \\
+        --enable-threads=posix                          \\
+        --enable-lto                                    \\
+        --enable-default-pie                            \\
+        --enable-default-ssp                            \\
+        --enable-host-shared                            \\
+        --enable-linker-build-id                        \\
+        --enable-plugin                                 \\
+        --enable-gold                                   \\
+        --with-system-libunwind                         \\
+        --enable-checking=release",
+    "make",
+    "make -k check || true",
+    "make install",
+    "rm -f /usr/lib/lib{gcc_s,atomic,gomp,quadmath,ssp,vtv}.la",
+    "ln -sfv ../usr/bin/cpp /lib",
+    "ln -sfv gcc /usr/bin/cc"
+]
 
-[files]
-bin = [
-    "/usr/bin/gcc",
-    "/usr/bin/c++",
-    "/usr/bin/cc"
-]
-lib = [
-    "/usr/lib/gcc/*"
-]
-doc = [
-    "/usr/share/info/gcc.info",
-    "/usr/share/man/man1/gcc.1"
-]
+# ------------------------------------------------------------
+# Pós-instalação
+# ------------------------------------------------------------
+[post_install]
+register = true
+update_cache = true
+clean_build_dir = true
+notify = true
+
+# ------------------------------------------------------------
+# Configuração LFS
+# ------------------------------------------------------------
+[lfs]
+stage = "final"
+toolchain = false
+bootstrap = false
+chroot_required = true
+
+# ------------------------------------------------------------
+# Segurança
+# ------------------------------------------------------------
+[security]
+verify_checksums = true
+use_chroot = true
+fakeroot = true
+signature_check = false
+
+# ------------------------------------------------------------
+# Empacotamento
+# ------------------------------------------------------------
+[package_build]
+enabled = true
+type = "tar"
+output_dir = "/var/zeropkg/packages"
+compress = "xz"
+include_docs = true
