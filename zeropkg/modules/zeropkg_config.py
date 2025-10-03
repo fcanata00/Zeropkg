@@ -2,110 +2,123 @@
 """
 zeropkg_config.py
 
-Carrega configuração global do Zeropkg (TOML). Procura em várias localizações e
-normaliza o resultado para uso pelo CLI e módulos.
+Leitor de configuração global do Zeropkg.
+Agora com cache, logging de erros e validação de diretórios.
 """
 
-from __future__ import annotations
 import os
+import sys
 
-# compatibilidade toml
 try:
     import tomllib  # Python 3.11+
-except Exception:
-    try:
-        import tomli as tomllib  # type: ignore
-    except Exception:
-        tomllib = None  # will raise later if used
+except ImportError:
+    import tomli as tomllib  # fallback
 
-# Locais onde o config pode existir (ordem de preferência)
-CANDIDATE_PATHS = [
-    "/etc/zeropkg.conf",                 # recommended system config
-    "/usr/lib/zeropkg/config.toml",      # installed package config
-    os.path.join(os.path.dirname(__file__), "..", "config.toml"),  # repo-local (relative)
-    "./config.toml",                     # working dir (dev)
+from zeropkg_logger import log_event
+
+# ------------------------
+# Defaults
+# ------------------------
+CONFIG_LOCATIONS = [
+    "/etc/zeropkg/config.toml",
+    "/usr/lib/zeropkg/config.toml",
+    os.path.expanduser("~/.config/zeropkg/config.toml"),
+    "./config.toml",
 ]
 
-# defaults
-DEFAULT = {
+DEFAULT_CONFIG = {
     "paths": {
         "root": "/",
         "build_root": "/var/zeropkg/build",
-        "cache_dir": "/var/zeropkg/packages",
+        "cache_dir": "/var/zeropkg/cache",
         "ports_dir": "/usr/ports",
         "db_path": "/var/lib/zeropkg/installed.sqlite3",
     },
     "repo": {
         "local": "/usr/ports",
-        "remote": None,
+        "remote": "https://example.com/zeropkg-ports.git",
         "branch": "main",
     },
     "sync": {
-        "force": False
+        "force": False,
     }
 }
 
-
-def _load_toml_file(path: str) -> dict:
-    if tomllib is None:
-        raise RuntimeError("Nenhuma biblioteca TOML disponível (instale tomli para Python <3.11).")
-    with open(path, "rb") as f:
-        return tomllib.load(f)
+_cached_config = None  # cache em memória
 
 
-def load_config() -> dict:
+# ------------------------
+# Funções
+# ------------------------
+def load_config(force_reload: bool = False) -> dict:
     """
-    Carrega o primeiro arquivo TOML encontrado entre os candidatos e
-    retorna um dict normalizado combinando com DEFAULT.
+    Lê o config.toml. Usa cache, a menos que force_reload=True.
     """
-    cfg = {
-        "paths": dict(DEFAULT["paths"]),
-        "repo": dict(DEFAULT["repo"]),
-        "sync": dict(DEFAULT["sync"]),
-    }
+    global _cached_config
+    if _cached_config is not None and not force_reload:
+        return _cached_config
 
-    found = None
-    for p in CANDIDATE_PATHS:
-        if not p:
-            continue
-        try:
-            # normalize relative path
-            p_exp = os.path.abspath(p)
-            if os.path.exists(p_exp):
-                parsed = _load_toml_file(p_exp)
-                found = p_exp
-                # merge paths
-                if "paths" in parsed and isinstance(parsed["paths"], dict):
-                    cfg["paths"].update(parsed["paths"])
-                # support older config that uses [repo] (your repo file)
-                if "repo" in parsed and isinstance(parsed["repo"], dict):
-                    cfg["repo"].update(parsed["repo"])
-                    # ensure ports_dir mirrors repo.local if not set
-                    if "local" in parsed["repo"] and not cfg["paths"].get("ports_dir"):
-                        cfg["paths"]["ports_dir"] = parsed["repo"]["local"]
-                if "sync" in parsed and isinstance(parsed["sync"], dict):
-                    cfg["sync"].update(parsed["sync"])
-                # some repos use top-level keys directly (backward compatibility)
-                for k in ("ports_dir", "cache_dir", "build_root", "root", "db_path"):
-                    if k in parsed and k not in cfg["paths"]:
-                        cfg["paths"][k] = parsed[k]
-                break
-        except Exception:
-            # ignore parse errors and try next candidate
-            continue
+    cfg = DEFAULT_CONFIG.copy()
+    for path in CONFIG_LOCATIONS:
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    data = tomllib.load(f)
+                    # Merge sections
+                    if "paths" in data:
+                        cfg["paths"].update(data["paths"])
+                    if "repo" in data:
+                        cfg["repo"].update(data["repo"])
+                    if "sync" in data:
+                        cfg["sync"].update(data["sync"])
+                    # compatibilidade com configs antigos (flat)
+                    for k, v in data.items():
+                        if k not in ("paths", "repo", "sync"):
+                            cfg[k] = v
+                    log_event("config", "load", f"Config carregado de {path}")
+            except Exception as e:
+                log_event("config", "error", f"Falha ao ler {path}: {e}", level="error")
+                continue
 
-    # If not found, cfg stays defaults
+    # Garantir consistência de paths
+    if "ports_dir" not in cfg["paths"] or not cfg["paths"]["ports_dir"]:
+        cfg["paths"]["ports_dir"] = cfg["repo"]["local"]
+
+    # Validação de diretórios críticos
+    for key in ("build_root", "cache_dir", "ports_dir"):
+        path = cfg["paths"].get(key)
+        if path and not os.path.exists(path):
+            try:
+                os.makedirs(path, exist_ok=True)
+                log_event("config", "paths", f"Criado diretório: {path}")
+            except Exception as e:
+                log_event("config", "error", f"Não foi possível criar {key} em {path}: {e}", level="error")
+
+    _cached_config = cfg
     return cfg
 
 
-# convenience getters
 def get_paths() -> dict:
     return load_config()["paths"]
-
 
 def get_repo() -> dict:
     return load_config()["repo"]
 
-
 def get_sync() -> dict:
     return load_config()["sync"]
+
+def get(key: str, default=None):
+    return load_config().get(key, default)
+
+
+# ------------------------
+# CLI rápido para debug
+# ------------------------
+if __name__ == "__main__":
+    import argparse, json
+    ap = argparse.ArgumentParser(description="Debug zeropkg config")
+    ap.add_argument("--reload", action="store_true", help="Força releitura do arquivo")
+    args = ap.parse_args()
+
+    cfg = load_config(force_reload=args.reload)
+    print(json.dumps(cfg, indent=2))
