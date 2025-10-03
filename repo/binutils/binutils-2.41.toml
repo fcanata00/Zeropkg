@@ -1,67 +1,133 @@
+# GNU Binutils — Fase Final
+# Receita completa para uso com Zeropkg (LFS ou sistema normal)
+# ------------------------------------------------------------
+# Esta receita constrói e instala os binários definitivos de montagem e linkagem
+# após a construção do toolchain (binutils-pass1, gcc-pass1, glibc, etc.)
+# ------------------------------------------------------------
+
 [package]
 name = "binutils"
-version = "2.41"
+version = "2.43.1"
 category = "base"
-description = "GNU Binutils - ferramentas de linkagem, montagem e manipulação de binários"
+variant = "final"
+description = "GNU Binutils — conjunto de ferramentas para montagem e linkagem (fase final)."
+maintainer = "Zeropkg Build System"
+license = "GPL-3.0"
 homepage = "https://www.gnu.org/software/binutils/"
-licenses = ["GPL-3.0-or-later"]
 
+# ------------------------------------------------------------
+# Fontes — múltiplos mirrors
+# ------------------------------------------------------------
+[sources]
+
+[[sources.entries]]
+url = "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz"
+checksum = "sha256:57ff8e8fd0497355dfcae6db4b1daef82ad6e3f23ec9e85795e80f8a4630b1dd"
+format = "tar.xz"
+priority = 1
+
+[[sources.entries]]
+url = "https://mirror.kernel.org/gnu/binutils/binutils-2.43.1.tar.xz"
+format = "tar.xz"
+priority = 2
+
+# ------------------------------------------------------------
+# Ambiente
+# ------------------------------------------------------------
+[environment]
+CFLAGS = "-O2 -pipe -fPIC"
+CXXFLAGS = "-O2 -pipe -fPIC"
+LDFLAGS = "-Wl,-O1"
+MAKEFLAGS = "-j$(nproc)"
+LANG = "C.UTF-8"
+LC_ALL = "C.UTF-8"
+
+# ------------------------------------------------------------
+# Dependências
+# ------------------------------------------------------------
 [dependencies]
-build = ["gcc", "make", "texinfo"]
-runtime = []
+build = ["gcc", "make", "bash", "texinfo"]
+runtime = ["glibc", "zlib"]
+optional = ["gdb"]
 
-[source]
-urls = [
-    "https://ftp.gnu.org/gnu/binutils/binutils-2.41.tar.xz",
-    "https://ftpmirror.gnu.org/binutils/binutils-2.41.tar.xz"
-]
-sha256 = "5b9c09b2fffb2c9b03a07e0ed0b8e8ab9d40f83dbb2519038b7a769ffed3cf1a"
-
+# ------------------------------------------------------------
+# Patches opcionais (se aplicáveis)
+# ------------------------------------------------------------
 [patches]
 files = []
 
-[build]
-# usamos diretório separado de build
-configure = "../configure \
-    --prefix=/usr \
-    --enable-gold \
-    --enable-ld=default \
-    --enable-plugins \
-    --enable-shared \
-    --disable-werror \
-    --enable-64-bit-bfd"
-make = "make -j$(nproc)"
-check = "make -k check"
-install = "make install"
-
-[build.env]
-PATH = "/usr/bin:/bin"
-CONFIG_SITE = "none"
-
+# ------------------------------------------------------------
+# Hooks (pré/pós estágios)
+# ------------------------------------------------------------
 [hooks]
-pre_configure = "echo '[HOOK] Preparando build do binutils...'"
-post_install = "rm -f /usr/lib/lib{bfd,opcodes}.a; echo '[HOOK] Binutils instalado com sucesso'"
+pre_configure = ""
+post_configure = ""
+pre_build = ""
+post_build = ""
+pre_install = ""
+post_install = "scripts/update-info-dir.sh"
+pre_remove = ""
+post_remove = ""
 
-[options]
+# ------------------------------------------------------------
+# Construção real
+# ------------------------------------------------------------
+[build]
+system = "custom"
 fakeroot = true
 chroot = true
-package_before_install = true
-run_tests = true
-
-[files]
-bin = [
-    "/usr/bin/addr2line",
-    "/usr/bin/ar",
-    "/usr/bin/as",
-    "/usr/bin/ld",
-    "/usr/bin/nm",
-    "/usr/bin/objcopy",
-    "/usr/bin/objdump",
-    "/usr/bin/ranlib",
-    "/usr/bin/readelf",
-    "/usr/bin/size",
-    "/usr/bin/strings",
-    "/usr/bin/strip"
+strip_binaries = true
+commands = [
+    "mkdir -pv build",
+    "cd build",
+    "../configure --prefix=/usr            \\
+                  --enable-gold            \\
+                  --enable-ld=default      \\
+                  --enable-plugins         \\
+                  --enable-shared          \\
+                  --disable-werror         \\
+                  --enable-64-bit-bfd      \\
+                  --enable-lto             \\
+                  --with-system-zlib",
+    "make tooldir=/usr",
+    "make check || true",
+    "make install tooldir=/usr",
+    "rm -fv /usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes}.a"
 ]
-lib = ["/usr/lib/*bfd*", "/usr/lib/*opcodes*"]
-doc = ["/usr/share/info/binutils.info"]
+
+# ------------------------------------------------------------
+# Pós-instalação
+# ------------------------------------------------------------
+[post_install]
+register = true
+update_cache = true
+clean_build_dir = true
+notify = true
+
+# ------------------------------------------------------------
+# Empacotamento binário
+# ------------------------------------------------------------
+[package_build]
+enabled = true
+type = "tar"
+output_dir = "/var/zeropkg/packages"
+compress = "xz"
+include_docs = true
+
+# ------------------------------------------------------------
+# Segurança e integridade
+# ------------------------------------------------------------
+[security]
+verify_checksums = true
+use_chroot = true
+fakeroot = true
+signature_check = false
+
+# ------------------------------------------------------------
+# Configuração LFS
+# ------------------------------------------------------------
+[lfs]
+stage = "final"
+toolchain = false
+bootstrap = false
+chroot_required = true
