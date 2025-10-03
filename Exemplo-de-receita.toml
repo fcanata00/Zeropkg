@@ -1,78 +1,62 @@
-# Receita Zeropkg exemplo (completa)
-# Caminho sugerido: /usr/ports/gcc/gcc-13.2.0.toml
-
 [package]
-name        = "gcc"
-version     = "13.2.0"
-release     = "1"
-category    = "development"
-description = "GNU Compiler Collection (C, C++, Fortran, etc.)"
-license     = "GPL-3.0"
-homepage    = "https://gcc.gnu.org"
-maintainer  = "Zeropkg Dev Team <dev@zeropkg.org>"
+name = "examplepkg"
+version = "1.0"
+category = "devel"
+description = "Exemplo de pacote com múltiplas fontes, incluindo Git"
+homepage = "https://example.org"
+licenses = ["GPL-3.0-or-later"]
+maintainer = "Você <voce@example.org>"
 
 [dependencies]
-build = ["gmp", "mpfr", "mpc"]
-runtime = ["glibc"]
+runtime = ["zlib", "openssl"]
+build = ["make", "pkg-config"]
 
 [source]
-# múltiplos formatos/espelhos
+# múltiplas opções: tarball + git
 urls = [
-  "https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.gz",
-  "https://mirror.example.org/gcc/gcc-13.2.0.tar.xz",
-  "https://backup.example.net/gcc-13.2.0.zip"
+    "https://example.org/releases/examplepkg-1.0.tar.gz",
+    "https://mirror.example.net/examplepkg/examplepkg-1.0.tar.gz",
+    "git+https://github.com/example/examplepkg.git"
 ]
-sha256 = "c3b2a03b35676f0fa5d4d5dbdb2c4b3f1b7ec1a4c3c8a1ef245ac7f1a123abcd"
-
-[environment]
-# Variáveis aplicadas durante a construção
-CC = "gcc"
-CXX = "g++"
-CFLAGS = "-O2 -pipe"
-CXXFLAGS = "-O2 -pipe"
-LDFLAGS = "-Wl,-O1"
-LANG = "C"
+# hash só usado para tarballs
+sha256 = "SOME_SHA256_HASH"
+# branch/tag/commit se usar git
+git_branch = "main"
+git_commit = "abcdef1234567890"
 
 [patches]
-# Patches aplicados automaticamente em ordem
 files = [
-  "/usr/ports/gcc/patches/fix-armv8-build.patch",
-  "/usr/ports/gcc/patches/remove-broken-tests.patch"
+    "examplepkg-fix-config.patch",
+    "examplepkg-security.patch"
 ]
-
-[hooks]
-# Hooks de automação
-pre_configure  = "echo '[HOOK] Preparando ambiente de build do GCC'"
-post_configure = "echo '[HOOK] Configure finalizado com sucesso'"
-pre_build      = "echo '[HOOK] Build será iniciado agora'"
-post_build     = "echo '[HOOK] Build finalizado com sucesso'"
-pre_install    = "echo '[HOOK] Instalando GCC no sistema'"
-post_install   = "echo '[HOOK] GCC instalado corretamente'"
-pre_remove     = "echo '[HOOK] Preparando remoção do GCC'"
-post_remove    = "echo '[HOOK] GCC foi removido com sucesso'"
 
 [build]
-# Opções de configuração
-configure = [
-  "./configure",
-  "--prefix=/usr",
-  "--enable-languages=c,c++,fortran",
-  "--disable-multilib"
-]
+configure = "./configure --prefix=/usr --enable-feature-x --disable-nls"
 make = "make -j$(nproc)"
 check = "make check"
+install = "make install DESTDIR=${PKGDIR}"
+
+[build.env]
+CFLAGS = "-O2 -pipe -march=native"
+LDFLAGS = "-Wl,-O1,--as-needed"
+PKG_CONFIG_PATH = "/usr/lib/pkgconfig:/usr/share/pkgconfig"
+SOMEFLAG = "enabled"
+
+[hooks]
+pre_configure = "echo '[HOOK] Rodando pre-configure...'"
+post_configure = "echo '[HOOK] Configuração finalizada!'"
+pre_install = "echo '[HOOK] Instalando em fakeroot...'"
+post_install = "strip --strip-unneeded ${PKGDIR}/usr/bin/* || true"
+pre_remove = "echo '[HOOK] Removendo examplepkg...'"
+post_remove = "echo '[HOOK] examplepkg removido com sucesso!'"
+
+[options]
 fakeroot = true
 chroot = true
 package_before_install = true
+run_tests = true
 
-[install]
-# Copia do builddir/fakeroot -> /usr
-make_install = "make install DESTDIR=$PKGDIR"
-
-[revdep]
-# Binários que devem ser checados com revdep
-check_binaries = [
-  "/usr/bin/gcc",
-  "/usr/bin/g++",
-  "/usr/lib/libgcc_s.so"
-]
+[files]
+bin = ["/usr/bin/example"]
+lib = ["/usr/lib/libexample.so*"]
+doc = ["/usr/share/doc/examplepkg/*"]
