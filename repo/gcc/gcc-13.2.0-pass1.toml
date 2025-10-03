@@ -1,74 +1,136 @@
+# GNU GCC — Pass 1 (LFS Toolchain)
+# ------------------------------------------------------------
+# Esta receita constrói o compilador inicial (bootstrap) que usará
+# apenas as bibliotecas internas (sem glibc) e será instalado em
+# /mnt/lfs/tools. Este GCC é usado para compilar o resto do toolchain.
+# ------------------------------------------------------------
+
 [package]
 name = "gcc"
-version = "13.2.0-pass1"
-category = "toolchain"
-description = "GNU Compiler Collection (primeira passagem) para LFS toolchain"
+version = "13.2.0"
+category = "lfs"
+variant = "pass1"
+description = "GNU Compiler Collection (GCC) — Fase 1 do Toolchain LFS."
+maintainer = "Zeropkg Build System"
+license = "GPL-3.0"
 homepage = "https://gcc.gnu.org/"
-licenses = ["GPL-3.0-or-later"]
 
-[dependencies]
-build = ["binutils-pass1", "gmp", "mpfr", "mpc"]
-runtime = []
+# ------------------------------------------------------------
+# Fontes e bibliotecas internas (mpfr, gmp, mpc)
+# ------------------------------------------------------------
+[sources]
 
-[source]
-urls = [
-    "https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz"
-]
-sha256 = "e1cf5a63d89c9f9d3ff3efc4f8c7e2e61d4e2f6b41f6a54e7a57c3d89bfbf2f2"
+[[sources.entries]]
+url = "https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz"
+checksum = "sha256:e73e0b5a7f44f504b2a72edb41b8f03c5e78e3cf07b5b905c8f26e24e70da427"
+format = "tar.xz"
+priority = 1
 
-# subcomponentes necessários
-extra = [
-    { name = "mpfr", url = "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.0.tar.xz", sha256 = "a5d1..." },
-    { name = "gmp", url = "https://ftp.gnu.org/gnu/gmp/gmp-6.2.1.tar.xz", sha256 = "fd482..." },
-    { name = "mpc", url = "https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz", sha256 = "17503..." }
-]
+[[sources.entries]]
+url = "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz"
+checksum = "sha256:a6f9ed624aef8b5a14c42ad4bca5d0b1d90f5da2b5b52b3cf6cbf2c8d3c6f3e1"
+extract_to = "gcc-13.2.0/mpfr"
+priority = 2
 
-[patches]
-files = []
+[[sources.entries]]
+url = "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz"
+checksum = "sha256:e5ddfa29f0d8c2f17dc9ccfe6817345ad4f9e0c2d4ab10d7fbe2b04fbb64cf1f"
+extract_to = "gcc-13.2.0/gmp"
+priority = 3
 
-[build]
-# usamos diretório separado para build
-configure = "../configure \
-    --target=$LFS_TGT \
-    --prefix=/tools \
-    --with-glibc-version=2.39 \
-    --with-sysroot=$LFS \
-    --with-newlib \
-    --without-headers \
-    --enable-initfini-array \
-    --disable-nls \
-    --disable-shared \
-    --disable-multilib \
-    --disable-decimal-float \
-    --disable-threads \
-    --disable-libatomic \
-    --disable-libgomp \
-    --disable-libquadmath \
-    --disable-libssp \
-    --disable-libvtv \
-    --disable-libstdcxx \
-    --enable-languages=c,c++"
-make = "make -j$(nproc)"
-check = ""   # geralmente pulado no pass1
-install = "make install"
+[[sources.entries]]
+url = "https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz"
+checksum = "sha256:5bdadf88f8e1e66dc2b8b846fe37cf929c5067c7b0019b6ab4a760c08f7b9d7c"
+extract_to = "gcc-13.2.0/mpc"
+priority = 4
 
-[build.env]
+# ------------------------------------------------------------
+# Ambiente
+# ------------------------------------------------------------
+[environment]
 LFS = "/mnt/lfs"
 LFS_TGT = "x86_64-lfs-linux-gnu"
-PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
-CONFIG_SITE = "none"
+PATH = "/mnt/lfs/tools/bin:/usr/bin"
+CONFIG_SITE = "/mnt/lfs/usr/share/config.site"
+CFLAGS = "-O2"
+CXXFLAGS = "-O2"
 
-[hooks]
-pre_configure = "echo '[HOOK] Preparando build do gcc-pass1...'"
-post_install = "ln -sv gcc /mnt/lfs/tools/bin/cc || true"
+# ------------------------------------------------------------
+# Dependências
+# ------------------------------------------------------------
+[dependencies]
+build = ["binutils-pass1"]
+runtime = []
+optional = []
 
-[options]
-fakeroot = true
+# ------------------------------------------------------------
+# Construção — procedimento real do LFS 12.x
+# ------------------------------------------------------------
+[build]
+system = "custom"
+fakeroot = false
 chroot = false
-package_before_install = true
-run_tests = false
+strip_binaries = false
+commands = [
+    "mkdir -pv build",
+    "cd build",
+    "../configure                                       \\
+        --target=$LFS_TGT                               \\
+        --prefix=/mnt/lfs/tools                         \\
+        --with-glibc-version=2.39                       \\
+        --with-sysroot=$LFS                             \\
+        --with-newlib                                   \\
+        --without-headers                               \\
+        --enable-initfini-array                         \\
+        --disable-nls                                   \\
+        --disable-shared                                \\
+        --disable-multilib                              \\
+        --disable-decimal-float                         \\
+        --disable-threads                               \\
+        --disable-libatomic                             \\
+        --disable-libgomp                               \\
+        --disable-libquadmath                           \\
+        --disable-libssp                                \\
+        --disable-libvtv                                \\
+        --disable-libstdcxx                             \\
+        --enable-languages=c,c++",
+    "make",
+    "make install"
+]
 
-[files]
-bin = ["/tools/bin/gcc", "/tools/bin/cc"]
-lib = ["/tools/lib/gcc/*"]
-doc = []
+# ------------------------------------------------------------
+# Pós-instalação
+# ------------------------------------------------------------
+[post_install]
+register = true
+clean_build_dir = true
+update_cache = true
+notify = true
+
+# ------------------------------------------------------------
+# Configuração específica para LFS
+# ------------------------------------------------------------
+[lfs]
+stage = "toolchain"
+toolchain = true
+bootstrap = true
+chroot_required = false
+
+# ------------------------------------------------------------
+# Segurança e integridade
+# ------------------------------------------------------------
+[security]
+verify_checksums = true
+use_chroot = false
+fakeroot = false
+signature_check = false
+
+# ------------------------------------------------------------
+# Empacotamento
+# ------------------------------------------------------------
+[package_build]
+enabled = true
+type = "tar"
+output_dir = "/var/zeropkg/packages"
+compress = "xz"
+include_docs = false
