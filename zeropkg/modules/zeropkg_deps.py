@@ -1,125 +1,329 @@
 #!/usr/bin/env python3
+# zeropkg_deps.py
 """
-zeropkg_deps.py
-Gerenciamento avançado de dependências para Zeropkg.
+Módulo de resolução de dependências para Zeropkg.
+
+Funcionalidades principais:
+- DependencyResolver: carrega deps de receitas, constrói grafos, detecta ciclos
+- missing_deps(pkgname): lista dependências não instaladas
+- reverse_deps(pkgname): lista pacotes que dependem de pkgname (no conjunto instalado)
+- resolve_and_install(resolver, pkgname, BuilderCls, InstallerCls, args):
+    resolve deps em ordem topológica e, para cada dep faltante, chama BuilderCls.build(...)
+    e espera que o Installer registre no DB.
+
+Observações:
+- Depende de:
+    - zeropkg_toml.load_toml(ports_dir, pkgname) ou load_toml(path) (tratamos com flexibilidade)
+    - zeropkg_db.DBManager com get_package(name) e list_installed()
+    - Builder/Installer com assinaturas conforme discutido (Builder.build(pkg, args, dir_install=...))
 """
 
+from __future__ import annotations
+
+import os
+import glob
 import logging
-from collections import defaultdict, deque
+from typing import Dict, List, Set, Tuple, Optional
 
-from zeropkg_logger import log_event
-from zeropkg_db import DBManager
 from zeropkg_toml import load_toml
+from zeropkg_db import DBManager
+from zeropkg_logger import log_event
 
 logger = logging.getLogger("zeropkg.deps")
 
 
-class DependencyResolver:
-    def __init__(self, db_path, ports_dir):
-        self.db = DBManager(db_path)
-        self.ports_dir = ports_dir
+class DependencyError(Exception):
+    pass
 
-    def _load_deps_from_toml(self, pkg_name):
-        """Carrega dependências de um pacote via TOML."""
-        meta = load_toml(self.ports_dir, pkg_name)
-        deps = {
-            "runtime": meta.get("dependencies", {}).get("runtime", []),
-            "build": meta.get("dependencies", {}).get("build", []),
-            "optional": meta.get("dependencies", {}).get("optional", []),
-        }
+
+class DependencyResolver:
+    def __init__(self, db_path: str, ports_dir: str = "/usr/ports"):
+        """
+        db_path: caminho para DB do zeropkg
+        ports_dir: raiz onde as receitas .toml estão (ex: /usr/ports)
+        """
+        self.db_path = db_path
+        self.ports_dir = ports_dir
+        self.db = DBManager(db_path)
+
+    # ---------------------
+    # helpers para carregar TOML / deps
+    # ---------------------
+    def _find_metafiles_for(self, pkgname: str) -> List[str]:
+        """
+        Procura arquivos <pkgname>-*.toml em ports_dir e retorna lista de caminhos.
+        """
+        pattern = os.path.join(self.ports_dir, "**", f"{pkgname}-*.toml")
+        return glob.glob(pattern, recursive=True)
+
+    def _load_meta(self, pkgname: str) -> Dict:
+        """
+        Tenta carregar a receita TOML do pacote.
+        Tentamos múltiplas assinaturas de load_toml para compatibilidade:
+          - load_toml(ports_dir, pkgname)
+          - load_toml(path_to_metafile)
+        Lança FileNotFoundError se não encontrar metafile.
+        """
+        # 1) tenta load_toml com (ports_dir, pkgname)
+        try:
+            return load_toml(self.ports_dir, pkgname)
+        except TypeError:
+            # assinatura diferente — tenta localizar arquivo
+            pass
+        except Exception:
+            # pode falhar; tentar localizar por glob abaixo
+            pass
+
+        # 2) procurar metafiles sob ports_dir
+        matches = self._find_metafiles_for(pkgname)
+        if not matches:
+            raise FileNotFoundError(f"Metafile for package '{pkgname}' not found under {self.ports_dir}")
+        # escolher a versão "mais alta" heurística: nome com versão maior lexicograficamente não é perfeito,
+        # mas escolher primeiro match é aceitável; caller deve garantir versões corretas.
+        # Melhor: ordenar por versão numérica — aqui mantemos simples e escolhemos primeiro (poderia melhorar).
+        path = sorted(matches)[-1]  # escolher o 'ultimo' ordenado para dar preferência a versões maiores
+        try:
+            return load_toml(path)
+        except TypeError:
+            # possível outra assinatura; tentar load_toml(ports_dir, pkgname) novamente falharia, mas rethrow
+            return load_toml(path)
+
+    def _extract_deps_from_meta(self, meta: Dict) -> Dict[str, List[str]]:
+        """
+        Retorna dict com chaves 'build', 'runtime', 'optional' (listas).
+        Trata diferentes formatos do metafile TOML (tolerante).
+        """
+        deps = {"build": [], "runtime": [], "optional": []}
+        if not meta:
+            return deps
+
+        # chaves possíveis: [dependencies] build/runtime/optional OR [depends] build/runtime
+        section = meta.get("dependencies") or meta.get("depends") or {}
+        if isinstance(section, dict):
+            for k in ["build", "runtime", "optional"]:
+                v = section.get(k, [])
+                if isinstance(v, list):
+                    deps[k] = [str(x) for x in v]
+                elif isinstance(v, str):
+                    deps[k] = [v]
+        else:
+            # seção inesperada, tentar pegar campos comuns
+            for k in ["build", "runtime"]:
+                v = meta.get(k, [])
+                if isinstance(v, list):
+                    deps[k] = [str(x) for x in v]
+
+        # algumas receitas podem ter deps inline em meta['package']['deps']
+        pkgsec = meta.get("package", {}) or {}
+        inline = pkgsec.get("deps") or pkgsec.get("depends")
+        if inline:
+            if isinstance(inline, list):
+                # append to runtime if not present
+                for d in inline:
+                    if d not in deps["runtime"]:
+                        deps["runtime"].append(str(d))
+            elif isinstance(inline, str):
+                if inline not in deps["runtime"]:
+                    deps["runtime"].append(inline)
+
         return deps
 
-    def resolve_graph(self, pkg_name, include_build=False):
+    # ---------------------
+    # API principal
+    # ---------------------
+    def missing_deps(self, pkgname: str) -> List[str]:
         """
-        Resolve dependências em forma de grafo (BFS).
-        Retorna lista ordenada de pacotes a instalar.
+        Retorna lista única de dependências runtime (recursivas) que NÃO estão instaladas no DB.
+        Não instala automaticamente; apenas informa.
         """
-        graph = defaultdict(list)
-        visited = set()
-        order = []
-        queue = deque([pkg_name])
+        try:
+            # construir grafo de dependências recursivamente começando por pkgname
+            graph = self._build_dep_graph([pkgname], include_build=False)
+            needed = set()
+            for node in graph:
+                if node == pkgname:
+                    continue
+                # checar se instalado
+                if not self.db.get_package(node):
+                    needed.add(node)
+            return sorted(needed)
+        except Exception as e:
+            logger.exception("missing_deps failed")
+            raise DependencyError(f"missing_deps failed: {e}")
 
-        while queue:
-            current = queue.popleft()
-            if current in visited:
-                continue
-            visited.add(current)
+    def reverse_deps(self, pkgname: str) -> List[str]:
+        """
+        Retorna lista de pacotes (instalados) que dependem de pkgname (dependências reversas).
+        Usa apenas o conjunto de pacotes listados como instalados no DB.
+        """
+        try:
+            installed = self.db.list_installed()  # lista de dicts
+            installed_names = [p["name"] for p in installed]
+            revs = []
+            for pkg in installed_names:
+                # carregar meta do pacote instalado (pode não existir no ports, então ignorar)
+                try:
+                    meta = self._load_meta(pkg)
+                except FileNotFoundError:
+                    continue
+                deps = self._extract_deps_from_meta(meta)
+                runtime = deps.get("runtime", []) or []
+                if pkgname in runtime:
+                    revs.append(pkg)
+            return sorted(revs)
+        except Exception as e:
+            logger.exception("reverse_deps failed")
+            raise DependencyError(f"reverse_deps failed: {e}")
 
-            deps = self._load_deps_from_toml(current)
-            all_deps = deps["runtime"] + (deps["build"] if include_build else [])
-            graph[current] = all_deps
+    def _build_dep_graph(self, roots: List[str], include_build: bool = False) -> Dict[str, Set[str]]:
+        """
+        Constrói grafo de dependências (direcionado) partindo de 'roots' (lista de package names).
+        O grafo contém arestas A -> B where A depends on B.
+        include_build: se True, inclui dependências de build também.
+        Retorna dict: {pkg: set(of dependencies)} incluindo nós para todos pacotes visitados.
+        """
+        graph: Dict[str, Set[str]] = {}
+        visited: Set[str] = set()
 
-            for dep in all_deps:
-                if dep not in visited:
-                    queue.append(dep)
-
-        # Ordenar pacotes (dependências antes do alvo)
-        def dfs(node, seen, stack):
-            if node in seen:
+        def visit(pkg: str):
+            if pkg in visited:
                 return
-            seen.add(node)
-            for dep in graph.get(node, []):
-                dfs(dep, seen, stack)
-            stack.append(node)
+            visited.add(pkg)
+            try:
+                meta = self._load_meta(pkg)
+            except FileNotFoundError:
+                # pacote não tem metafile no ports: deixamos sem dependências (é external / host-provided)
+                graph.setdefault(pkg, set())
+                return
+            deps = self._extract_deps_from_meta(meta)
+            runtime = deps.get("runtime", []) or []
+            build = deps.get("build", []) or []
+            reqs = set(runtime)
+            if include_build:
+                reqs |= set(build)
+            graph.setdefault(pkg, set())
+            for d in reqs:
+                graph[pkg].add(d)
+                visit(d)
 
-        stack = []
-        dfs(pkg_name, set(), stack)
-        order = stack[::-1]
+        for r in roots:
+            visit(r)
+        return graph
 
+    def resolve_graph(self, pkgname: str, include_build: bool = False) -> List[str]:
+        """
+        Retorna lista topologicamente ordenada de pacotes que precisam ser considerados para
+        instalação/construção na ordem correta: dependências primeiro, pacote último.
+        include_build: incluir dependências de build também.
+        """
+        graph = self._build_dep_graph([pkgname], include_build=include_build)
+        order = self._topological_sort(graph)
+        # queremos ordem com dependências primeiro e o pkgname por último
         return order
 
-    def detect_cycles(self, pkg_name):
-        """Detecta ciclos no grafo de dependências."""
-        graph = defaultdict(list)
-        deps = self._load_deps_from_toml(pkg_name)
-        graph[pkg_name] = deps["runtime"] + deps["build"]
+    def _topological_sort(self, graph: Dict[str, Set[str]]) -> List[str]:
+        """
+        Ordenação topológica. Lança DependencyError se ciclo detectado.
+        Retorna lista com nós ordenados (deps antes dos que usam).
+        """
+        visited: Set[str] = set()
+        temp: Set[str] = set()
+        order: List[str] = []
 
-        visited = set()
-        stack = set()
+        def visit(n: str):
+            if n in visited:
+                return
+            if n in temp:
+                # ciclo
+                raise DependencyError(f"Dependency cycle detected at {n}")
+            temp.add(n)
+            for m in graph.get(n, set()):
+                visit(m)
+            temp.remove(n)
+            visited.add(n)
+            order.append(n)
 
-        def visit(node):
-            if node in stack:
-                return True
-            if node in visited:
-                return False
-            visited.add(node)
-            stack.add(node)
-            for dep in graph.get(node, []):
-                if visit(dep):
-                    return True
-            stack.remove(node)
-            return False
+        for node in list(graph.keys()):
+            if node not in visited:
+                visit(node)
+        # order contém nós com dependências antes — remover duplicados e manter ordem
+        return order
 
-        return visit(pkg_name)
-
-    def missing_deps(self, pkg_name):
-        """Retorna dependências faltando (não instaladas)."""
-        deps = self._load_deps_from_toml(pkg_name)
-        missing = []
-        for dep in deps["runtime"] + deps["build"]:
-            if not self.db.is_installed(dep):
-                missing.append(dep)
-        return missing
-
-    def reverse_deps(self, pkg_name):
-        """Encontra pacotes que dependem do pacote dado."""
-        revdeps = []
-        installed = self.db.list_installed()
-        for pkg in installed:
-            deps = self._load_deps_from_toml(pkg)
-            if pkg_name in deps["runtime"] or pkg_name in deps["build"]:
-                revdeps.append(pkg)
-        return revdeps
-
-
-# Funções auxiliares
-def resolve_and_install(resolver, pkg_name, builder, installer, args):
+    # ---------------------
+    # utilitário que instala dependências faltantes usando Builder/Installer
+    # Nota: esta função é independente, mas usa classes passadas para chamar build/install.
+    # ---------------------
+def resolve_and_install(resolver: DependencyResolver, pkgname: str,
+                        BuilderCls, InstallerCls, args) -> List[str]:
     """
-    Resolve dependências e instala todas em ordem correta.
+    Resolve dependências transitivas de 'pkgname' e, para cada dependência que NÃO está instalada,
+    chama BuilderCls(...).build(dep, args) para construir/instalar.
+
+    Parâmetros:
+      - resolver: DependencyResolver instance
+      - pkgname: pacote alvo (string)
+      - BuilderCls: class reference para Builder (será instanciada com db_path e ports_dir)
+      - InstallerCls: class reference para Installer (pode ser útil; atualmente não usado diretamente)
+      - args: objeto args do CLI (contém db_path, ports_dir, dry_run, root, fakeroot, build_root, etc.)
+
+    Retorna a lista de pacotes efetivamente construídos/instalados (em ordem).
     """
-    order = resolver.resolve_graph(pkg_name, include_build=True)
-    for dep in order:
-        if not resolver.db.is_installed(dep):
-            log_event("deps", "install", f"Instalando dependência {dep}")
-            builder.build(dep, args)
-            installer.install(dep, args)
+    logger = logging.getLogger("zeropkg.deps.resolve_and_install")
+    built: List[str] = []
+
+    # extrair opções do args (com defaults)
+    db_path = getattr(args, "db_path", "/var/lib/zeropkg/installed.sqlite3")
+    ports_dir = getattr(args, "ports_dir", "/usr/ports")
+    build_root = getattr(args, "build_root", "/var/zeropkg/build")
+    cache_dir = getattr(args, "cache_dir", "/usr/ports/distfiles")
+    packages_dir = getattr(args, "packages_dir", "/var/zeropkg/packages")
+    dry_run = getattr(args, "dry_run", False)
+    fakeroot = getattr(args, "fakeroot", False)
+
+    # instanciar builder/installer
+    builder = BuilderCls(db_path=db_path, ports_dir=ports_dir,
+                         build_root=build_root, cache_dir=cache_dir, packages_dir=packages_dir)
+    installer = InstallerCls(db_path=db_path, ports_dir=ports_dir,
+                             root=getattr(args, "root", "/"), dry_run=dry_run, use_fakeroot=fakeroot)
+
+    # construir grafo e ordem
+    try:
+        order = resolver.resolve_graph(pkgname, include_build=False)
+    except DependencyError as de:
+        logger.error(f"Failed to resolve graph for {pkgname}: {de}")
+        raise
+
+    # order tem dependências primeiro; queremos instalar todos exceto o próprio pkgname (por enquanto)
+    # mas incluir o pkgname também, já que às vezes queremos construir tudo (resolve_and_install)
+    # vamos iterar até o penúltimo (instalar deps) e deixar o pkgname para o caller (builder)
+    # No entanto, para conveniência deste helper, construiremos todos na ordem completa.
+    db = DBManager(db_path)
+
+    for pkg in order:
+        # não tentar construir pacotes que já estão instalados
+        if db.get_package(pkg):
+            logger.debug(f"{pkg} is already installed; skipping")
+            continue
+        # ignorar placeholders vazios (por segurança)
+        if not pkg or pkg.strip() == "":
+            continue
+        logger.info(f"Resolving & building dependency: {pkg}")
+        try:
+            # builder.build aceita target (nome do pacote), args, dir_install opcional
+            builder.build(pkg, args)
+            # depois do builder.build, assumir que installer registrou no DB; conferir
+            if not db.get_package(pkg):
+                # pode ser que builder não registrou; tentamos instalar pacote gerado do cache
+                # tente localizar pacote em packages_dir
+                pkg_file = None
+                candidate = os.path.join(packages_dir, f"{pkg}.tar.xz")
+                if os.path.exists(candidate):
+                    pkg_file = candidate
+                if pkg_file:
+                    installer.install(pkg, args, pkg_file=pkg_file, meta=None)
+            built.append(pkg)
+        except Exception as e:
+            logger.error(f"Failed to build/install dependency {pkg}: {e}")
+            raise DependencyError(f"Failed to build/install dependency {pkg}: {e}")
+
+    return built
