@@ -1,17 +1,16 @@
 """
 zeropkg_downloader.py
 
-Downloader multi-source para Zeropkg — versão revisada e integrada.
+Downloader multi-source para Zeropkg — versão melhorada.
 
 Suporta:
-- http(s), ftp, file://, git+...
-- retries com backoff
-- nomes únicos no cache (hash curto da URL)
-- opção prefer_existing
-- verbose ou log via zeropkg_logger
+- http(s), ftp, file://, git+, rsync://, scp://
+- retries com backoff + resume
+- download paralelo opcional
+- nomes únicos no cache
+- verificação de checksum
 """
 
-from __future__ import annotations
 import os
 import shutil
 import hashlib
@@ -21,7 +20,9 @@ import subprocess
 import tempfile
 import time
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from zeropkg_toml import PackageMeta, SourceEntry
 from zeropkg_logger import log_event, setup_logger
 
@@ -32,6 +33,7 @@ class DownloadError(Exception):
 
 class ChecksumMismatch(Exception):
     pass
+
 
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
@@ -72,13 +74,21 @@ def resolve_cache_name(meta: PackageMeta, src: SourceEntry) -> str:
     urlhash = hashlib.sha1(src.url.encode()).hexdigest()[:8]
     return f"{meta.name}-{meta.version}-{base}-{urlhash}"
 
+
+# ----------------------------
+# Downloaders
+# ----------------------------
 def _download_http(url: str, dest: str, timeout: int = 30, retries: int = 3, verbose: bool = False):
     last_err = None
     for attempt in range(1, retries + 1):
         try:
-            if verbose:
-                print(f"[zeropkg] Baixando {url} (tentativa {attempt}/{retries})")
-            urllib.request.urlretrieve(url, dest)
+            req = urllib.request.Request(url)
+            if os.path.exists(dest):
+                # resume download
+                current_size = os.path.getsize(dest)
+                req.add_header("Range", f"bytes={current_size}-")
+            with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "ab") as out:
+                shutil.copyfileobj(resp, out)
             return
         except Exception as e:
             last_err = e
@@ -86,7 +96,6 @@ def _download_http(url: str, dest: str, timeout: int = 30, retries: int = 3, ver
             if verbose:
                 print(f"[zeropkg] Falha ao baixar {url}: {e} → retry em {wait}s")
             time.sleep(wait)
-            continue
     raise DownloadError(f"Falha ao baixar {url}: {last_err}")
 
 def _download_file_url(url: str, dest: str):
@@ -100,14 +109,7 @@ def _download_file_url(url: str, dest: str):
     shutil.copy2(src, dest)
 
 def _git_clone_to_tar(url: str, out_dir: str, verbose: bool = False) -> str:
-    real = url
-    if url.startswith("git+"):
-        real = url[len("git+"):]
-    try:
-        subprocess.run(["git", "--version"], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        raise DownloadError("git não disponível para clonar repositórios")
+    real = url[len("git+"):] if url.startswith("git+") else url
     tmpd = tempfile.mkdtemp(prefix="zeropkg_git_")
     try:
         if verbose:
@@ -120,91 +122,91 @@ def _git_clone_to_tar(url: str, out_dir: str, verbose: bool = False) -> str:
     finally:
         shutil.rmtree(tmpd, ignore_errors=True)
 
+def _download_rsync(url: str, dest: str):
+    subprocess.run(["rsync", "-avz", url, dest], check=True)
+
+def _download_scp(url: str, dest: str):
+    # Ex: scp://user@host:/path/to/file
+    real = url[len("scp://"):]
+    subprocess.run(["scp", real, dest], check=True)
+
+
+# ----------------------------
+# API principal
+# ----------------------------
+def download_source(meta: PackageMeta,
+                    src: SourceEntry,
+                    cache_dir: str,
+                    timeout: int = 30,
+                    prefer_existing: bool = True,
+                    verbose: bool = False) -> Dict[str, Any]:
+    """Baixa um único source e retorna dict com {path, url, from_cache}"""
+    _ensure_dir(cache_dir)
+    url = src.url
+    filename = resolve_cache_name(meta, src)
+    cache_path = os.path.join(cache_dir, filename)
+
+    # cache já válido
+    if prefer_existing and os.path.exists(cache_path) and src.checksum:
+        if _verify_checksum(cache_path, src.checksum):
+            return {"path": cache_path, "url": url, "from_cache": True}
+
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    tmp.close()
+    tmp_dest = tmp.name
+
+    try:
+        if url.startswith(("http://", "https://", "ftp://")):
+            _download_http(url, tmp_dest, timeout=timeout, retries=3, verbose=verbose)
+        elif url.startswith("file://"):
+            _download_file_url(url, tmp_dest)
+        elif url.startswith(("git+", "git://")):
+            git_out = tempfile.mkdtemp(prefix="zeropkg_git_out_")
+            try:
+                tarpath = _git_clone_to_tar(url, git_out, verbose=verbose)
+                shutil.move(tarpath, cache_path)
+                return {"path": cache_path, "url": url, "from_cache": False}
+            finally:
+                shutil.rmtree(git_out, ignore_errors=True)
+        elif url.startswith("rsync://"):
+            _download_rsync(url, tmp_dest)
+        elif url.startswith("scp://"):
+            _download_scp(url, tmp_dest)
+        else:
+            raise DownloadError(f"Scheme não suportado: {url}")
+
+        shutil.move(tmp_dest, cache_path)
+
+        if src.checksum and not _verify_checksum(cache_path, src.checksum):
+            os.remove(cache_path)
+            raise ChecksumMismatch(f"Checksum mismatch para {url}")
+
+        return {"path": cache_path, "url": url, "from_cache": False}
+    finally:
+        if os.path.exists(tmp_dest):
+            os.remove(tmp_dest)
+
+
 def download_package(meta: PackageMeta,
                      cache_dir: str = "/usr/ports/distfiles",
                      timeout: int = 30,
                      prefer_existing: bool = True,
-                     verbose: bool = False) -> str:
+                     verbose: bool = False,
+                     parallel: bool = False) -> List[Dict[str, Any]]:
     """
-    Baixa as fontes crençadas em meta.sources. Retorna caminho no cache.
-    Lança DownloadError ou ChecksumMismatch.
+    Baixa todos os sources de um pacote.
+    Retorna lista de dicts [{path, url, from_cache}, ...]
     """
-    _ensure_dir(cache_dir)
-
     sources = sorted(meta.sources, key=lambda s: (s.priority if getattr(s, "priority", None) is not None else 1000))
-    last_err = None
 
-    for src in sources:
-        url = src.url
-        filename = resolve_cache_name(meta, src)
-        cache_path = os.path.join(cache_dir, filename)
+    results = []
+    if parallel and len(sources) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(sources))) as ex:
+            futs = {ex.submit(download_source, meta, s, cache_dir, timeout, prefer_existing, verbose): s for s in sources}
+            for fut in as_completed(futs):
+                results.append(fut.result())
+    else:
+        for s in sources:
+            results.append(download_source(meta, s, cache_dir, timeout, prefer_existing, verbose))
 
-        if prefer_existing and os.path.exists(cache_path) and src.checksum:
-            try:
-                if _verify_checksum(cache_path, src.checksum):
-                    if verbose:
-                        print(f"[zeropkg] Usando cache existente: {cache_path}")
-                    log_event(meta.name, "downloader", f"Usou cache {cache_path}")
-                    return cache_path
-                else:
-                    if verbose:
-                        print(f"[zeropkg] Cache inválido (checksum mismatch), removendo: {cache_path}")
-                    try:
-                        os.remove(cache_path)
-                    except Exception:
-                        pass
-            except Exception:
-                try:
-                    os.remove(cache_path)
-                except Exception:
-                    pass
-
-        try:
-            td = tempfile.NamedTemporaryFile(delete=False)
-            td.close()
-            tmp_dest = td.name
-
-            if url.startswith(("http://", "https://", "ftp://")):
-                _download_http(url, tmp_dest, timeout=timeout, retries=3, verbose=verbose)
-            elif url.startswith("file://"):
-                _download_file_url(url, tmp_dest)
-            elif url.startswith(("git+", "git://")):
-                git_out = tempfile.mkdtemp(prefix="zeropkg_git_out_")
-                try:
-                    tarpath = _git_clone_to_tar(url, git_out, verbose=verbose)
-                    shutil.move(tarpath, cache_path)
-                    if src.checksum and not _verify_checksum(cache_path, src.checksum):
-                        try:
-                            os.remove(cache_path)
-                        except Exception:
-                            pass
-                        raise ChecksumMismatch("Checksum mismatch para git source")
-                    log_event(meta.name, "downloader", f"Clonou git e salvou em {cache_path}")
-                    return cache_path
-                finally:
-                    shutil.rmtree(git_out, ignore_errors=True)
-            else:
-                raise DownloadError(f"Scheme não suportado: {url}")
-
-            shutil.move(tmp_dest, cache_path)
-
-            if src.checksum and not _verify_checksum(cache_path, src.checksum):
-                try:
-                    os.remove(cache_path)
-                except Exception:
-                    pass
-                raise ChecksumMismatch(f"Checksum mismatch para {url}")
-
-            if verbose:
-                print(f"[zeropkg] Download concluído: {cache_path}")
-            log_event(meta.name, "downloader", f"Download concluído {cache_path}")
-            return cache_path
-
-        except (DownloadError, ChecksumMismatch, Exception) as e:
-            last_err = e
-            if verbose:
-                print(f"[zeropkg] Erro com {url}, tentando próximo mirror: {e}")
-            log_event(meta.name, "downloader", f"Erro ao baixar {url}: {e}")
-            continue
-
-    raise DownloadError(f"Falha ao baixar todas as fontes. Último erro: {last_err}")
+    return results
