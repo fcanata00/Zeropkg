@@ -81,6 +81,9 @@ zeropkg --revdep                   -> Repara dependências quebradas
 zeropkg --info <pacote>            -> Mostra informações
 zeropkg --search <nome>            -> Pesquisa pacotes
 zeropkg --lfs-bootstrap --root /mnt/lfs -> Constrói toolchain LFS
+zeropkg --lfs-bootstrap --root /mnt/lfs -b binutils-2.43.1-pass1
+zeropkg -b binutils --variant pass1 --root /mnt/lfs
+zeropkg --root /mnt/lfs --chroot -b binutils-2.43.1
 
 Todos os comandos aceitam --dry-run e abreviações (-b, -i, -r).
 
