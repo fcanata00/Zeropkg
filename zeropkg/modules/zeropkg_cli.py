@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-zeropkg_cli.py - CLI integrado para Zeropkg
+zeropkg_cli.py - CLI integrado para Zeropkg (com chroot support)
 """
 
 import os
 import sys
 import argparse
 import traceback
+from typing import List
 
 MODULES_PATH = "/usr/lib/zeropkg/modules"
 if MODULES_PATH not in sys.path:
     sys.path.insert(0, MODULES_PATH)
 
-# imports dos módulos principais
 from zeropkg_toml import parse_toml
 from zeropkg_builder import Builder
 from zeropkg_installer import Installer
@@ -25,7 +25,7 @@ from zeropkg_db import get_package
 from zeropkg_logger import log_event
 from zeropkg_deps import check_missing
 from zeropkg_config import get_paths
-
+from zeropkg_chroot import enter_chroot, cleanup_chroot, prepare_chroot, ChrootError
 
 # --- utils ---
 def find_metafile(pkgname: str, ports_dir: str) -> str:
@@ -38,15 +38,12 @@ def find_metafile(pkgname: str, ports_dir: str) -> str:
         return candidate
     raise FileNotFoundError(f"Metafile para {pkgname} não encontrado em {ports_dir}")
 
-
 def load_meta_from_name(pkgname: str, ports_dir: str):
     return parse_toml(find_metafile(pkgname, ports_dir))
-
 
 def safe_print_exc(e: Exception):
     print(f"Erro: {e}")
     traceback.print_exc()
-
 
 # --- commands ---
 def cmd_install(pkgname: str, args):
@@ -72,7 +69,7 @@ def cmd_install(pkgname: str, args):
                                       dry_run=args.dry_run,
                                       root=args.root,
                                       use_fakeroot=args.fakeroot)
-            installer_dep.install(pkgfile_dep, dep_meta, compute_hash=True, run_hooks=True)
+            installer_dep.install(pkgfile_dep, dep_meta, skip_hash=False)
 
     builder = Builder(meta,
                       cache_dir=args.cache_dir,
@@ -88,9 +85,8 @@ def cmd_install(pkgname: str, args):
                           dry_run=args.dry_run,
                           root=args.root,
                           use_fakeroot=args.fakeroot)
-    installed = installer.install(pkgfile, meta, compute_hash=True, run_hooks=True)
-    print(f"Instalados {len(installed)} arquivos.")
-
+    installer.install(pkgfile, meta, build_id=None, skip_hash=False)
+    print(f"Instalação solicitada para {meta.name} concluída (verifique logs para detalhes).")
 
 def cmd_remove(target: str, args):
     name, _, version = target.partition(":")
@@ -103,7 +99,6 @@ def cmd_remove(target: str, args):
                          use_fakeroot=args.fakeroot,
                          force=args.force)
     print(res["message"])
-
 
 def cmd_build(pkgname: str, args):
     meta = load_meta_from_name(pkgname, args.ports_dir)
@@ -118,7 +113,6 @@ def cmd_build(pkgname: str, args):
     pkgfile = builder.build(dir_install=args.dir_install)
     print(f"Pacote gerado: {pkgfile}")
 
-
 def cmd_upgrade(pkgname: str, args):
     ok = upgrade_package(pkgname,
                          db_path=args.db_path,
@@ -129,7 +123,6 @@ def cmd_upgrade(pkgname: str, args):
                          backup=True,
                          verbose=True)
     print("Upgrade concluído." if ok else "Upgrade falhou.")
-
 
 def cmd_upgrade_all(args):
     res = upgrade_all(db_path=args.db_path,
@@ -142,17 +135,14 @@ def cmd_upgrade_all(args):
     fail = len(res) - ok
     print(f"Upgrade all: {ok} succeeded, {fail} failed")
 
-
 def cmd_update(args):
     res = run_update_scan(dry_run=args.dry_run)
     print(res)
-
 
 def cmd_sync(args):
     print("Sincronizando repositório...")
     sync_repos()
     print("Sync concluído.")
-
 
 def cmd_depclean(args):
     orphans = depclean(args.db_path)
@@ -160,13 +150,11 @@ def cmd_depclean(args):
     for o in orphans:
         print("  ", o)
 
-
 def cmd_revdep(args):
     broken = revdep(args.db_path)
     print("Dependências quebradas:" if broken else "Nenhuma dependência quebrada.")
     for pkg, mis in broken.items():
         print(f"{pkg} depende de: {mis}")
-
 
 def cmd_search(query: str, args):
     results = []
@@ -175,7 +163,6 @@ def cmd_search(query: str, args):
             if f.endswith(".toml") and query in f:
                 results.append(os.path.join(root, f))
     print("\n".join(results) if results else "Nenhum resultado.")
-
 
 def cmd_info(pkgname: str, args):
     meta = load_meta_from_name(pkgname, args.ports_dir)
@@ -187,12 +174,8 @@ def cmd_info(pkgname: str, args):
     print(f"Dependencies: {getattr(meta, 'dependencies', {})}")
     print(f"Build directives: {getattr(meta, 'build', {})}")
 
-
-# --- LFS specific ---
+# LFS specific
 def cmd_lfs_bootstrap(args):
-    """
-    Executa a sequência oficial do LFS toolchain (LFS 12.1).
-    """
     sequence = [
         "binutils-2.41-pass1",
         "gcc-13.2.0-pass1",
@@ -211,16 +194,37 @@ def cmd_lfs_bootstrap(args):
             sys.exit(1)
     print("[✓] LFS bootstrap concluído!")
 
-
 def cmd_lfs_step(pkgname: str, args):
-    """
-    Executa um passo único do toolchain (ex: binutils-pass1).
-    """
     print(f"[+] Construindo passo LFS: {pkgname}")
     cmd_install(pkgname, args)
 
+# chroot commands
+def cmd_enter_chroot(args):
+    try:
+        command: List[str] = None
+        if args.enter_command:
+            # pass command string split. Recommend quoting properly.
+            command = ["/bin/bash", "-lc", args.enter_command]
+        env = {}
+        if args.chroot_env:
+            # env entries as KEY=VAL separated by commas
+            for pair in args.chroot_env.split(","):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    env[k.strip()] = v.strip()
+        res = enter_chroot(args.root, command=command, env=env, dry_run=args.dry_run)
+        print(res)
+    except Exception as e:
+        safe_print_exc(e)
 
-# --- CLI entrypoint ---
+def cmd_cleanup_chroot(args):
+    try:
+        res = cleanup_chroot(args.root, force_lazy=args.force, dry_run=args.dry_run)
+        print(res)
+    except Exception as e:
+        safe_print_exc(e)
+
+# Parser
 def build_parser():
     paths = get_paths()
     p = argparse.ArgumentParser(prog="zeropkg", description="Zeropkg - source-based package manager")
@@ -237,7 +241,12 @@ def build_parser():
     p.add_argument("--info", metavar="PKG")
     # LFS
     p.add_argument("--lfs-bootstrap", action="store_true", help="Constrói toda a toolchain do LFS na ordem oficial")
-    p.add_argument("--lfs-step", metavar="PKG", help="Constrói um passo específico da toolchain (ex: binutils-pass1)")
+    p.add_argument("--lfs-step", metavar="PKG", help="Constrói um passo específico do toolchain (ex: binutils-pass1)")
+    # chroot
+    p.add_argument("--enter-chroot", action="store_true", help="Enter a chroot shell or run command inside chroot")
+    p.add_argument("--enter-command", metavar="CMD", help="Command to run inside chroot (shell-quoted)")
+    p.add_argument("--chroot-env", metavar="KV,...", help="env variables for chroot command, e.g. LFS=/mnt/lfs,PATH=/tools/bin:$PATH")
+    p.add_argument("--cleanup-chroot", action="store_true", help="Cleanup chroot mounts in paths.root")
     # flags
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--root", default=paths["root"])
@@ -251,46 +260,53 @@ def build_parser():
     p.add_argument("--db-path", default=paths["db_path"])
     return p
 
-
 def main():
     p = build_parser()
     args = p.parse_args()
 
     cmds = [args.install, args.remove, args.build, args.upgrade,
             args.update, args.sync, args.upgrade_all, args.depclean,
-            args.revdep, args.search, args.info, args.lfs_bootstrap, args.lfs_step]
+            args.revdep, args.search, args.info, args.lfs_bootstrap, args.lfs_step,
+            args.enter_chroot, args.cleanup_chroot]
 
     if sum(bool(c) for c in cmds) != 1:
         p.print_help()
         sys.exit(1)
 
-    if args.install:
-        cmd_install(args.install, args)
-    elif args.remove:
-        cmd_remove(args.remove, args)
-    elif args.build:
-        cmd_build(args.build, args)
-    elif args.upgrade:
-        cmd_upgrade(args.upgrade, args)
-    elif args.upgrade_all:
-        cmd_upgrade_all(args)
-    elif args.update:
-        cmd_update(args)
-    elif args.sync:
-        cmd_sync(args)
-    elif args.depclean:
-        cmd_depclean(args)
-    elif args.revdep:
-        cmd_revdep(args)
-    elif args.search:
-        cmd_search(args.search, args)
-    elif args.info:
-        cmd_info(args.info, args)
-    elif args.lfs_bootstrap:
-        cmd_lfs_bootstrap(args)
-    elif args.lfs_step:
-        cmd_lfs_step(args.lfs_step, args)
-
+    try:
+        if args.install:
+            cmd_install(args.install, args)
+        elif args.remove:
+            cmd_remove(args.remove, args)
+        elif args.build:
+            cmd_build(args.build, args)
+        elif args.upgrade:
+            cmd_upgrade(args.upgrade, args)
+        elif args.upgrade_all:
+            cmd_upgrade_all(args)
+        elif args.update:
+            cmd_update(args)
+        elif args.sync:
+            cmd_sync(args)
+        elif args.depclean:
+            cmd_depclean(args)
+        elif args.revdep:
+            cmd_revdep(args)
+        elif args.search:
+            cmd_search(args.search, args)
+        elif args.info:
+            cmd_info(args.info, args)
+        elif args.lfs_bootstrap:
+            cmd_lfs_bootstrap(args)
+        elif args.lfs_step:
+            cmd_lfs_step(args.lfs_step, args)
+        elif args.enter_chroot:
+            cmd_enter_chroot(args)
+        elif args.cleanup_chroot:
+            cmd_cleanup_chroot(args)
+    except Exception as e:
+        safe_print_exc(e)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
