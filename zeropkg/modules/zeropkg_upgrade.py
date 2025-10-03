@@ -1,11 +1,12 @@
+#!/usr/bin/env python3
 """
 zeropkg_upgrade.py
-
-Módulo de upgrade para Zeropkg — versão revisada:
-- Remove a versão antiga antes de instalar a nova
+Módulo de upgrade para Zeropkg — versão revisada com DependencyResolver:
+- Resolve dependências via grafo completo
+- Remove versão antiga antes de instalar a nova
 - Executa hooks de pre_remove/post_remove
 - Mantém backup e rollback em caso de falha
-- Suporta upgrade individual e global (grafo com topological sort)
+- Suporta upgrade individual e global (ordem topológica)
 """
 
 import os
@@ -15,11 +16,11 @@ import shutil
 import logging
 from typing import Optional, List, Tuple, Dict, Set
 
-from zeropkg_toml import parse_toml, PackageMeta
+from zeropkg_toml import load_toml
 from zeropkg_builder import Builder, BuildError
 from zeropkg_installer import Installer, InstallError
-from zeropkg_deps import check_missing, resolve_dependencies
-from zeropkg_db import connect, get_package, list_installed
+from zeropkg_deps import DependencyResolver, resolve_and_install
+from zeropkg_db import DBManager
 from zeropkg_logger import log_event
 
 logger = logging.getLogger("zeropkg.upgrade")
@@ -86,18 +87,19 @@ def upgrade_package(
     dry_run: bool = False,
     root: Optional[str] = None,
     backup: bool = True,
-    verbose: bool = False
+    verbose: bool = False,
+    args=None
 ) -> bool:
     """
     Atualiza um pacote para a versão mais nova encontrada.
     Fluxo:
-      1. Resolve dependências
+      1. Resolve dependências com DependencyResolver
       2. Remove versão antiga (se instalada)
       3. Constrói e instala nova versão
       4. Rollback em caso de falha
     """
-    conn = connect(db_path)
-    installed = get_package(conn, pkgname)
+    db = DBManager(db_path)
+    installed = db.get_package(pkgname)
     current_version = installed["version"] if installed else None
 
     if verbose:
@@ -108,8 +110,8 @@ def upgrade_package(
         log_event(pkgname, "upgrade", "Nenhum metafile encontrado", level="error")
         return False
 
-    latest_meta = parse_toml(latest_path)
-    latest_version = latest_meta.version
+    latest_meta = load_toml(ports_dir, pkgname)
+    latest_version = latest_meta["package"]["version"]
 
     cmp = compare_versions(latest_version, current_version) if current_version else 1
     if cmp <= 0:
@@ -119,21 +121,15 @@ def upgrade_package(
     log_event(pkgname, "upgrade", f"Upgrade: {current_version} → {latest_version}")
 
     if dry_run:
-        missing = check_missing(latest_meta, db_path=db_path)
+        resolver = DependencyResolver(db_path, ports_dir)
+        missing = resolver.missing_deps(pkgname)
         log_event(pkgname, "upgrade", f"[dry-run] Dependências faltantes: {missing}")
         return True
 
-    # Resolver dependências automaticamente
+    # Resolver dependências e instalá-las
     try:
-        deps = resolve_dependencies(latest_meta, ports_dir=ports_dir, db_path=db_path)
-        for dep in deps:
-            log_event(pkgname, "upgrade", f"Construindo dependência {dep}")
-            dep_meta_path = find_latest_metafile(dep, ports_dir)
-            if dep_meta_path:
-                dep_meta = parse_toml(dep_meta_path)
-                dep_builder = Builder(dep_meta, cache_dir=pkg_cache, pkg_cache=pkg_cache,
-                                      dry_run=dry_run, db_path=db_path)
-                dep_builder.build(dir_install=root)
+        resolver = DependencyResolver(db_path, ports_dir)
+        resolve_and_install(resolver, pkgname, Builder, Installer, args)
     except Exception as e:
         log_event(pkgname, "upgrade", f"Erro ao resolver dependências: {e}", level="error")
         return False
@@ -151,7 +147,7 @@ def upgrade_package(
     # Remover versão antiga antes de instalar
     if installed:
         try:
-            inst = Installer(db_path=db_path, dry_run=dry_run, root=root)
+            inst = Installer(db_path=db_path)
             inst.remove(pkgname, current_version)
             log_event(pkgname, "upgrade", f"Versão antiga {current_version} removida com sucesso")
         except Exception as e:
@@ -159,10 +155,9 @@ def upgrade_package(
 
     # Construir e instalar nova versão
     try:
-        builder = Builder(latest_meta, cache_dir=pkg_cache, pkg_cache=pkg_cache,
-                          dry_run=dry_run, db_path=db_path)
-        result = builder.build(dir_install=root)
-        log_event(pkgname, "upgrade", f"Build concluído → {result['pkgfile']}")
+        builder = Builder(db_path=db_path, ports_dir=ports_dir)
+        builder.build(pkgname, args, dir_install=root)
+        log_event(pkgname, "upgrade", f"Build concluído de {pkgname}-{latest_version}")
         return True
     except (BuildError, InstallError) as e:
         log_event(pkgname, "upgrade", f"Erro durante upgrade: {e}", level="error")
@@ -170,8 +165,8 @@ def upgrade_package(
         if backup_pkg and os.path.exists(backup_pkg):
             log_event(pkgname, "upgrade", "Tentando rollback...")
             try:
-                inst = Installer(db_path=db_path, dry_run=False, root=root)
-                inst.install(backup_pkg, latest_meta)
+                inst = Installer(db_path=db_path)
+                inst.install(pkgname, args, pkg_file=backup_pkg, dir_install=root)
                 log_event(pkgname, "upgrade", "Rollback concluído")
             except Exception as re:
                 log_event(pkgname, "upgrade", f"Rollback falhou: {re}", level="error")
@@ -187,30 +182,32 @@ def upgrade_all(
     pkg_cache: str = PKG_CACHE_DEFAULT,
     dry_run: bool = False,
     root: Optional[str] = None,
-    verbose: bool = False
+    verbose: bool = False,
+    args=None
 ) -> List[Tuple[str, bool]]:
     """
     Atualiza todos os pacotes instalados.
     Constrói grafo global e aplica upgrade em ordem topológica.
     """
-    conn = connect(db_path)
-    installed = list_installed(conn)
-    conn.close()
+    db = DBManager(db_path)
+    installed = db.list_installed()
 
     graph: Dict[str, Set[str]] = {}
-    to_upgrade: Dict[str, PackageMeta] = {}
+    to_upgrade: Dict[str, str] = {}
 
     for pkg in installed:
         name = pkg["name"]
         latest_path = find_latest_metafile(name, ports_dir)
         if not latest_path:
             continue
-        latest_meta = parse_toml(latest_path)
-        if compare_versions(latest_meta.version, pkg["version"]) > 0:
-            to_upgrade[name] = latest_meta
-            deps = resolve_dependencies(latest_meta, ports_dir=ports_dir, db_path=db_path)
+        latest_meta = load_toml(ports_dir, name)
+        if compare_versions(latest_meta["package"]["version"], pkg["version"]) > 0:
+            to_upgrade[name] = latest_meta["package"]["version"]
+            resolver = DependencyResolver(db_path, ports_dir)
+            deps = resolver._load_deps_from_toml(name)["runtime"]
             graph[name] = set(deps)
 
+    # ordenação topológica
     order: List[str] = []
     visited: Set[str] = set()
     temp: Set[str] = set()
@@ -236,7 +233,7 @@ def upgrade_all(
         try:
             ok = upgrade_package(pkg, db_path=db_path, ports_dir=ports_dir,
                                  pkg_cache=pkg_cache, dry_run=dry_run,
-                                 root=root, verbose=verbose)
+                                 root=root, verbose=verbose, args=args)
             results.append((pkg, ok))
         except Exception as e:
             log_event(pkg, "upgrade", f"Erro no upgrade_all: {e}", level="error")
