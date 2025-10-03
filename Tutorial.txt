@@ -1,132 +1,148 @@
-Zeropkg - Gerenciador de Pacotes Source-Based
-=============================================
+# Zeropkg — Tutorial Completo (v2.0)
 
-📌 Introdução
--------------
-Zeropkg é um gerenciador de pacotes baseado em fontes, inspirado em ports e no conceito de Linux From Scratch (LFS).
-Ele permite baixar, construir, instalar, atualizar e remover programas a partir do código-fonte, com suporte a chroot,
-fakeroot, hooks e empacotamento.
+## 1. Introdução
+Zeropkg é um gerenciador de pacotes source-based escrito em Python 3, projetado para construir, instalar e manter sistemas Linux From Scratch (LFS) ou distribuições baseadas em código-fonte.
+Ele faz o download, aplica patches, compila, instala e registra pacotes diretamente do código-fonte, com total rastreabilidade e controle.
 
-📦 Dependências do Host
------------------------
-Antes de usar o Zeropkg, certifique-se de que seu sistema hospedeiro possui os seguintes pacotes:
-- Python 3.8+
-- git
-- tar, xz, gzip, bzip2
-- fakeroot
-- gcc, binutils, make
-- util-linux (mount, umount, etc.)
-- bash, coreutils, findutils
-- sqlite3
+------------------------------------------------------------
+## 2. Estrutura de Diretórios
+/usr/lib/zeropkg/modules  -> Módulos principais (builder, installer, deps, etc.)
+/usr/bin/zeropkg          -> Executável principal
+/usr/ports                -> Repositório de receitas
+/usr/ports/distfiles      -> Cache de downloads
+/var/zeropkg/build        -> Diretório temporário de build
+/var/lib/zeropkg          -> Banco de dados SQLite
+/var/zeropkg/packages     -> Cache de binários
+/var/log/zeropkg          -> Logs detalhados
+/etc/zeropkg/config.toml  -> Configuração global
+/mnt/lfs                  -> Diretório LFS (opcional)
 
-Diretórios Padrão
------------------
-O Zeropkg utiliza uma árvore de diretórios configurável, definida em /etc/zeropkg/config.toml
+------------------------------------------------------------
+## 3. Instalação
+Dependências do sistema:
+sudo apt install python3 python3-pip git wget tar patch fakeroot sqlite3
 
-Exemplo de estrutura padrão:
- /usr/lib/zeropkg/modules/   → módulos Python do Zeropkg
- /usr/bin/zeropkg            → executável CLI
- /usr/ports/                 → repositório de receitas (metafiles .toml)
- /usr/ports/distfiles/       → cache de fontes baixados
- /var/zeropkg/build/         → diretório temporário de builds
- /var/zeropkg/packages/      → pacotes binários gerados (.tar.xz)
- /var/lib/zeropkg/           → banco de dados instalado (SQLite)
- /etc/zeropkg/config.toml    → configuração principal
+Bibliotecas Python:
+sudo pip3 install requests beautifulsoup4 tomli
 
-Exemplo de config.toml:
+Instalação automática:
+sudo bash install_zeropkg.sh
+
+Esse script:
+- Cria diretórios e instala módulos
+- Instala /usr/bin/zeropkg
+- Gera /etc/zeropkg/config.toml
+- Clona automaticamente o repositório de ports em /usr/ports
+
+------------------------------------------------------------
+## 4. Arquivo de Configuração (/etc/zeropkg/config.toml)
 [paths]
-root = "/"
-cache_dir = "/usr/ports/distfiles"
-build_root = "/var/zeropkg/build"
-ports_dir = "/usr/ports"
 db_path = "/var/lib/zeropkg/installed.sqlite3"
+ports_dir = "/usr/ports"
+build_root = "/var/zeropkg/build"
+cache_dir = "/usr/ports/distfiles"
+packages_dir = "/var/zeropkg/packages"
 
-📝 Receita de Pacote
---------------------
-Cada pacote é descrito por um arquivo TOML. Exemplo (binutils-pass1.toml):
+[options]
+jobs = 4
+fakeroot = true
+chroot_enabled = true
+auto_clean = true
+log_level = "INFO"
 
-[package]
-name = "binutils"
-version = "2.41-pass1"
-category = "toolchain"
-description = "Binutils first pass"
-homepage = "https://www.gnu.org/software/binutils/"
-licenses = ["GPL-3.0-or-later"]
+[repos]
+main = "https://github.com/fcanata00/Zeropkg-Ports.git"
+testing = "https://github.com/fcanata00/Zeropkg-Testing.git"
+local = "/mnt/repos/zeropkg-local"
 
+[network]
+proxy = ""
+verify_ssl = true
+retries = 3
+timeout = 30
+
+[lfs]
+root = "/mnt/lfs"
+chroot_shell = "/bin/bash"
+user = "lfs"
+group = "lfs"
+
+------------------------------------------------------------
+## 5. Comandos Principais (CLI)
+zeropkg --help                     -> Exibe ajuda
+zeropkg --sync                     -> Atualiza repositórios
+zeropkg --update                   -> Verifica novas versões
+zeropkg --upgrade                  -> Atualiza pacotes instalados
+zeropkg -b, --build <pacote>       -> Compila um pacote
+zeropkg -i, --install <pacote>     -> Instala um pacote e dependências
+zeropkg -r, --remove <pacote>      -> Remove um pacote com hooks
+zeropkg --depclean                 -> Remove dependências órfãs
+zeropkg --revdep                   -> Repara dependências quebradas
+zeropkg --info <pacote>            -> Mostra informações
+zeropkg --search <nome>            -> Pesquisa pacotes
+zeropkg --lfs-bootstrap --root /mnt/lfs -> Constrói toolchain LFS
+
+Todos os comandos aceitam --dry-run e abreviações (-b, -i, -r).
+
+------------------------------------------------------------
+## 6. Estrutura de Receitas (TOML)
 [source]
-urls = ["https://ftp.gnu.org/gnu/binutils/binutils-2.41.tar.xz"]
-sha256 = "SOMEHASH"
+urls = [
+    "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz",
+    "https://mirror.kernel.org/gnu/binutils/binutils-2.43.1.tar.xz"
+]
+sha256 = "abc123..."
+format = "tar.xz"
 
 [build]
-configure = "./configure --prefix=/tools --with-sysroot=$LFS --target=$LFS_TGT --disable-nls --disable-werror"
-make = "make -j4"
-install = "make install"
+dependencies = ["gcc", "glibc"]
+commands = [
+    "./configure --prefix=/usr",
+    "make -j4",
+    "make check",
+    "make install"
+]
+env = { "CFLAGS" = "-O2 -pipe" }
 
-[build.env]
-LFS = "/mnt/lfs"
-LFS_TGT = "x86_64-lfs-linux-gnu"
-PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
+[hooks]
+pre_configure = "scripts/pre.sh"
+post_install  = "scripts/post.sh"
 
-⚙️ Comandos do CLI
-------------------
-Uso geral:
-    zeropkg [opções]
+[package]
+description = "GNU Binutils — ferramentas de montagem e linkagem"
+category = "devel"
+license = "GPL-3.0"
+maintainer = "Você <email@dominio>"
 
-Principais comandos:
-    -i, --install PKG        Instala pacote (compila + instala)
-    -r, --remove PKG[:VER]   Remove pacote
-    -b, --build PKG          Constrói pacote mas não instala
-    -u, --upgrade PKG        Atualiza pacote para nova versão
-    --upgrade-all            Atualiza todos os pacotes
-    -U, --update             Escaneia novas versões upstream
-    --sync                   Sincroniza repositório local com remoto
-    --depclean               Remove dependências órfãs
-    --revdep                 Verifica dependências reversas
-    -s, --search QUERY       Busca pacotes por nome
-    --info PKG               Mostra informações do pacote
+------------------------------------------------------------
+## 7. Exemplo: Construção LFS Toolchain
+1. Crie o diretório:
+   sudo mkdir -pv /mnt/lfs
+2. Monte as partições e defina LFS:
+   export LFS=/mnt/lfs
+3. Sincronize o repositório:
+   zeropkg --sync
+4. Construa a toolchain:
+   zeropkg --lfs-bootstrap --root /mnt/lfs
 
-Suporte LFS:
-    --lfs-bootstrap          Constrói toda a toolchain do LFS (ordem oficial)
-    --lfs-step PKG           Constrói um passo específico do toolchain
+O Zeropkg montará o chroot, configurará o ambiente seguro e construirá as fases:
+   binutils-pass1 → gcc-pass1 → glibc → binutils-final → gcc-final ...
 
-Suporte Chroot:
-    --enter-chroot           Abre shell ou executa comando dentro do chroot
-    --enter-command CMD      Comando a ser executado dentro do chroot
-    --chroot-env KV,...      Variáveis de ambiente para o chroot
-    --cleanup-chroot         Desmonta todos os bind mounts do chroot
+------------------------------------------------------------
+## 8. Logs e Banco de Dados
+Logs detalhados: /var/log/zeropkg/
+Banco de dados SQLite: /var/lib/zeropkg/installed.sqlite3
 
-Flags adicionais:
-    --root DIR               Define root alternativo (ex: /mnt/lfs)
-    --dir-install DIR        Instala pacote em DIR após build
-    --cache-dir DIR          Cache de fontes
-    --build-root DIR         Diretório temporário de build
-    --ports-dir DIR          Diretório de receitas
-    --db-path FILE           Banco de dados de pacotes
-    --fakeroot               Usa fakeroot para preservar UID/GID
-    --dry-run                Simula ações sem executá-las
+Use:
+sqlite3 /var/lib/zeropkg/installed.sqlite3
+.tables
 
-🔨 Construindo o Toolchain LFS
-------------------------------
-1. Monte partições e exporte LFS=/mnt/lfs
-2. Configure config.toml com root="/mnt/lfs"
-3. Crie receitas .toml para cada passo do LFS (binutils-pass1, gcc-pass1, etc.)
-4. Use o comando:
-    zeropkg --lfs-bootstrap --root /mnt/lfs
-    zeropkg --install gcc-13.2.0-pass1 --root /mnt/lfs
-   Isso executa a ordem oficial do livro:
-     - Binutils pass1
-     - GCC pass1
-     - Linux Headers
-     - Glibc
-     - Binutils pass2
-     - GCC pass2
-5. Depois entre no chroot:
-    zeropkg --enter-chroot --root /mnt/lfs
-6. Continue a construção dentro do chroot.
+------------------------------------------------------------
+## 9. Desinstalação
+Para remover completamente o Zeropkg (opcional):
+sudo rm -rf /usr/lib/zeropkg /usr/bin/zeropkg /etc/zeropkg /var/lib/zeropkg /var/zeropkg
 
-✅ Conclusão
-------------
-O Zeropkg oferece suporte total para construção de um sistema LFS,
-com gerenciamento de dependências, empacotamento, instalação em root alternativo,
-e chroot seguro com suporte a rede.
-Use receitas .toml bem definidas para controlar cada etapa.
+------------------------------------------------------------
+## 10. Conclusão
+O Zeropkg é uma ferramenta poderosa e modular que oferece controle total sobre o sistema e a construção de pacotes a partir do código-fonte.
+Totalmente integrado com LFS e repositórios Git, é ideal para aprendizado, automação e desenvolvimento de distribuições personalizadas.
