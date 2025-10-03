@@ -1,82 +1,120 @@
+"""
+zeropkg_installer.py
+
+Módulo Installer para Zeropkg — versão revisada.
+
+Funções:
+- instalar pacotes binários (tarball) no sistema ou em dir alternativo
+- desinstalar pacotes baseando-se no banco
+- registrar no DB (chamando zeropkg_db.register_package / remove_package)
+- rodar hooks pós-install / pós-remove
+- registrar eventos com logger e no DB
+"""
+
 import os
 import tarfile
 import shutil
-import logging
-from typing import Dict, Optional, List
-from zeropkg_db import register_package, remove_package, get_installed_files
-from zeropkg_patcher import Patcher
+from typing import Optional, List, Tuple
+from zeropkg_db import connect, register_package, remove_package, get_package, query_events, record_event
+from zeropkg_logger import log_event, setup_logger
+from zeropkg_patcher import Patcher, HookError
 
-logger = logging.getLogger("zeropkg.installer")
+logger = setup_logger(pkg_name=None, stage="installer")
 
 class InstallerError(Exception):
     pass
 
 class Installer:
-    def __init__(self, db_path="/var/lib/zeropkg/installed.json",
-                 dry_run=False, dir_install=None):
+    def __init__(self, db_path: str = "/var/lib/zeropkg/installed.sqlite3",
+                 dry_run: bool = False, dir_install: Optional[str] = None):
         self.db_path = db_path
         self.dry_run = dry_run
+        # destino de instalação real (prefix root). Se dir_install fornecido, instala nele.
         self.dir_install = dir_install or "/"
 
-    def install(self, pkgfile: str, meta, hooks: Optional[Dict[str, List[str]]] = None):
-        """Instala um pacote binário e registra no DB"""
-        stagingdir = "/tmp/zeropkg-install-staging"
-        os.makedirs(stagingdir, exist_ok=True)
+    def install(self, pkgfile: str, meta, hooks: Optional[dict] = None) -> List[str]:
+        """
+        Instala um pacote binário tarball `pkgfile` para meta (PackageMeta).
+        Retorna lista dos caminhos dos arquivos instalados.
+        """
+        pkgname = meta.name
+        staging = "/tmp/zeropkg_install_staging"
+        if os.path.exists(staging):
+            shutil.rmtree(staging, ignore_errors=True)
+        os.makedirs(staging, exist_ok=True)
 
-        # 1. Extrair pacote no staging
-        logger.info(f"Extraindo {pkgfile} -> {stagingdir}")
+        log_event(pkgname, "installer", f"Extraindo {pkgfile} em staging")
         if not self.dry_run:
             with tarfile.open(pkgfile, "r:*") as tar:
-                tar.extractall(stagingdir)
+                tar.extractall(staging)
 
-        # 2. Copiar arquivos para o destino
-        dest = self.dir_install
-        logger.info(f"Instalando arquivos em {dest}")
+        log_event(pkgname, "installer", f"Copiando arquivos para {self.dir_install}")
+        installed_files: List[str] = []
         if not self.dry_run:
-            for root, dirs, files in os.walk(stagingdir):
-                rel = os.path.relpath(root, stagingdir)
-                target_dir = os.path.join(dest, rel) if rel != "." else dest
+            for root, dirs, files in os.walk(staging):
+                rel = os.path.relpath(root, staging)
+                target_dir = os.path.join(self.dir_install, rel) if rel != "." else self.dir_install
                 os.makedirs(target_dir, exist_ok=True)
                 for f in files:
                     src = os.path.join(root, f)
                     dst = os.path.join(target_dir, f)
                     shutil.copy2(src, dst)
+                    installed_files.append(dst)
 
-        # 3. Registrar no DB
+        # registrar no DB
+        conn = connect(self.db_path)
+        # produzir lista (path, None) porque não calculamos hash aqui
+        file_list = [(p, None) for p in installed_files]
+        pkg_id = None
         if not self.dry_run:
-            register_package(self.db_path, meta, stagingdir)
+            pkg_id = register_package(conn, meta, pkgfile, file_list)
+            record_event(conn, "INFO", "installer", f"Pacote instalado: {meta.name}-{meta.version}", {"pkg_id": pkg_id})
 
-        # 4. Executar hooks pós-install
+        # hooks pós-install
         if hooks:
-            patcher = Patcher(workdir=dest, env=getattr(meta, "environment", {}))
-            patcher.apply_stage("post_install", {}, hooks)
+            p = Patcher(workdir=self.dir_install, env=meta.environment if hasattr(meta, "environment") else {}, pkg_name=pkgname)
+            try:
+                p.apply_stage("post_install", {}, hooks)
+            except HookError as he:
+                log_event(pkgname, "installer", f"Erro em hook pós-install: {he}", level="error")
+                raise
 
-        logger.info(f"Pacote {meta.name}-{meta.version} instalado com sucesso.")
+        log_event(pkgname, "installer", f"Instalação concluída: {meta.name}-{meta.version}")
+        return installed_files
 
-    def remove(self, name: str, version: str, hooks: Optional[Dict[str, List[str]]] = None):
-        """Remove um pacote com base no DB"""
-        files = get_installed_files(self.db_path, name, version)
-        if not files:
-            raise InstallerError(f"Pacote {name}-{version} não encontrado no banco.")
+    def remove(self, name: str, version: Optional[str] = None, hooks: Optional[dict] = None) -> List[str]:
+        """
+        Remove um pacote nome:versão. Retorna lista de arquivos que tentou apagar.
+        """
+        conn = connect(self.db_path)
+        pkg = get_package(conn, name, version)
+        if not pkg:
+            raise InstallerError(f"Pacote não instalado: {name}:{version}")
 
-        # 1. Remover arquivos
-        logger.info(f"Removendo pacote {name}-{version}")
+        # obter arquivos antes de remover do DB
+        # usamos remove_package que retorna paths
+        files_to_remove = remove_package(conn, name, pkg.get("version"))
+
+        log_event(name, "installer", f"Removendo pacote {name}:{pkg.get('version')}")
+        removed = []
         if not self.dry_run:
-            for f in files:
+            for fpath in files_to_remove:
                 try:
-                    os.remove(f)
+                    os.remove(fpath)
+                    removed.append(fpath)
                 except FileNotFoundError:
-                    pass  # já removido
+                    pass
                 except Exception as e:
-                    logger.warning(f"Erro ao remover {f}: {e}")
+                    log_event(name, "installer", f"Erro ao remover {fpath}: {e}", level="error")
 
-        # 2. Remover do DB
-        if not self.dry_run:
-            remove_package(self.db_path, name, version)
-
-        # 3. Executar hooks pós-remove
+        # hooks pós-remove
         if hooks:
-            patcher = Patcher(workdir="/", env=os.environ.copy())
-            patcher.apply_stage("post_remove", {}, hooks)
+            p = Patcher(workdir=self.dir_install, env=os.environ.copy(), pkg_name=name)
+            try:
+                p.apply_stage("post_remove", {}, hooks)
+            except HookError as he:
+                log_event(name, "installer", f"Erro em hook pós-remove: {he}", level="error")
+                raise
 
-        logger.info(f"Pacote {name}-{version} removido com sucesso.")
+        log_event(name, "installer", f"Remoção concluída: {name}:{pkg.get('version')}")
+        return removed
