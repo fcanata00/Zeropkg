@@ -1,7 +1,10 @@
 """
 zeropkg_upgrade.py
 
-Módulo de upgrade para Zeropkg — versão revisada e integrada ao Builder/Installer atuais.
+Módulo de upgrade para Zeropkg — versão revisada:
+- Verifica e constrói dependências automaticamente (resolve_dependencies)
+- Usa Builder/Installer integrados
+- Faz backup da versão anterior e rollback em caso de falha
 """
 
 import os
@@ -14,8 +17,8 @@ from typing import Optional, List, Tuple
 from zeropkg_toml import parse_toml, PackageMeta
 from zeropkg_builder import Builder, BuildError
 from zeropkg_installer import Installer, InstallError
-from zeropkg_deps import check_missing
-from zeropkg_db import connect, get_package, record_event
+from zeropkg_deps import check_missing, resolve_dependencies
+from zeropkg_db import connect, get_package
 from zeropkg_logger import log_event
 
 logger = logging.getLogger("zeropkg.upgrade")
@@ -86,6 +89,7 @@ def upgrade_package(
 ) -> bool:
     """
     Atualiza um pacote para a versão mais nova encontrada.
+    Resolve dependências automaticamente antes do build.
     """
     conn = connect(db_path)
     installed = get_package(conn, pkgname)
@@ -112,13 +116,23 @@ def upgrade_package(
     if dry_run:
         missing = check_missing(latest_meta, db_path=db_path)
         log_event(pkgname, "upgrade", f"[dry-run] Dependências faltantes: {missing}")
-        log_event(pkgname, "upgrade", "[dry-run] Plano: build + install")
+        log_event(pkgname, "upgrade", "[dry-run] Plano: resolver dependências + build + install")
         return True
 
-    # Dependências faltantes
-    missing = check_missing(latest_meta, db_path=db_path)
-    if missing:
-        log_event(pkgname, "upgrade", f"Dependências faltantes: {missing}", level="warning")
+    # Resolver dependências automaticamente
+    try:
+        deps = resolve_dependencies(latest_meta, ports_dir=ports_dir, db_path=db_path)
+        for dep in deps:
+            log_event(pkgname, "upgrade", f"Construindo dependência {dep}")
+            dep_meta_path = find_latest_metafile(dep, ports_dir)
+            if dep_meta_path:
+                dep_meta = parse_toml(dep_meta_path)
+                dep_builder = Builder(dep_meta, cache_dir=pkg_cache, pkg_cache=pkg_cache,
+                                      dry_run=dry_run, db_path=db_path)
+                dep_builder.build(dir_install=root)
+    except Exception as e:
+        log_event(pkgname, "upgrade", f"Erro ao resolver dependências: {e}", level="error")
+        return False
 
     # Backup opcional
     backup_pkg = None
