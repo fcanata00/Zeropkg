@@ -1,0 +1,140 @@
+# Exemplo de Receita Completa Zeropkg
+# Mostra todos os recursos suportados pelo Zeropkg
+
+[package]
+name = "example-complete"
+version = "1.0"
+category = "utils"
+description = "Exemplo completo de receita Zeropkg com todos os recursos disponíveis."
+maintainer = "Você <seu.email@dominio>"
+license = "GPL-3.0"
+homepage = "https://example.org"
+variant = "default"
+
+# ====================================================================
+# Múltiplas fontes suportadas: tarballs, git, patch, mirror
+# ====================================================================
+[sources]
+
+# Fonte principal em tar.xz
+[[sources.entries]]
+url = "https://example.org/sources/example-complete-1.0.tar.xz"
+checksum = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+format = "tar.xz"
+priority = 1
+
+# Mirror alternativo
+[[sources.entries]]
+url = "https://mirror.kernel.org/example/example-complete-1.0.tar.xz"
+format = "tar.xz"
+priority = 2
+
+# Clonagem via Git também é suportada
+[[sources.entries]]
+url = "git+https://github.com/example/example-complete.git"
+branch = "main"
+type = "git"
+
+# ====================================================================
+# Definição de patches (aplicados automaticamente pelo módulo patcher)
+# ====================================================================
+[patches]
+# Cada patch é aplicado em ordem
+files = [
+    "patches/fix-paths.patch",
+    "patches/add-feature.patch"
+]
+
+# ====================================================================
+# Ambiente customizado (passado ao builder e fakeroot)
+# ====================================================================
+[environment]
+CFLAGS = "-O2 -pipe -march=native"
+CXXFLAGS = "-O2 -pipe -march=native"
+LDFLAGS = "-Wl,-O1"
+PKG_CONFIG_PATH = "/usr/lib/pkgconfig:/usr/share/pkgconfig"
+MAKEFLAGS = "-j4"
+
+# Variáveis específicas
+CUSTOM_VAR = "example_value"
+PREFIX = "/usr"
+
+# ====================================================================
+# Dependências
+# ====================================================================
+[dependencies]
+runtime = ["glibc", "gcc"]
+build = ["make", "pkg-config"]
+optional = ["zlib", "openssl"]
+conflicts = ["example-old"]
+
+# ====================================================================
+# Hooks — scripts executados em diferentes estágios
+# ====================================================================
+[hooks]
+pre_download = "scripts/pre_download.sh"
+post_download = "scripts/post_download.sh"
+pre_configure = "scripts/pre_configure.sh"
+post_configure = "scripts/post_configure.sh"
+pre_build = "scripts/pre_build.sh"
+post_build = "scripts/post_build.sh"
+pre_install = "scripts/pre_install.sh"
+post_install = "scripts/post_install.sh"
+pre_remove = "scripts/pre_remove.sh"
+post_remove = "scripts/post_remove.sh"
+
+# ====================================================================
+# Instruções de build — integradas com builder/chroot/fakeroot
+# ====================================================================
+[build]
+system = "autotools"  # pode ser: make, meson, cmake, custom, autotools
+configure = "./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var"
+build = "make"
+test = "make check"
+install = "make install DESTDIR=${PKGDEST}"
+fakeroot = true
+chroot = false
+strip_binaries = true
+
+# Comandos adicionais customizados
+commands = [
+    "echo 'Iniciando build do exemplo completo...'",
+    "make -j$(nproc)"
+]
+
+# ====================================================================
+# Empacotamento — cria binário em /var/zeropkg/packages antes da instalação
+# ====================================================================
+[package_build]
+enabled = true
+type = "tar"
+output_dir = "/var/zeropkg/packages"
+compress = "xz"
+include_docs = true
+
+# ====================================================================
+# Pós-instalação — scripts, limpeza e registro
+# ====================================================================
+[post_install]
+register = true
+clean_build_dir = true
+update_cache = true
+notify = true
+
+# ====================================================================
+# Segurança do build — modo chroot/fakeroot e isolamento
+# ====================================================================
+[security]
+fakeroot = true
+use_chroot = false
+verify_checksums = true
+signature_check = false
+
+# ====================================================================
+# Metadados para LFS
+# ====================================================================
+[lfs]
+stage = "final"
+toolchain = false
+bootstrap = false
+chroot_required = false
