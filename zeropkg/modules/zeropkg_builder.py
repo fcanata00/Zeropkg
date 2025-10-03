@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-zeropkg_builder.py - Builder do Zeropkg (integrado com zeropkg_chroot)
-
-Alterações:
-- Se self.chroot definido, chama prepare_chroot(self.chroot) antes do build e cleanup depois.
-- Se dir_install for fornecido e não for "/", prepara chroot no dir_install antes da instalação.
-- Garante cleanup seguro em finally.
+zeropkg_builder.py
+Builder principal do Zeropkg — constrói pacotes a partir das receitas TOML.
 """
 
 import os
@@ -13,205 +9,115 @@ import tarfile
 import shutil
 import subprocess
 import logging
-from typing import Optional, Dict, Any, List
 
+from zeropkg_logger import log_event
+from zeropkg_toml import load_toml
 from zeropkg_downloader import download_package
 from zeropkg_patcher import Patcher
-from zeropkg_logger import log_event
-from zeropkg_db import connect, record_build_start, record_build_finish
 from zeropkg_installer import Installer
-from zeropkg_deps import resolve_dependencies
-from zeropkg_toml import PackageMeta, package_id
-from zeropkg_chroot import prepare_chroot, cleanup_chroot, ChrootError
+from zeropkg_db import DBManager
+from zeropkg_deps import DependencyResolver, resolve_and_install
+from zeropkg_chroot import prepare_chroot, cleanup_chroot
 
 logger = logging.getLogger("zeropkg.builder")
 
 
-class BuildError(Exception):
-    pass
-
-
 class Builder:
-    def __init__(self,
-                 meta: PackageMeta,
-                 cache_dir="/usr/ports/distfiles",
-                 pkg_cache="/var/zeropkg/packages",
-                 build_root="/var/zeropkg/build",
-                 dry_run=False,
-                 use_fakeroot=True,
-                 chroot: Optional[str] = None,
-                 db_path="/var/lib/zeropkg/installed.sqlite3"):
-
-        self.meta = meta
-        self.cache_dir = cache_dir
-        self.pkg_cache = pkg_cache
-        self.build_root = build_root
-        self.dry_run = dry_run
-        self.use_fakeroot = use_fakeroot
-        self.chroot = chroot
+    def __init__(self, db_path, ports_dir="/usr/ports", build_root="/var/zeropkg/build",
+                 cache_dir="/usr/ports/distfiles", packages_dir="/var/zeropkg/packages"):
         self.db_path = db_path
+        self.ports_dir = ports_dir
+        self.build_root = build_root
+        self.cache_dir = cache_dir
+        self.packages_dir = packages_dir
+        self.db = DBManager(db_path)
 
-    # -------------------------------------
-    # helpers
-    # -------------------------------------
-    def _run(self, cmd, cwd=None, env=None, stage="build"):
-        log_event(self.meta.name, stage, f"Executando: {cmd}")
-        if self.dry_run:
-            return
-        try:
-            subprocess.run(cmd, cwd=cwd, env=env or os.environ,
-                           shell=isinstance(cmd, str),
-                           check=True, text=True)
-        except subprocess.CalledProcessError as e:
-            raise BuildError(f"Falha no estágio {stage}: {cmd}\n{e.stderr or e}") from e
+    def build(self, pkg_name, args, chroot=None, dir_install=None):
+        """
+        Constrói um pacote:
+        - resolve dependências
+        - baixa fontes
+        - aplica patches/hooks
+        - compila
+        - instala em staging
+        - empacota
+        - instala (se solicitado)
+        """
+        meta = load_toml(self.ports_dir, pkg_name)
+        pkg_fullname = f"{meta['package']['name']}-{meta['package']['version']}"
 
-    def _extract(self, src: str, dest: str):
-        if self.dry_run:
-            return
-        if src.endswith(".tar.gz") or src.endswith(".tgz"):
-            mode = "r:gz"
-        elif src.endswith(".tar.xz"):
-            mode = "r:xz"
-        elif src.endswith(".tar.bz2"):
-            mode = "r:bz2"
+        staging_dir = os.path.join(self.build_root, f"{pkg_fullname}-staging")
+        os.makedirs(staging_dir, exist_ok=True)
+
+        log_event("builder", "start", f"Iniciando build de {pkg_fullname}")
+
+        # --- 1. Resolver dependências ---
+        resolver = DependencyResolver(self.db_path, self.ports_dir)
+        resolve_and_install(resolver, meta["package"]["name"], Builder, Installer, args)
+
+        # --- 2. Download do source ---
+        source_dir = os.path.join(self.build_root, pkg_fullname)
+        os.makedirs(source_dir, exist_ok=True)
+        tarball = download_package(meta, self.cache_dir)
+        if tarball.endswith((".tar.gz", ".tar.xz", ".tar.bz2")):
+            with tarfile.open(tarball, "r:*") as tf:
+                tf.extractall(source_dir)
         else:
-            raise BuildError(f"Formato não suportado: {src}")
-        with tarfile.open(src, mode) as tf:
-            def is_within_directory(directory, target):
-                abs_directory = os.path.abspath(directory)
-                abs_target = os.path.abspath(target)
-                return os.path.commonprefix([abs_directory, abs_target]) == abs_directory
-            for m in tf.getmembers():
-                if not is_within_directory(dest, os.path.join(dest, m.name)):
-                    raise BuildError("Tentativa de path traversal no tar")
-            tf.extractall(path=dest)
+            shutil.copy(tarball, source_dir)
 
-    # -------------------------------------
-    # build principal
-    # -------------------------------------
-    def build(self, dir_install: Optional[str] = None, parallel_download: bool = False) -> Dict[str, Any]:
-        """
-        Executa o build completo do pacote.
-        Retorna dict com status, caminho do pacote e build_id.
-        """
-        os.makedirs(self.build_root, exist_ok=True)
-        os.makedirs(self.pkg_cache, exist_ok=True)
+        # entrar no diretório do código-fonte
+        extracted_dirs = os.listdir(source_dir)
+        if len(extracted_dirs) == 1:
+            src_path = os.path.join(source_dir, extracted_dirs[0])
+        else:
+            src_path = source_dir
 
-        conn = connect(self.db_path)
-        build_id = record_build_start(conn, self.meta)
-        conn.close()
+        # --- 3. Aplicar patches ---
+        patcher = Patcher()
+        patcher.apply_stage("pre_configure", src_path, meta)
+        for patch in meta.get("patches", {}).get("files", []):
+            patcher.apply_patch(src_path, patch)
+        patcher.apply_stage("post_configure", src_path, meta)
 
-        pkgid = package_id(self.meta)
-        staging = os.path.join(self.build_root, f"{self.meta.name}-{pkgid}")
-        if os.path.exists(staging):
-            shutil.rmtree(staging)
-        os.makedirs(staging, exist_ok=True)
-
+        # --- 4. Ambiente ---
         env = os.environ.copy()
-        env.update(self.meta.environment or {})
-        if self.use_fakeroot:
-            env["FAKEROOT"] = "1"
+        if "build.env" in meta:
+            for k, v in meta["build.env"].items():
+                env[k] = v
 
-        chroot_prepared = False
-        install_chroot_prepared = False
+        # --- 5. Construção ---
+        def run_cmd(cmd, stage):
+            if cmd:
+                log_event("builder", stage, f"Executando: {cmd}")
+                subprocess.run(cmd, cwd=src_path, shell=True, env=env, check=True)
 
-        try:
-            # If a chroot is requested for build-time, prepare it
-            if self.chroot:
-                log_event(self.meta.name, "chroot", f"Preparando chroot de build em {self.chroot}")
-                prepare_chroot(self.chroot, copy_resolv=True, dry_run=self.dry_run)
-                chroot_prepared = True
+        run_cmd(meta.get("build", {}).get("configure"), "configure")
+        run_cmd(meta.get("build", {}).get("make"), "make")
+        if meta.get("options", {}).get("run_tests"):
+            run_cmd(meta.get("build", {}).get("check"), "check")
 
-            # 1. resolver dependências
-            deps = resolve_dependencies(self.meta, ports_dir="/usr/ports", db_path=self.db_path)
-            for dep in deps:
-                log_event(self.meta.name, "deps", f"Dependência requerida: {dep}")
+        # --- 6. Instalação em staging ---
+        env["DESTDIR"] = staging_dir
+        run_cmd(meta.get("build", {}).get("install"), "install")
 
-            # 2. baixar fontes
-            sources_info: List[Dict[str, Any]] = download_package(
-                self.meta,
-                cache_dir=self.cache_dir,
-                prefer_existing=True,
-                verbose=True,
-                parallel=parallel_download
-            )
+        # --- 7. Empacotamento ---
+        os.makedirs(self.packages_dir, exist_ok=True)
+        pkg_file = os.path.join(self.packages_dir, f"{pkg_fullname}.tar.xz")
+        with tarfile.open(pkg_file, "w:xz") as tf:
+            tf.add(staging_dir, arcname="/")
 
-            # 3. extrair fontes
-            srcdir = os.path.join(self.build_root, f"{self.meta.name}-{self.meta.version}")
-            if os.path.exists(srcdir):
-                shutil.rmtree(srcdir)
-            os.makedirs(srcdir, exist_ok=True)
+        log_event("builder", "package", f"Pacote gerado: {pkg_file}")
 
-            for entry in sources_info:
-                src_path = entry["path"]
-                log_event(self.meta.name, "fetch", f"Fonte obtida: {src_path} (cache={entry['from_cache']})")
-                self._extract(src_path, srcdir)
+        # --- 8. Instalar no sistema (se solicitado) ---
+        if dir_install or not args.build_only:
+            installer = Installer(self.db_path, self.ports_dir)
+            installer.install(pkg_name, args, pkg_file=pkg_file, chroot=chroot, dir_install=dir_install)
 
-            # 4. aplicar patches/hooks pré-configure
-            patcher = Patcher(srcdir, env=env, pkg_name=self.meta.name)
-            patcher.apply_stage("pre_configure", patches=self.meta.patches, hooks=self.meta.hooks)
+        # --- 9. Registro no DB ---
+        self.db.record_build_finish(pkg_name, meta["package"]["version"], pkg_file)
 
-            # 5. configure
-            if "configure" in self.meta.build:
-                self._run(self.meta.build["configure"], cwd=srcdir, env=env, stage="configure")
+        # --- 10. Limpeza ---
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        shutil.rmtree(source_dir, ignore_errors=True)
 
-            # 6. build
-            jobs = env.get("MAKEJOBS", "4")
-            build_cmd = self.meta.build.get("make", f"make -j{jobs}")
-            self._run(build_cmd, cwd=srcdir, env=env, stage="build")
-
-            # 7. hooks pós-build
-            patcher.apply_stage("post_build", hooks=self.meta.hooks)
-
-            # 8. instalar em staging
-            install_cmd = self.meta.build.get("install", f"make install DESTDIR={staging}")
-            self._run(install_cmd, cwd=srcdir, env=env, stage="install")
-
-            # 9. hooks pós-install
-            patcher.apply_stage("post_install", hooks=self.meta.hooks)
-
-            # 10. empacotar
-            pkgfile = os.path.join(self.pkg_cache, f"{self.meta.name}-{self.meta.version}.tar.xz")
-            if not self.dry_run:
-                with tarfile.open(pkgfile, "w:xz") as tf:
-                    tf.add(staging, arcname="/")
-
-            # 11. instalar no root se solicitado
-            if dir_install:
-                # if installing into a chroot path, prepare it
-                if os.path.abspath(dir_install) != "/":
-                    try:
-                        prepare_chroot(dir_install, copy_resolv=True, dry_run=self.dry_run)
-                        install_chroot_prepared = True
-                    except ChrootError as ce:
-                        log_event(self.meta.name, "chroot", f"Falha ao preparar chroot para install: {ce}", level="warning")
-
-                installer = Installer(db_path=self.db_path,
-                                      dry_run=self.dry_run,
-                                      root=dir_install,
-                                      use_fakeroot=self.use_fakeroot)
-                installer.install(pkgfile, self.meta, hooks=self.meta.hooks, build_id=build_id)
-
-            conn = connect(self.db_path)
-            record_build_finish(conn, build_id, "success", log_path=None)
-            conn.close()
-            return {"status": "success", "pkgfile": pkgfile, "build_id": build_id}
-
-        except Exception as e:
-            conn = connect(self.db_path)
-            record_build_finish(conn, build_id, f"failed: {e}")
-            conn.close()
-            raise
-        finally:
-            # limpar staging
-            if os.path.exists(staging):
-                shutil.rmtree(staging, ignore_errors=True)
-
-            # limpar chroots preparados
-            try:
-                if install_chroot_prepared:
-                    cleanup_chroot(dir_install, force_lazy=True, dry_run=self.dry_run)
-                if chroot_prepared:
-                    cleanup_chroot(self.chroot, force_lazy=True, dry_run=self.dry_run)
-            except Exception as e:
-                log_event(self.meta.name, "chroot", f"Erro cleanup chroot: {e}", level="warning")
+        log_event("builder", "finish", f"Build concluído de {pkg_fullname}")
