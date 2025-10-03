@@ -90,15 +90,18 @@ def cmd_install(pkgname: str, args):
 
 def cmd_remove(target: str, args):
     name, _, version = target.partition(":")
-    res = remove_package(name,
-                         version=version or None,
-                         db_path=args.db_path,
-                         ports_dir=args.ports_dir,
-                         root=args.root,
-                         dry_run=args.dry_run,
-                         use_fakeroot=args.fakeroot,
-                         force=args.force)
-    print(res["message"])
+    installer = Installer(db_path=args.db_path,
+                          ports_dir=args.ports_dir,
+                          root=args.root,
+                          dry_run=args.dry_run)
+    ok = installer.remove(name,
+                          version=version or None,
+                          hooks=None,
+                          force=args.force)
+    if ok:
+        print(f"{name} removido com sucesso.")
+    else:
+        print(f"Falha ao remover {name}. Verifique os logs.")
 
 def cmd_build(pkgname: str, args):
     meta = load_meta_from_name(pkgname, args.ports_dir)
