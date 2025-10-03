@@ -1,174 +1,183 @@
 #!/usr/bin/env python3
-"""
-zeropkg_remover.py
-
-Módulo responsável por remover pacotes e executar hooks de pré/post-remover.
-
-Funcionalidades:
-- Verifica revdeps (quem depende do pacote) antes de remover (a menos que force=True).
-- Carrega metafile TOML do ports para descobrir hooks (pre_remove/post_remove).
-- Chama Installer.remove(...) (que executa hooks e atualiza o DB).
-- Retorna relatório estruturado das ações realizadas.
-
-API pública:
-- remove_package(name, version=None, db_path=..., ports_dir=..., root="/", dry_run=False, use_fakeroot=True, force=False)
-- find_metafile_for_installed(name, ports_dir)
-- can_remove_package(name, version=None, db_path=...)
-"""
+# zeropkg_remover.py — Módulo de remoção do Zeropkg (com hooks e rollback)
+# -*- coding: utf-8 -*-
 
 from __future__ import annotations
 import os
-import logging
+import shutil
 import argparse
-from typing import Optional, Dict, Any, List
+import logging
+from typing import Optional, List, Dict, Any
 
 from zeropkg_toml import parse_toml, ValidationError
 from zeropkg_installer import Installer
-from zeropkg_db import connect, find_revdeps, get_package
-from zeropkg_logger import log_event
+from zeropkg_deps import DependencyResolver
+from zeropkg_db import DBManager
+from zeropkg_logger import get_logger, log_event
+from zeropkg_chroot import prepare_chroot, cleanup_chroot
+from zeropkg_patcher import HookError, Patcher
 
-logger = logging.getLogger("zeropkg.remover")
+LOG = get_logger(stage="remove")
 
 
 class RemoveError(Exception):
     pass
 
 
-def find_metafile_for_installed(name: str, ports_dir: str = "/usr/ports") -> Optional[str]:
-    """
-    Procura por um metafile .toml adequado para 'name' dentro de ports_dir.
-    Retorna caminho do metafile (o primeiro que achar) ou None.
-    """
-    for root, _, files in os.walk(ports_dir):
-        for f in files:
-            if f.endswith(".toml") and f.startswith(name + "-"):
-                return os.path.join(root, f)
-    candidate = os.path.join(ports_dir, name, f"{name}.toml")
-    if os.path.exists(candidate):
-        return candidate
-    return None
+class Remover:
+    def __init__(
+        self,
+        db_path: str = "/var/lib/zeropkg/installed.sqlite3",
+        ports_dir: str = "/usr/ports",
+        root: str = "/",
+        dry_run: bool = False,
+        use_fakeroot: bool = True,
+        fatal_hooks: bool = True,
+    ):
+        self.db_path = db_path
+        self.ports_dir = ports_dir
+        self.root = os.path.abspath(root or "/")
+        self.dry_run = dry_run
+        self.use_fakeroot = use_fakeroot
+        self.fatal_hooks = fatal_hooks
+        self.db = DBManager(db_path)
+        self.resolver = DependencyResolver(db_path, ports_dir)
+        self.installer = Installer(
+            db_path=db_path,
+            ports_dir=ports_dir,
+            root=self.root,
+            dry_run=dry_run,
+            use_fakeroot=use_fakeroot,
+        )
 
+    # --------------------------------------------
+    # Utilidades
+    # --------------------------------------------
+    def _find_metafile(self, name: str) -> Optional[str]:
+        """Procura por metafile do pacote."""
+        for root, _, files in os.walk(self.ports_dir):
+            for f in files:
+                if f.endswith(".toml") and f.startswith(name + "-"):
+                    return os.path.join(root, f)
+        candidate = os.path.join(self.ports_dir, name, f"{name}.toml")
+        return candidate if os.path.exists(candidate) else None
 
-def can_remove_package(name: str, version: Optional[str] = None, db_path: str = "/var/lib/zeropkg/installed.sqlite3") -> Dict[str, Any]:
-    """
-    Verifica se o pacote pode ser removido:
-    - retorna dict com keys: can_remove (bool), revdeps (list)
-    """
-    conn = connect(db_path)
-    revs = find_revdeps(conn, name)
-    conn.close()
-    return {"can_remove": len(revs) == 0, "revdeps": revs}
+    def _run_hook(self, pkg: str, stage: str, hooks: Dict[str, List[str]], workdir: str):
+        """Executa hooks pre_remove ou post_remove."""
+        if not hooks or stage not in hooks:
+            return
+        patcher = Patcher(workdir=workdir, ports_dir=self.ports_dir, pkg_name=pkg)
+        for script in hooks[stage]:
+            try:
+                patcher.run_hook(script, stage=stage)
+            except HookError as e:
+                log_event(pkg, stage, f"Hook falhou: {e}", level="error")
+                if self.fatal_hooks:
+                    raise RemoveError(f"Hook crítico falhou: {script}")
 
+    # --------------------------------------------
+    # Função principal
+    # --------------------------------------------
+    def remove(self, name: str, version: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
+        """Remove pacote com segurança e hooks integrados."""
+        log_event(name, "remove", f"Solicitada remoção ({'dry-run' if self.dry_run else 'real'})")
+        pkg_info = self.db.get_package(name)
+        if not pkg_info:
+            msg = f"Pacote {name} não encontrado no DB"
+            log_event(name, "remove", msg, level="warning")
+            return {"status": "not_found", "message": msg}
 
-def remove_package(name: str,
-                   version: Optional[str] = None,
-                   db_path: str = "/var/lib/zeropkg/installed.sqlite3",
-                   ports_dir: str = "/usr/ports",
-                   root: str = "/",
-                   dry_run: bool = False,
-                   use_fakeroot: bool = True,
-                   force: bool = False) -> Dict[str, Any]:
-    """
-    Remove um pacote do sistema (prefix 'root'), chamando hooks pre/post remove quando disponíveis.
+        revdeps = self.db.find_revdeps(name)
+        if revdeps and not force:
+            msg = f"Remoção bloqueada: dependentes -> {', '.join(revdeps)}"
+            log_event(name, "remove", msg, level="warning")
+            return {"status": "blocked", "revdeps": revdeps, "removed": False, "message": msg}
 
-    Parâmetros:
-      - name: nome do pacote a remover
-      - version: versão específica (opcional)
-      - db_path: caminho do sqlite DB
-      - ports_dir: onde procurar metafiles (para obter hooks)
-      - root: prefixo de instalação (ex: / ou /mnt/lfs)
-      - dry_run: se True, apenas simula e não modifica nada
-      - use_fakeroot: repassa para Installer (fakeroot ou não)
-      - force: se True, ignora revdeps e força a remoção
+        metafile = self._find_metafile(name)
+        hooks = {}
+        if metafile:
+            try:
+                meta = parse_toml(metafile)
+                hooks = getattr(meta, "hooks", {}) or {}
+            except Exception as e:
+                log_event(name, "remove", f"Erro ao ler metafile: {e}", level="warning")
 
-    Retorna:
-      dict { "status": "ok"|"blocked"|"error", "removed": True/False, "revdeps": [...], "message": str }
-    """
-    log_event(name, "remove", f"Solicitada remoção: {name} {version or ''} (root={root})")
-    # 1) verificar revdeps
-    conn = connect(db_path)
-    revs = find_revdeps(conn, name)
-    conn.close()
-    if revs and not force:
-        msg = f"Remoção bloqueada: {len(revs)} pacotes dependem de {name}"
-        log_event(name, "remove", msg, level="warning")
-        return {"status": "blocked", "removed": False, "revdeps": revs, "message": msg}
+        # Hooks pré-remover
+        self._run_hook(name, "pre_remove", hooks, self.root)
 
-    # 2) tentar ler hooks do metafile (se disponível)
-    metafile = find_metafile_for_installed(name, ports_dir)
-    hooks = None
-    meta_info = None
-    if metafile:
+        if self.dry_run:
+            files = pkg_info.get("files", [])
+            log_event(name, "remove", f"[dry-run] Removeria {len(files)} arquivos de {name}")
+            return {"status": "ok", "removed": False, "message": f"[dry-run] {len(files)} arquivos seriam removidos"}
+
+        # Executar em chroot seguro
         try:
-            meta = parse_toml(metafile)
-            hooks = getattr(meta, "hooks", None) or {}
-            meta_info = {"name": meta.name, "version": meta.version, "meta_path": metafile}
-            log_event(name, "remove", f"Metafile encontrado: {metafile}")
-        except (FileNotFoundError, ValidationError) as e:
-            # continua sem hooks se falhar
-            log_event(name, "remove", f"Erro ao ler metafile ({metafile}): {e}", level="warning")
-            hooks = None
-    else:
-        log_event(name, "remove", "Nenhum metafile encontrado; remoção prossegue sem hooks")
+            with prepare_chroot(self.root):
+                ok = self.installer.remove(name, version, hooks=hooks, force=force)
+                if ok:
+                    log_event(name, "remove", f"Remoção completa: {name}")
+                else:
+                    raise RemoveError(f"Installer.remove retornou erro para {name}")
+        except Exception as e:
+            log_event(name, "remove", f"Erro de remoção em chroot: {e}", level="error")
+            raise
 
-    # 3) executar remoção via Installer (que já registra no DB e aplica hooks)
-    inst = Installer(db_path=db_path, dry_run=dry_run, root=root, use_fakeroot=use_fakeroot)
-    try:
-        # Installer.remove aceita hooks optional
-        inst.remove(name, version, hooks=hooks)
-        msg = f"Remoção executada: {name} {version or ''}"
-        log_event(name, "remove", msg)
-        return {"status": "ok", "removed": True, "revdeps": revs, "message": msg, "meta": meta_info}
-    except Exception as e:
-        log_event(name, "remove", f"Erro na remoção de {name}: {e}", level="error")
-        raise RemoveError(str(e)) from e
+        # Hooks pós-remover
+        self._run_hook(name, "post_remove", hooks, self.root)
+
+        self.db.log_event(name, "remove", "Remoção concluída")
+        return {"status": "ok", "removed": True, "message": f"Pacote {name} removido"}
+
+    # --------------------------------------------
+    # Múltiplos pacotes (depclean)
+    # --------------------------------------------
+    def remove_multiple(self, packages: List[str], force: bool = False) -> Dict[str, List[str]]:
+        summary = {"removed": [], "failed": [], "blocked": []}
+        for pkg in packages:
+            try:
+                res = self.remove(pkg, force=force)
+                if res.get("status") == "ok":
+                    summary["removed"].append(pkg)
+                elif res.get("status") == "blocked":
+                    summary["blocked"].append(pkg)
+                else:
+                    summary["failed"].append(pkg)
+            except Exception as e:
+                summary["failed"].append(pkg)
+                log_event(pkg, "remove", f"Erro: {e}", level="error")
+        return summary
 
 
-# -----------------------
-# CLI / utilitário mínimo
-# -----------------------
+# --------------------------------------------
+# CLI utilitário
+# --------------------------------------------
 def _build_argparser():
-    p = argparse.ArgumentParser(prog="zeropkg-remove", description="Remover pacote Zeropkg (executa hooks pre/post)")
-    p.add_argument("package", help="nome do pacote (ex: gcc)")
-    p.add_argument("-v", "--version", help="versão específica (opcional)", default=None)
-    p.add_argument("--root", default="/", help="prefixo de instalação (ex: /mnt/lfs)")
-    p.add_argument("--ports-dir", default="/usr/ports", help="diretório de recipes/ports")
-    p.add_argument("--db-path", default="/var/lib/zeropkg/installed.sqlite3", help="caminho do DB sqlite")
-    p.add_argument("--dry-run", action="store_true", help="simula a remoção sem alterar nada")
-    p.add_argument("-f", "--force", action="store_true", help="força remoção mesmo se houver revdeps")
-    p.add_argument("--no-fakeroot", action="store_true", help="não usar fakeroot (por padrão usa fakeroot)")
+    p = argparse.ArgumentParser(prog="zeropkg-remove", description="Remove pacotes com hooks e rollback")
+    p.add_argument("package", nargs="+", help="Pacote(s) a remover")
+    p.add_argument("-v", "--version", help="Versão específica", default=None)
+    p.add_argument("--root", default="/", help="Prefixo (ex: /mnt/lfs)")
+    p.add_argument("--ports-dir", default="/usr/ports", help="Diretório de recipes")
+    p.add_argument("--db-path", default="/var/lib/zeropkg/installed.sqlite3", help="Banco de dados")
+    p.add_argument("--dry-run", action="store_true", help="Simula sem remover")
+    p.add_argument("-f", "--force", action="store_true", help="Ignora dependentes")
+    p.add_argument("--no-fakeroot", action="store_true", help="Não usar fakeroot")
     return p
 
 
 def main(argv: Optional[List[str]] = None):
-    p = _build_argparser()
-    args = p.parse_args(argv)
-
-    try:
-        res = remove_package(
-            args.package,
-            version=args.version,
-            db_path=args.db_path,
-            ports_dir=args.ports_dir,
-            root=args.root,
-            dry_run=args.dry_run,
-            use_fakeroot=not args.no_fakeroot,
-            force=args.force
-        )
-        if res["status"] == "blocked":
-            print("Remoção bloqueada — pacotes dependem deste:", res["revdeps"])
-            print("Use --force para forçar (cuidado).")
-            return 2
-        elif res["status"] == "ok":
-            print("Remoção concluída:", res.get("message"))
-            return 0
-        else:
-            print("Erro:", res.get("message"))
-            return 1
-    except RemoveError as e:
-        print("Falha na remoção:", e)
-        return 1
+    args = _build_argparser().parse_args(argv)
+    remover = Remover(
+        db_path=args.db_path,
+        ports_dir=args.ports_dir,
+        root=args.root,
+        dry_run=args.dry_run,
+        use_fakeroot=not args.no_fakeroot,
+    )
+    result = remover.remove_multiple(args.package, force=args.force)
+    print("Resumo:")
+    for key, items in result.items():
+        print(f"  {key}: {len(items)} {' '.join(items)}")
 
 
 if __name__ == "__main__":
-    exit(main())
+    main()
