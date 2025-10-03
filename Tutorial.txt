@@ -112,6 +112,7 @@ Flags adicionais:
 3. Crie receitas .toml para cada passo do LFS (binutils-pass1, gcc-pass1, etc.)
 4. Use o comando:
     zeropkg --lfs-bootstrap --root /mnt/lfs
+    zeropkg --install gcc-13.2.0-pass1 --root /mnt/lfs
    Isso executa a ordem oficial do livro:
      - Binutils pass1
      - GCC pass1
