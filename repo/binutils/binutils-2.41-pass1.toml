@@ -1,0 +1,54 @@
+[package]
+name = "binutils"
+version = "2.41-pass1"
+category = "toolchain"
+description = "Binutils (primeira passagem) para LFS toolchain"
+homepage = "https://www.gnu.org/software/binutils/"
+licenses = ["GPL-3.0-or-later"]
+
+[dependencies]
+build = ["gcc", "make"]
+runtime = []
+
+[source]
+# URL oficial
+urls = [
+    "https://ftp.gnu.org/gnu/binutils/binutils-2.41.tar.xz",
+    "https://ftpmirror.gnu.org/binutils/binutils-2.41.tar.xz"
+]
+sha256 = "5b9c09b2fffb2c9b03a07e0ed0b8e8ab9d40f83dbb2519038b7a769ffed3cf1a"
+
+[patches]
+files = []
+
+[build]
+configure = "../configure \
+    --prefix=/tools \
+    --with-sysroot=$LFS \
+    --target=$LFS_TGT \
+    --disable-nls \
+    --disable-werror"
+make = "make -j$(nproc)"
+check = ""   # testes geralmente pulados no pass1
+install = "make install"
+
+[build.env]
+LFS = "/mnt/lfs"
+LFS_TGT = "x86_64-lfs-linux-gnu"
+PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
+CONFIG_SITE = "none"
+
+[hooks]
+pre_configure = "echo '[HOOK] Preparando build do binutils-pass1...'"
+post_install = "echo '[HOOK] Binutils-pass1 instalado em $LFS/tools'"
+
+[options]
+fakeroot = true
+chroot = false
+package_before_install = true
+run_tests = false
+
+[files]
+bin = ["/tools/bin/*"]
+lib = ["/tools/lib/*"]
+doc = []
