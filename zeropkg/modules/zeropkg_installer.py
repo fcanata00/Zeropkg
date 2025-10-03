@@ -2,55 +2,86 @@
 """
 zeropkg_installer.py
 
-Installer completo para Zeropkg.
+Installer completo para Zeropkg — funcionalidade LFS-ready.
 
-Funcionalidades:
-- instalação de pacotes binários (tarballs) em um prefixo (--root)
-- suporte a fakeroot para preservar UID/GID (use_fakeroot=True)
-- integração com Builder via build_id (gravado no DB)
-- registro no banco SQLite (register_package)
-- execução de hooks (post_install / post_remove) via Patcher
-- dry-run para simulação
-- extração segura e cálculo opcional de SHA256 por arquivo
+Principais features:
+- instalar .tar.xz/.tar.gz/.zip em um prefixo (--root)
+- usar fakeroot para preservar UID/GID (use_fakeroot=True)
+- preparar/desmontar chroot (prepare_chroot / cleanup_chroot)
+- integração com DB: register_package / remove_package / get_package / record_event
+- executar hooks via Patcher (pre_install, post_install, pre_remove, post_remove)
+- extração segura (prevenção path traversal)
+- dry_run que simula operações
+- calcular sha256 para arquivos instalados (opcional)
 """
 
 from __future__ import annotations
 import os
-import tarfile
-import tempfile
 import shutil
+import tarfile
+import zipfile
+import tempfile
+import subprocess
 import hashlib
 import time
-import subprocess
 import json
+import logging
 import shlex
 from typing import Optional, List, Tuple, Dict
 
+# Importar API do projeto — adapte se o seu módulo tiver outro nome/assinatura
 from zeropkg_db import connect, register_package, remove_package, get_package, record_event
-from zeropkg_logger import log_event
 from zeropkg_patcher import Patcher, HookError
+from zeropkg_logger import log_event
 
-# defaults (ajuste conforme sua instalação)
+# Defaults (ajuste se quiser)
 DEFAULT_DB = "/var/lib/zeropkg/installed.sqlite3"
 DEFAULT_STAGING_BASE = "/var/zeropkg/staging"
 DEFAULT_PKG_CACHE = "/var/zeropkg/packages"
-DEFAULT_FAKEROOT = "fakeroot"
+
+# configure simple logging fallback
+logger = logging.getLogger("zeropkg.installer")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
+
 
 class InstallerError(Exception):
     pass
 
+
 def _now_tag() -> str:
     return time.strftime("%Y%m%d%H%M%S")
 
-def _safe_extract(tar: tarfile.TarFile, dest: str) -> None:
-    """Extrai um tarfile prevenindo path traversal."""
-    for member in tar.getmembers():
-        member_path = os.path.join(dest, member.name)
-        abs_dest = os.path.abspath(dest)
-        abs_target = os.path.abspath(member_path)
-        if not (abs_target == abs_dest or abs_target.startswith(abs_dest + os.sep)):
-            raise InstallerError(f"Arquivo inseguro no tar: {member.name}")
-    tar.extractall(dest)
+
+def _safe_extract_tar(tar_path: str, dest: str) -> None:
+    """
+    Extrai tar de forma segura prevenindo path traversal.
+    Suporta tar.* (gzip/xz) via tarfile.
+    """
+    with tarfile.open(tar_path, "r:*") as tar:
+        for member in tar.getmembers():
+            member_path = os.path.join(dest, member.name)
+            abs_dest = os.path.abspath(dest)
+            abs_target = os.path.abspath(member_path)
+            if not (abs_target == abs_dest or abs_target.startswith(abs_dest + os.sep)):
+                raise InstallerError(f"Arquivo inseguro no tar: {member.name}")
+        tar.extractall(dest)
+
+
+def _extract_archive_any(path: str, dest: str) -> None:
+    """
+    Detecta tar/zip/single-file e extrai/copia para dest.
+    """
+    os.makedirs(dest, exist_ok=True)
+    if tarfile.is_tarfile(path):
+        _safe_extract_tar(path, dest)
+    elif zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path, "r") as z:
+            z.extractall(dest)
+    else:
+        # fallback: copiar arquivo simples
+        shutil.copy2(path, os.path.join(dest, os.path.basename(path)))
+
 
 def _calc_sha256(path: str) -> str:
     h = hashlib.sha256()
@@ -59,23 +90,23 @@ def _calc_sha256(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
 class Installer:
     def __init__(self,
                  db_path: str = DEFAULT_DB,
                  dry_run: bool = False,
                  root: str = "/",
                  use_fakeroot: bool = False,
-                 fakeroot_bin: str = DEFAULT_FAKEROOT):
+                 fakeroot_bin: str = "fakeroot"):
         """
-        db_path: caminho do sqlite DB
-        dry_run: se True, simula sem aplicar
-        root: prefixo de instalação (ex: "/", "/mnt/lfs")
-        use_fakeroot: se True, usa fakeroot para preservar UID/GID
-        fakeroot_bin: caminho do binário fakeroot (por padrão "fakeroot")
+        db_path: caminho para sqlite DB
+        dry_run: se True, apenas simula
+        root: prefixo de instalação (ex: '/', '/mnt/lfs')
+        use_fakeroot: se True, usa fakeroot para operações que preservam UID/GID
+        fakeroot_bin: binário fakeroot (padrão 'fakeroot')
         """
         self.db_path = db_path
         self.dry_run = dry_run
-        # normalizar root (sem trailing slash exceto se for apenas "/")
         self.root = os.path.abspath(root)
         self.use_fakeroot = use_fakeroot
         self.fakeroot_bin = fakeroot_bin
@@ -84,18 +115,72 @@ class Installer:
         os.makedirs(DEFAULT_PKG_CACHE, exist_ok=True)
 
     # -------------------------
-    # Helpers para fakeroot
+    # chroot helpers (mount /dev, /proc, /sys, /dev/pts)
+    # -------------------------
+    def prepare_chroot(self) -> None:
+        """
+        Prepara mounts dentro do self.root (bind /dev, mount proc/sys/devpts).
+        Necessita privilégios (root). Em dry_run apenas loga.
+        """
+        chroot_path = self.root
+        log_event("installer", "installer", f"prepare_chroot: {chroot_path}")
+        if self.dry_run:
+            log_event("installer", "installer", f"[dry-run] mount --bind /dev -> {chroot_path}/dev")
+            log_event("installer", "installer", f"[dry-run] mount -t proc proc -> {chroot_path}/proc")
+            log_event("installer", "installer", f"[dry-run] mount -t sysfs sys -> {chroot_path}/sys")
+            log_event("installer", "installer", f"[dry-run] mount -t devpts devpts -> {chroot_path}/dev/pts")
+            return
+
+        try:
+            for d in ("dev", "proc", "sys", "dev/pts"):
+                path = os.path.join(chroot_path, d)
+                os.makedirs(path, exist_ok=True)
+
+            subprocess.run(["mount", "--bind", "/dev", os.path.join(chroot_path, "dev")], check=True)
+            subprocess.run(["mount", "-t", "proc", "proc", os.path.join(chroot_path, "proc")], check=True)
+            subprocess.run(["mount", "-t", "sysfs", "sys", os.path.join(chroot_path, "sys")], check=True)
+            subprocess.run(["mount", "-t", "devpts", "devpts", os.path.join(chroot_path, "dev/pts")], check=True)
+            log_event("installer", "installer", "prepare_chroot: mounts prontos")
+        except subprocess.CalledProcessError as e:
+            log_event("installer", "installer", f"prepare_chroot erro: {e}")
+            raise InstallerError(f"prepare_chroot failed: {e}") from e
+
+    def cleanup_chroot(self) -> None:
+        """
+        Limpa os mounts criados por prepare_chroot. Best-effort, ignora erros.
+        """
+        chroot_path = self.root
+        log_event("installer", "installer", f"cleanup_chroot: {chroot_path}")
+        if self.dry_run:
+            log_event("installer", "installer", f"[dry-run] umount {chroot_path}/dev/pts")
+            log_event("installer", "installer", f"[dry-run] umount {chroot_path}/sys")
+            log_event("installer", "installer", f"[dry-run] umount {chroot_path}/proc")
+            log_event("installer", "installer", f"[dry-run] umount {chroot_path}/dev")
+            return
+
+        mpoints = [
+            os.path.join(chroot_path, "dev/pts"),
+            os.path.join(chroot_path, "sys"),
+            os.path.join(chroot_path, "proc"),
+            os.path.join(chroot_path, "dev"),
+        ]
+        for mp in mpoints:
+            try:
+                # lazy umount
+                subprocess.run(["umount", "-l", mp], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        log_event("installer", "installer", "cleanup_chroot: mounts limpos (tentativa)")
+
+    # -------------------------
+    # fakeroot helpers
     # -------------------------
     def _run_fakeroot_sh(self, sh_command: str, cwd: Optional[str] = None) -> None:
-        """
-        Executa uma string shell via fakeroot: fakeroot sh -c '...'
-        Levanta InstallerError em caso de falha.
-        """
         cmd = [self.fakeroot_bin, "sh", "-c", sh_command]
         try:
             subprocess.run(cmd, cwd=cwd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except subprocess.CalledProcessError as e:
-            raise InstallerError(f"fakeroot comando falhou: {sh_command}\n{e.stderr}") from e
+            raise InstallerError(f"fakeroot command failed: {sh_command}\n{e.stderr}") from e
 
     def _fakeroot_copy(self, src: str, dst: str) -> None:
         src_q = shlex.quote(src)
@@ -110,13 +195,13 @@ class Installer:
         path_q = shlex.quote(path)
         self._run_fakeroot_sh(f"rm -f {path_q}")
 
-    def _fakeroot_extract(self, tarfile_path: str, dest: str) -> None:
-        tar_q = shlex.quote(os.path.abspath(tarfile_path))
+    def _fakeroot_extract(self, archive: str, dest: str) -> None:
+        arch_q = shlex.quote(os.path.abspath(archive))
         dest_q = shlex.quote(dest)
-        self._run_fakeroot_sh(f"mkdir -p {dest_q} && tar -xf {tar_q} -C {dest_q}")
+        self._run_fakeroot_sh(f"mkdir -p {dest_q} && tar -xf {arch_q} -C {dest_q}")
 
     # -------------------------
-    # Instalação
+    # Main operations
     # -------------------------
     def install(self,
                 pkgfile: str,
@@ -125,127 +210,153 @@ class Installer:
                 run_hooks: bool = True,
                 build_id: Optional[int] = None) -> List[str]:
         """
-        Instala um tarball pkgfile segundo PackageMeta meta.
-
-        Retorna: lista de caminhos instalados (absolutos relativos ao prefix root).
+        Instala um pacote binário (.tar.* ou .zip) no prefixo self.root.
+        Retorna lista de arquivos instalados (caminhos absolutos).
         """
         pkg_name = getattr(meta, "name", "unknown")
         pkg_ver = getattr(meta, "version", "unknown")
-        staging_dir = os.path.join(DEFAULT_STAGING_BASE, f"{pkg_name}-{pkg_ver}-{_now_tag()}")
+        staging = os.path.join(DEFAULT_STAGING_BASE, f"{pkg_name}-{pkg_ver}-{_now_tag()}")
 
-        log_event(pkg_name, "installer", f"Iniciando instalação {pkg_name}-{pkg_ver} (root={self.root}, fakeroot={self.use_fakeroot})")
+        log_event(pkg_name, "installer", f"install: iniciando {pkg_name}-{pkg_ver} root={self.root} fakeroot={self.use_fakeroot} dry_run={self.dry_run}")
 
-        # criar staging
-        if not self.dry_run:
-            os.makedirs(staging_dir, exist_ok=True)
+        # preparar chroot se necessário
+        chroot_was_prepared = False
+        if getattr(meta, "hooks", None) or getattr(meta, "build", None):
+            # Preferência: se meta indica que precisamos de chroot, deixe o usuário passar chroot via root; aqui só usamos flag root.
+            pass
+
+        if self.dry_run:
+            log_event(pkg_name, "installer", f"[dry-run] criar staging em {staging}")
         else:
-            print(f"[dry-run] Criar staging: {staging_dir}")
+            os.makedirs(staging, exist_ok=True)
 
-        # extrair
+        # Se precisamos preparar chroot (usuário quer instalar dentro de um chroot root), faça
+        # (decisão: se root != '/', consideramos que é chroot target)
         try:
+            if self.root != "/":
+                self.prepare_chroot()
+                chroot_was_prepared = True
+
+            # 1) extrair para staging
             if self.dry_run:
-                log_event(pkg_name, "installer", f"[dry-run] extrair {pkgfile} -> {staging_dir}")
+                log_event(pkg_name, "installer", f"[dry-run] extrair {pkgfile} -> {staging}")
             else:
                 if self.use_fakeroot:
-                    # usar fakeroot para extrair de forma que ownerships simulados sejam aplicados
-                    self._fakeroot_extract(pkgfile, staging_dir)
+                    # usar fakeroot para extrair — preserva owners simulados
+                    self._fakeroot_extract(pkgfile, staging)
                 else:
-                    with tarfile.open(pkgfile, "r:*") as tar:
-                        _safe_extract(tar, staging_dir)
-                log_event(pkg_name, "installer", f"Extração concluída: {staging_dir}")
-        except Exception as e:
-            raise InstallerError(f"Falha na extração do pacote {pkgfile}: {e}") from e
+                    _extract_archive_any(pkgfile, staging)
+                log_event(pkg_name, "installer", f"extraído para {staging}")
 
-        # copiar arquivos do staging para o prefix root
-        installed_files: List[str] = []
-        try:
-            for root_dir, dirs, files in os.walk(staging_dir):
-                rel_root = os.path.relpath(root_dir, staging_dir)
+            # 2) executar pre_install hooks (no root)
+            hooks = getattr(meta, "hooks", {}) or {}
+            if run_hooks and "pre_install" in hooks:
+                try:
+                    if self.dry_run:
+                        log_event(pkg_name, "installer", f"[dry-run] pre_install hooks: {hooks['pre_install']}")
+                    else:
+                        patcher = Patcher(workdir=self.root, env=getattr(meta, "environment", {}), pkg_name=pkg_name)
+                        patcher.apply_stage("pre_install", {}, {"pre_install": hooks["pre_install"]})
+                        log_event(pkg_name, "installer", "pre_install hooks executados")
+                except HookError as he:
+                    log_event(pkg_name, "installer", f"Erro em pre_install hook: {he}")
+
+            # 3) copiar arquivos do staging para o prefix root
+            installed_files: List[str] = []
+            for src_root, dirs, files in os.walk(staging):
+                rel_root = os.path.relpath(src_root, staging)
                 if rel_root == ".":
                     rel_root = ""
                 target_root = os.path.join(self.root, rel_root) if rel_root else self.root
 
-                if self.use_fakeroot:
-                    # criar diretório alvo via fakeroot
-                    if self.dry_run:
-                        print(f"[dry-run] fakeroot mkdir -p {target_root}")
-                    else:
-                        self._fakeroot_mkdir(target_root)
+                # criar target_root
+                if self.dry_run:
+                    log_event(pkg_name, "installer", f"[dry-run] criar dir {target_root}")
                 else:
-                    if not self.dry_run:
+                    if self.use_fakeroot:
+                        try:
+                            self._fakeroot_mkdir(target_root)
+                        except InstallerError:
+                            os.makedirs(target_root, exist_ok=True)
+                    else:
                         os.makedirs(target_root, exist_ok=True)
 
                 for fname in files:
-                    src_path = os.path.join(root_dir, fname)
+                    src_path = os.path.join(src_root, fname)
                     dst_path = os.path.join(target_root, fname)
-
                     if self.dry_run:
-                        print(f"[dry-run] copy {src_path} -> {dst_path}")
+                        log_event(pkg_name, "installer", f"[dry-run] copy {src_path} -> {dst_path}")
                     else:
-                        if self.use_fakeroot:
-                            # cp -a via fakeroot (shell quoting)
-                            try:
-                                self._fakeroot_copy(src_path, dst_path)
-                            except InstallerError:
-                                # fallback para operação local se cp falhar
+                        try:
+                            if self.use_fakeroot:
+                                try:
+                                    self._fakeroot_copy(src_path, dst_path)
+                                except InstallerError:
+                                    # fallback para copy local
+                                    shutil.copy2(src_path, dst_path)
+                            else:
                                 shutil.copy2(src_path, dst_path)
-                        else:
-                            shutil.copy2(src_path, dst_path)
-                        installed_files.append(dst_path)
-        except Exception as e:
-            raise InstallerError(f"Falha ao copiar arquivos para root: {e}") from e
+                            installed_files.append(dst_path)
+                        except PermissionError as pe:
+                            raise InstallerError(f"Permissão negada ao copiar {src_path} -> {dst_path}: {pe}") from pe
+                        except Exception as e:
+                            raise InstallerError(f"Erro ao copiar {src_path} -> {dst_path}: {e}") from e
 
-        # calcular hashes
-        files_with_hash: List[Tuple[str, Optional[str]]] = []
-        for p in installed_files:
-            if compute_hash and not self.dry_run:
-                try:
-                    h = _calc_sha256(p)
-                except Exception:
+            # 4) calcular hashes (opcional)
+            files_with_hash: List[Tuple[str, Optional[str]]] = []
+            for p in installed_files:
+                if compute_hash and not self.dry_run:
+                    try:
+                        h = _calc_sha256(p)
+                    except Exception:
+                        h = None
+                else:
                     h = None
-            else:
-                h = None
-            files_with_hash.append((p, h))
+                files_with_hash.append((p, h))
 
-        # registrar no DB
-        if not self.dry_run:
-            try:
+            # 5) registrar no DB
+            if not self.dry_run:
                 conn = connect(self.db_path)
                 pkgfile_abs = os.path.abspath(pkgfile)
                 pkg_id = register_package(conn, meta, pkgfile_abs, files_with_hash, build_id=build_id)
-                record_event(conn, "INFO", "installer", f"Pacote instalado: {pkg_name}-{pkg_ver}", {"pkg_id": pkg_id, "build_id": build_id})
-                log_event(pkg_name, "installer", f"Registrado no DB (pkg_id={pkg_id}, build_id={build_id})")
-            except Exception as e:
-                raise InstallerError(f"Erro ao registrar pacote no DB: {e}") from e
-        else:
-            log_event(pkg_name, "installer", "[dry-run] registro no DB simulado")
-
-        # executar hooks post_install
-        if run_hooks:
-            hooks = getattr(meta, "hooks", {}) or {}
-            if "post_install" in hooks:
                 try:
-                    patcher = Patcher(workdir=self.root, env=getattr(meta, "environment", {}), pkg_name=pkg_name)
+                    record_event(conn, "INFO", "installer", f"Pacote instalado: {pkg_name}-{pkg_ver}", {"pkg_id": pkg_id, "build_id": build_id})
+                except Exception:
+                    # Se record_event não existir na sua versão do DB, ignore
+                    pass
+                log_event(pkg_name, "installer", f"registrado no DB pkg_id={pkg_id}")
+            else:
+                log_event(pkg_name, "installer", "[dry-run] registro no DB simulado")
+
+            # 6) executar post_install hooks
+            if run_hooks and "post_install" in hooks:
+                try:
                     if self.dry_run:
-                        print(f"[dry-run] executar post_install hooks: {hooks['post_install']}")
+                        log_event(pkg_name, "installer", f"[dry-run] post_install hooks: {hooks['post_install']}")
                     else:
+                        patcher = Patcher(workdir=self.root, env=getattr(meta, "environment", {}), pkg_name=pkg_name)
                         patcher.apply_stage("post_install", {}, {"post_install": hooks["post_install"]})
                         log_event(pkg_name, "installer", "post_install hooks executados")
                 except HookError as he:
-                    # registrar evento e continuar (política: não reverter automaticamente)
-                    log_event(pkg_name, "installer", f"Erro em hook post_install: {he}")
+                    log_event(pkg_name, "installer", f"Erro em post_install hook: {he}")
 
-        # limpeza do staging
-        if not self.dry_run:
-            try:
-                shutil.rmtree(staging_dir, ignore_errors=True)
-            except Exception:
-                pass
-        else:
-            print(f"[dry-run] staging {staging_dir} mantido para inspeção")
+            # 7) limpar staging
+            if not self.dry_run:
+                try:
+                    shutil.rmtree(staging, ignore_errors=True)
+                except Exception:
+                    pass
 
-        log_event(pkg_name, "installer", f"Instalação concluída: {pkg_name}-{pkg_ver} ({len(installed_files)} arquivos)")
-        return installed_files
+            log_event(pkg_name, "installer", f"Instalação finalizada: {pkg_name}-{pkg_ver} (arquivos: {len(installed_files)})")
+            return installed_files
+
+        finally:
+            # cleanup chroot se preparado
+            if chroot_was_prepared:
+                try:
+                    self.cleanup_chroot()
+                except Exception:
+                    log_event(pkg_name, "installer", "Erro durante cleanup_chroot (ignorado)")
 
     # -------------------------
     # Remoção
@@ -255,11 +366,9 @@ class Installer:
                version: Optional[str] = None,
                run_hooks: bool = True) -> List[str]:
         """
-        Remove pacote com base no DB.
-        Retorna lista de arquivos que foram (ou seriam) removidos.
+        Remove pacote com base no registro no DB. Retorna lista de arquivos removidos.
         """
-        conn = connect(self.db_path)
-        pkg = get_package(conn, name, version)
+        pkg = get_package(connect(self.db_path), name, version)
         if not pkg:
             raise InstallerError(f"Pacote não encontrado no DB: {name} {version or ''}")
 
@@ -273,71 +382,97 @@ class Installer:
             except Exception:
                 hooks = {}
 
-        # excluir do DB (remove_package retorna paths registrados)
+        pkg_name = name
+        log_event(pkg_name, "installer", f"remove: iniciando remoção {pkg_name}:{pkg_version}")
+
+        # prepare chroot if root != '/'
+        chroot_was_prepared = False
+        if self.root != "/":
+            self.prepare_chroot()
+            chroot_was_prepared = True
+
         try:
-            files_to_remove = remove_package(conn, name, pkg_version)
-        except Exception as e:
-            raise InstallerError(f"Erro ao remover registro do DB: {e}") from e
-
-        removed_files: List[str] = []
-        for fpath in files_to_remove:
-            if self.dry_run:
-                print(f"[dry-run] remover arquivo {fpath}")
-            else:
+            # run pre_remove hooks
+            if run_hooks and "pre_remove" in hooks:
                 try:
-                    if self.use_fakeroot:
-                        # usar fakeroot para remover
-                        try:
-                            self._fakeroot_remove(fpath)
-                        except InstallerError:
-                            # fallback: tentar remover localmente
-                            if os.path.exists(fpath):
-                                os.remove(fpath)
-                        else:
-                            # assume removido
-                            removed_files.append(fpath)
+                    if self.dry_run:
+                        log_event(pkg_name, "installer", f"[dry-run] pre_remove hooks: {hooks['pre_remove']}")
                     else:
-                        if os.path.exists(fpath):
-                            os.remove(fpath)
-                            removed_files.append(fpath)
-                except Exception as e:
-                    log_event(name, "installer", f"Erro ao remover {fpath}: {e}")
+                        patcher = Patcher(workdir=self.root, env=os.environ.copy(), pkg_name=pkg_name)
+                        patcher.apply_stage("pre_remove", {}, {"pre_remove": hooks["pre_remove"]})
+                except HookError as he:
+                    log_event(pkg_name, "installer", f"Erro em pre_remove hook: {he}")
 
-        # tentar remover diretórios vazios ascendentes (respeitando prefix self.root)
-        if not self.dry_run:
-            for fpath in removed_files:
-                d = os.path.dirname(fpath)
-                while True:
-                    if not d.startswith(self.root):
-                        break
-                    if d == self.root or d == os.path.sep:
-                        break
+            # remove registro do DB e obter lista de caminhos (remove_package deve implementar isso)
+            conn = connect(self.db_path)
+            try:
+                paths = remove_package(conn, name, pkg_version)
+            except Exception as e:
+                raise InstallerError(f"Erro ao remover pacote do DB: {e}") from e
+
+            removed: List[str] = []
+            for p in paths:
+                if self.dry_run:
+                    log_event(pkg_name, "installer", f"[dry-run] remover arquivo {p}")
+                else:
                     try:
-                        if os.listdir(d):
-                            break
-                        # se fakeroot, tentar com fakeroot
                         if self.use_fakeroot:
                             try:
-                                self._run_fakeroot_sh(f"rmdir {shlex.quote(d)}")
+                                self._fakeroot_remove(p)
+                                removed.append(p)
                             except InstallerError:
-                                break
+                                if os.path.exists(p):
+                                    os.remove(p)
+                                    removed.append(p)
                         else:
-                            os.rmdir(d)
-                        d = os.path.dirname(d)
-                    except Exception:
-                        break
+                            if os.path.exists(p):
+                                os.remove(p)
+                                removed.append(p)
+                    except Exception as e:
+                        log_event(pkg_name, "installer", f"Erro ao remover {p}: {e}")
 
-        # executar hooks post_remove
-        if run_hooks and "post_remove" in hooks:
-            try:
-                patcher = Patcher(workdir=self.root, env=os.environ.copy(), pkg_name=name)
-                if self.dry_run:
-                    print(f"[dry-run] executar post_remove hooks: {hooks['post_remove']}")
-                else:
-                    patcher.apply_stage("post_remove", {}, {"post_remove": hooks["post_remove"]})
-                    log_event(name, "installer", "post_remove hooks executados")
-            except HookError as he:
-                log_event(name, "installer", f"Erro em hook post_remove: {he}")
+            # remover diretórios vazios ascendentes (respeitando self.root)
+            if not self.dry_run:
+                for p in removed:
+                    d = os.path.dirname(p)
+                    while True:
+                        if not d.startswith(self.root):
+                            break
+                        if d == self.root or d == os.path.sep:
+                            break
+                        try:
+                            if os.listdir(d):
+                                break
+                            # tentar remover via fakeroot se solicitado
+                            if self.use_fakeroot:
+                                try:
+                                    self._run_fakeroot_sh(f"rmdir {shlex.quote(d)}")
+                                except InstallerError:
+                                    break
+                            else:
+                                os.rmdir(d)
+                            d = os.path.dirname(d)
+                        except Exception:
+                            break
 
-        log_event(name, "installer", f"Remoção concluída: {name}:{pkg_version} (arquivos removidos: {len(removed_files)})")
-        return removed_files
+            # post_remove hooks
+            if run_hooks and "post_remove" in hooks:
+                try:
+                    if self.dry_run:
+                        log_event(pkg_name, "installer", f"[dry-run] post_remove hooks: {hooks['post_remove']}")
+                    else:
+                        patcher = Patcher(workdir=self.root, env=os.environ.copy(), pkg_name=pkg_name)
+                        patcher.apply_stage("post_remove", {}, {"post_remove": hooks["post_remove"]})
+                        log_event(pkg_name, "installer", "post_remove hooks executados")
+                except HookError as he:
+                    log_event(pkg_name, "installer", f"Erro em post_remove hook: {he}")
+
+            log_event(pkg_name, "installer", f"Remoção concluída: {pkg_name}:{pkg_version} (arquivos removidos: {len(removed)})")
+            return removed
+
+        finally:
+            if chroot_was_prepared:
+                try:
+                    self.cleanup_chroot()
+                except Exception:
+                    log_event(pkg_name, "installer", "Erro ao cleanup_chroot (ignorado)")
