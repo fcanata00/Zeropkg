@@ -1,49 +1,111 @@
 #!/usr/bin/env python3
 """
-zeropkg_config.py - Leitura da configuração global do Zeropkg
+zeropkg_config.py
 
-Lê /etc/zeropkg.conf (TOML) e retorna um dicionário com as configurações.
-Se o arquivo não existir, retorna valores padrão.
+Carrega configuração global do Zeropkg (TOML). Procura em várias localizações e
+normaliza o resultado para uso pelo CLI e módulos.
 """
 
+from __future__ import annotations
 import os
-import tomllib  # Python 3.11+; se estiver em 3.10, use `import tomli as tomllib`
 
-DEFAULT_CONFIG = {
+# compatibilidade toml
+try:
+    import tomllib  # Python 3.11+
+except Exception:
+    try:
+        import tomli as tomllib  # type: ignore
+    except Exception:
+        tomllib = None  # will raise later if used
+
+# Locais onde o config pode existir (ordem de preferência)
+CANDIDATE_PATHS = [
+    "/etc/zeropkg.conf",                 # recommended system config
+    "/usr/lib/zeropkg/config.toml",      # installed package config
+    os.path.join(os.path.dirname(__file__), "..", "config.toml"),  # repo-local (relative)
+    "./config.toml",                     # working dir (dev)
+]
+
+# defaults
+DEFAULT = {
     "paths": {
         "root": "/",
         "build_root": "/var/zeropkg/build",
         "cache_dir": "/var/zeropkg/packages",
         "ports_dir": "/usr/ports",
         "db_path": "/var/lib/zeropkg/installed.sqlite3",
+    },
+    "repo": {
+        "local": "/usr/ports",
+        "remote": None,
+        "branch": "main",
+    },
+    "sync": {
+        "force": False
     }
 }
 
-CONFIG_FILE = "/etc/zeropkg.conf"
+
+def _load_toml_file(path: str) -> dict:
+    if tomllib is None:
+        raise RuntimeError("Nenhuma biblioteca TOML disponível (instale tomli para Python <3.11).")
+    with open(path, "rb") as f:
+        return tomllib.load(f)
 
 
-def load_config(config_file: str = CONFIG_FILE) -> dict:
+def load_config() -> dict:
     """
-    Lê o arquivo de configuração TOML e retorna como dict.
-    Se não existir, retorna DEFAULT_CONFIG.
+    Carrega o primeiro arquivo TOML encontrado entre os candidatos e
+    retorna um dict normalizado combinando com DEFAULT.
     """
-    cfg = DEFAULT_CONFIG.copy()
-    if os.path.exists(config_file):
+    cfg = {
+        "paths": dict(DEFAULT["paths"]),
+        "repo": dict(DEFAULT["repo"]),
+        "sync": dict(DEFAULT["sync"]),
+    }
+
+    found = None
+    for p in CANDIDATE_PATHS:
+        if not p:
+            continue
         try:
-            with open(config_file, "rb") as f:
-                parsed = tomllib.load(f)
-            # sobrepor defaults com valores do arquivo
-            for section, values in parsed.items():
-                if section not in cfg:
-                    cfg[section] = {}
-                for k, v in values.items():
-                    cfg[section][k] = v
-        except Exception as e:
-            print(f"[!] Erro ao ler {config_file}: {e}")
+            # normalize relative path
+            p_exp = os.path.abspath(p)
+            if os.path.exists(p_exp):
+                parsed = _load_toml_file(p_exp)
+                found = p_exp
+                # merge paths
+                if "paths" in parsed and isinstance(parsed["paths"], dict):
+                    cfg["paths"].update(parsed["paths"])
+                # support older config that uses [repo] (your repo file)
+                if "repo" in parsed and isinstance(parsed["repo"], dict):
+                    cfg["repo"].update(parsed["repo"])
+                    # ensure ports_dir mirrors repo.local if not set
+                    if "local" in parsed["repo"] and not cfg["paths"].get("ports_dir"):
+                        cfg["paths"]["ports_dir"] = parsed["repo"]["local"]
+                if "sync" in parsed and isinstance(parsed["sync"], dict):
+                    cfg["sync"].update(parsed["sync"])
+                # some repos use top-level keys directly (backward compatibility)
+                for k in ("ports_dir", "cache_dir", "build_root", "root", "db_path"):
+                    if k in parsed and k not in cfg["paths"]:
+                        cfg["paths"][k] = parsed[k]
+                break
+        except Exception:
+            # ignore parse errors and try next candidate
+            continue
+
+    # If not found, cfg stays defaults
     return cfg
 
 
-# Helper para pegar paths já resolvidos
-def get_paths(config_file: str = CONFIG_FILE) -> dict:
-    cfg = load_config(config_file)
-    return cfg.get("paths", {})
+# convenience getters
+def get_paths() -> dict:
+    return load_config()["paths"]
+
+
+def get_repo() -> dict:
+    return load_config()["repo"]
+
+
+def get_sync() -> dict:
+    return load_config()["sync"]
