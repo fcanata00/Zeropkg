@@ -12,7 +12,7 @@ MODULES_PATH = "/usr/lib/zeropkg/modules"
 if MODULES_PATH not in sys.path:
     sys.path.insert(0, MODULES_PATH)
 
-# imports dos módulos
+# imports dos módulos principais
 from zeropkg_toml import parse_toml
 from zeropkg_builder import Builder
 from zeropkg_installer import Installer
@@ -24,7 +24,7 @@ from zeropkg_remover import remove_package
 from zeropkg_db import get_package
 from zeropkg_logger import log_event
 from zeropkg_deps import check_missing
-from zeropkg_config import load_config, get_paths
+from zeropkg_config import get_paths
 
 
 # --- utils ---
@@ -188,6 +188,38 @@ def cmd_info(pkgname: str, args):
     print(f"Build directives: {getattr(meta, 'build', {})}")
 
 
+# --- LFS specific ---
+def cmd_lfs_bootstrap(args):
+    """
+    Executa a sequência oficial do LFS toolchain (LFS 12.1).
+    """
+    sequence = [
+        "binutils-2.41-pass1",
+        "gcc-13.2.0-pass1",
+        "linux-headers-6.6",
+        "glibc-2.39",
+        "binutils-2.41-pass2",
+        "gcc-13.2.0-pass2"
+    ]
+    for pkg in sequence:
+        print(f"[+] Construindo {pkg} ...")
+        try:
+            cmd_install(pkg.split("-")[0], args)
+        except Exception as e:
+            safe_print_exc(e)
+            print(f"[!] Falha ao construir {pkg}, interrompendo bootstrap.")
+            sys.exit(1)
+    print("[✓] LFS bootstrap concluído!")
+
+
+def cmd_lfs_step(pkgname: str, args):
+    """
+    Executa um passo único do toolchain (ex: binutils-pass1).
+    """
+    print(f"[+] Construindo passo LFS: {pkgname}")
+    cmd_install(pkgname, args)
+
+
 # --- CLI entrypoint ---
 def build_parser():
     paths = get_paths()
@@ -203,6 +235,9 @@ def build_parser():
     p.add_argument("--revdep", action="store_true")
     p.add_argument("-s", "--search", metavar="QUERY")
     p.add_argument("--info", metavar="PKG")
+    # LFS
+    p.add_argument("--lfs-bootstrap", action="store_true", help="Constrói toda a toolchain do LFS na ordem oficial")
+    p.add_argument("--lfs-step", metavar="PKG", help="Constrói um passo específico da toolchain (ex: binutils-pass1)")
     # flags
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--root", default=paths["root"])
@@ -223,7 +258,7 @@ def main():
 
     cmds = [args.install, args.remove, args.build, args.upgrade,
             args.update, args.sync, args.upgrade_all, args.depclean,
-            args.revdep, args.search, args.info]
+            args.revdep, args.search, args.info, args.lfs_bootstrap, args.lfs_step]
 
     if sum(bool(c) for c in cmds) != 1:
         p.print_help()
@@ -251,6 +286,10 @@ def main():
         cmd_search(args.search, args)
     elif args.info:
         cmd_info(args.info, args)
+    elif args.lfs_bootstrap:
+        cmd_lfs_bootstrap(args)
+    elif args.lfs_step:
+        cmd_lfs_step(args.lfs_step, args)
 
 
 if __name__ == "__main__":
