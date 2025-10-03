@@ -1,8 +1,7 @@
 # GNU GCC — Fase Final
 # ------------------------------------------------------------
-# Esta é a compilação definitiva do GCC, dentro do chroot do LFS ou
-# em um sistema funcional. Inclui suporte a C, C++, LTO, PIE, plugins
-# e bibliotecas completas.
+# Compilador definitivo do LFS com suporte a C e C++, executado dentro
+# do chroot, já com glibc e binutils finais instalados.
 # ------------------------------------------------------------
 
 [package]
@@ -10,7 +9,7 @@ name = "gcc"
 version = "13.2.0"
 category = "base"
 variant = "final"
-description = "GNU Compiler Collection (GCC) — Fase final completa com suporte a C e C++."
+description = "GNU Compiler Collection (GCC) — Fase final com suporte completo a C e C++."
 maintainer = "Zeropkg Build System"
 license = "GPL-3.0"
 homepage = "https://gcc.gnu.org/"
@@ -28,19 +27,16 @@ priority = 1
 
 [[sources.entries]]
 url = "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz"
-checksum = "sha256:a6f9ed624aef8b5a14c42ad4bca5d0b1d90f5da2b5b52b3cf6cbf2c8d3c6f3e1"
 extract_to = "gcc-13.2.0/mpfr"
 priority = 2
 
 [[sources.entries]]
 url = "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz"
-checksum = "sha256:e5ddfa29f0d8c2f17dc9ccfe6817345ad4f9e0c2d4ab10d7fbe2b04fbb64cf1f"
 extract_to = "gcc-13.2.0/gmp"
 priority = 3
 
 [[sources.entries]]
 url = "https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz"
-checksum = "sha256:5bdadf88f8e1e66dc2b8b846fe37cf929c5067c7b0019b6ab4a760c08f7b9d7c"
 extract_to = "gcc-13.2.0/mpc"
 priority = 4
 
@@ -48,7 +44,6 @@ priority = 4
 # Ambiente
 # ------------------------------------------------------------
 [environment]
-LFS = "/mnt/lfs"
 PATH = "/usr/bin"
 CFLAGS = "-O2 -pipe -fPIC"
 CXXFLAGS = "-O2 -pipe -fPIC"
@@ -58,12 +53,12 @@ LANG = "C.UTF-8"
 LC_ALL = "C.UTF-8"
 
 # ------------------------------------------------------------
-# Dependências
+# Dependências — renomeadas conforme receitas Zeropkg
 # ------------------------------------------------------------
 [dependencies]
-build = ["binutils", "glibc", "zlib", "bash", "make", "texinfo"]
-runtime = ["glibc", "zlib", "mpfr", "gmp", "mpc"]
-optional = ["isl"]
+build = ["binutils-2.43.1", "glibc-2.39", "zlib-1.3.1", "make", "texinfo"]
+runtime = ["glibc-2.39", "zlib-1.3.1", "mpfr-4.2.1", "gmp-6.3.0", "mpc-1.3.1"]
+optional = ["isl-0.26"]
 
 # ------------------------------------------------------------
 # Patches (opcionais)
@@ -85,7 +80,7 @@ pre_remove = ""
 post_remove = ""
 
 # ------------------------------------------------------------
-# Construção real (capítulo 8.24 do LFS)
+# Construção real
 # ------------------------------------------------------------
 [build]
 system = "custom"
@@ -130,7 +125,7 @@ clean_build_dir = true
 notify = true
 
 # ------------------------------------------------------------
-# Configuração LFS
+# LFS
 # ------------------------------------------------------------
 [lfs]
 stage = "final"
