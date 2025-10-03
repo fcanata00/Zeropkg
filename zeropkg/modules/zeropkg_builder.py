@@ -1,12 +1,11 @@
+#!/usr/bin/env python3
 """
-zeropkg_builder.py - Builder do Zeropkg (integrado com novo Downloader)
+zeropkg_builder.py - Builder do Zeropkg (integrado com zeropkg_chroot)
 
-- Resolve dependências (zeropkg_deps)
-- Baixa múltiplas fontes com downloader (http, ftp, file, git, rsync, scp)
-- Verifica e aplica patches/hooks
-- Constrói e instala em staging
-- Empacota em tar.xz
-- Integra com Installer e DB
+Alterações:
+- Se self.chroot definido, chama prepare_chroot(self.chroot) antes do build e cleanup depois.
+- Se dir_install for fornecido e não for "/", prepara chroot no dir_install antes da instalação.
+- Garante cleanup seguro em finally.
 """
 
 import os
@@ -23,6 +22,7 @@ from zeropkg_db import connect, record_build_start, record_build_finish
 from zeropkg_installer import Installer
 from zeropkg_deps import resolve_dependencies
 from zeropkg_toml import PackageMeta, package_id
+from zeropkg_chroot import prepare_chroot, cleanup_chroot, ChrootError
 
 logger = logging.getLogger("zeropkg.builder")
 
@@ -97,7 +97,6 @@ class Builder:
         os.makedirs(self.build_root, exist_ok=True)
         os.makedirs(self.pkg_cache, exist_ok=True)
 
-        # --- registrar build ---
         conn = connect(self.db_path)
         build_id = record_build_start(conn, self.meta)
         conn.close()
@@ -113,13 +112,22 @@ class Builder:
         if self.use_fakeroot:
             env["FAKEROOT"] = "1"
 
+        chroot_prepared = False
+        install_chroot_prepared = False
+
         try:
+            # If a chroot is requested for build-time, prepare it
+            if self.chroot:
+                log_event(self.meta.name, "chroot", f"Preparando chroot de build em {self.chroot}")
+                prepare_chroot(self.chroot, copy_resolv=True, dry_run=self.dry_run)
+                chroot_prepared = True
+
             # 1. resolver dependências
             deps = resolve_dependencies(self.meta, ports_dir="/usr/ports", db_path=self.db_path)
             for dep in deps:
                 log_event(self.meta.name, "deps", f"Dependência requerida: {dep}")
 
-            # 2. baixar fontes (agora retorna lista de dicts)
+            # 2. baixar fontes
             sources_info: List[Dict[str, Any]] = download_package(
                 self.meta,
                 cache_dir=self.cache_dir,
@@ -170,13 +178,20 @@ class Builder:
 
             # 11. instalar no root se solicitado
             if dir_install:
+                # if installing into a chroot path, prepare it
+                if os.path.abspath(dir_install) != "/":
+                    try:
+                        prepare_chroot(dir_install, copy_resolv=True, dry_run=self.dry_run)
+                        install_chroot_prepared = True
+                    except ChrootError as ce:
+                        log_event(self.meta.name, "chroot", f"Falha ao preparar chroot para install: {ce}", level="warning")
+
                 installer = Installer(db_path=self.db_path,
                                       dry_run=self.dry_run,
                                       root=dir_install,
                                       use_fakeroot=self.use_fakeroot)
                 installer.install(pkgfile, self.meta, hooks=self.meta.hooks, build_id=build_id)
 
-            # --- sucesso ---
             conn = connect(self.db_path)
             record_build_finish(conn, build_id, "success", log_path=None)
             conn.close()
@@ -188,5 +203,15 @@ class Builder:
             conn.close()
             raise
         finally:
+            # limpar staging
             if os.path.exists(staging):
-                shutil.rmtree(staging)
+                shutil.rmtree(staging, ignore_errors=True)
+
+            # limpar chroots preparados
+            try:
+                if install_chroot_prepared:
+                    cleanup_chroot(dir_install, force_lazy=True, dry_run=self.dry_run)
+                if chroot_prepared:
+                    cleanup_chroot(self.chroot, force_lazy=True, dry_run=self.dry_run)
+            except Exception as e:
+                log_event(self.meta.name, "chroot", f"Erro cleanup chroot: {e}", level="warning")
