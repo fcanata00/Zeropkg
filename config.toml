@@ -1,0 +1,13 @@
+[repo]
+# Diretório local onde ficam as receitas
+local = "/usr/ports"
+
+# URL do repositório remoto (git)
+remote = "https://github.com/fcanata00/Zeropkg-ports.git"
+
+# Branch principal
+branch = "main"
+
+[sync]
+# Se quiser sobrescrever local ao sync
+force = true
