@@ -1,256 +1,153 @@
-"""
-zeropkg_db.py
+#!/usr/bin/env python3
+# zeropkg_db.py — Banco de dados de pacotes do Zeropkg
+# -*- coding: utf-8 -*-
 
-Gerenciamento do banco de dados SQLite para Zeropkg:
-- pacotes instalados e seus arquivos
-- builds
-- eventos / logs
-- consultas revdep / depclean
-"""
-
-import sqlite3
 import os
-import datetime
-import json
-from typing import Optional, List, Dict, Any, Tuple
+import sqlite3
+import time
+from typing import List, Dict, Optional
 
-# --- esquema de criação do banco ---
-SCHEMA_SQL = """
-PRAGMA foreign_keys = ON;
-
+DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS packages (
-    id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     version TEXT NOT NULL,
-    variant TEXT,
-    installed_at TEXT NOT NULL,
-    pkgfile TEXT,
-    manifest_json TEXT,
-    dependencies_json TEXT,
-    status TEXT NOT NULL DEFAULT 'installed',
-    UNIQUE(name, version, variant)
+    install_date INTEGER,
+    build_options TEXT,
+    PRIMARY KEY (name)
 );
 
 CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY,
-    package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
-    path TEXT NOT NULL,
-    file_hash TEXT,
-    UNIQUE(package_id, path)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    FOREIGN KEY(package_name) REFERENCES packages(name) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS builds (
-    id INTEGER PRIMARY KEY,
-    package_id INTEGER,
-    meta_json TEXT,
-    start_time TEXT,
-    end_time TEXT,
-    status TEXT,
-    log_path TEXT,
-    FOREIGN KEY(package_id) REFERENCES packages(id) ON DELETE SET NULL
+CREATE TABLE IF NOT EXISTS dependencies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_name TEXT NOT NULL,
+    dep_name TEXT NOT NULL,
+    dep_version TEXT,
+    FOREIGN KEY(package_name) REFERENCES packages(name) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY,
-    ts TEXT NOT NULL,
-    level TEXT,
-    component TEXT,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pkg_name TEXT,
+    stage TEXT,
     message TEXT,
-    metadata_json TEXT
+    level TEXT,
+    timestamp INTEGER
 );
 """
 
-def init_db(db_path: str) -> None:
-    """Inicializa o banco (cria diretórios e esquema)."""
-    d = os.path.dirname(db_path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(SCHEMA_SQL)
-        conn.commit()
-    finally:
-        conn.close()
 
-def connect(db_path: str) -> sqlite3.Connection:
-    """Conecta ao DB, ativa foreign keys e row_factory."""
-    if not os.path.exists(db_path):
-        init_db(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+class DBManager:
+    def __init__(self, db_path: str = "/var/lib/zeropkg/installed.sqlite3"):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
 
-def _now_iso() -> str:
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    def _init_schema(self):
+        with self.conn:
+            self.conn.executescript(DB_SCHEMA)
 
-def register_package(conn: sqlite3.Connection,
-                     meta,
-                     pkgfile: Optional[str],
-                     files_list: List[Tuple[str, Optional[str]]],
-                     build_id: Optional[int] = None) -> int:
-    """Registra um pacote no banco, com sua lista de arquivos."""
-    deps = getattr(meta, "dependencies", None)
-    deps_json = json.dumps(deps) if deps is not None else json.dumps([])
+    # ----------------------------
+    # Pacotes
+    # ----------------------------
+    def add_package(self, name: str, version: str, files: List[str], deps: List[Dict], build_options: str = ""):
+        """Adiciona pacote ao DB com seus arquivos e dependências"""
+        now = int(time.time())
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO packages(name, version, install_date, build_options) VALUES (?, ?, ?, ?)",
+                (name, version, now, build_options),
+            )
+            # limpar registros antigos
+            self.conn.execute("DELETE FROM files WHERE package_name=?", (name,))
+            self.conn.execute("DELETE FROM dependencies WHERE package_name=?", (name,))
+            # adicionar arquivos
+            for f in files:
+                self.conn.execute(
+                    "INSERT INTO files(package_name, file_path) VALUES (?, ?)", (name, f)
+                )
+            # adicionar dependências
+            for d in deps:
+                dep_name = d.get("name") if isinstance(d, dict) else str(d)
+                dep_ver = d.get("version") if isinstance(d, dict) else None
+                self.conn.execute(
+                    "INSERT INTO dependencies(package_name, dep_name, dep_version) VALUES (?, ?, ?)",
+                    (name, dep_name, dep_ver),
+                )
 
-    manifest = {
-        "name": getattr(meta, "name", None),
-        "version": getattr(meta, "version", None),
-        "variant": getattr(meta, "variant", None)
-    }
-    manifest_json = json.dumps(manifest)
+    def remove_package(self, name: str) -> List[str]:
+        """Remove pacote e retorna lista de arquivos que estavam registrados"""
+        with self.conn:
+            rows = self.conn.execute("SELECT file_path FROM files WHERE package_name=?", (name,)).fetchall()
+            files = [r["file_path"] for r in rows]
+            self.conn.execute("DELETE FROM packages WHERE name=?", (name,))
+            return files
 
-    cur = conn.cursor()
-    installed_at = _now_iso()
-    cur.execute("""
-        INSERT OR REPLACE INTO packages
-        (name, version, variant, installed_at, pkgfile, manifest_json, dependencies_json, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (getattr(meta, "name", None),
-          getattr(meta, "version", None),
-          getattr(meta, "variant", None),
-          installed_at,
-          pkgfile,
-          manifest_json,
-          deps_json,
-          "installed"))
-    conn.commit()
+    def get_package(self, name: str) -> Optional[Dict]:
+        row = self.conn.execute("SELECT * FROM packages WHERE name=?", (name,)).fetchone()
+        if not row:
+            return None
+        files = self.list_files(name)
+        deps = self.list_deps(name)
+        return {
+            "name": row["name"],
+            "version": row["version"],
+            "install_date": row["install_date"],
+            "build_options": row["build_options"],
+            "files": files,
+            "deps": deps,
+        }
 
-    cur.execute("""
-        SELECT id FROM packages WHERE name=? AND version=? AND variant IS ?
-    """, (getattr(meta, "name", None),
-          getattr(meta, "version", None),
-          getattr(meta, "variant", None)))
-    row = cur.fetchone()
-    if not row:
-        raise RuntimeError("Falha ao recuperar package id")
-    pkg_id = row["id"]
+    def list_installed(self) -> List[Dict]:
+        rows = self.conn.execute("SELECT * FROM packages ORDER BY name").fetchall()
+        return [dict(r) for r in rows]
 
-    for path, fhash in files_list:
-        try:
-            cur.execute("""
-                INSERT OR IGNORE INTO files (package_id, path, file_hash)
-                VALUES (?, ?, ?)
-            """, (pkg_id, path, fhash))
-        except Exception:
-            pass
-    conn.commit()
+    def is_installed(self, name: str, version: Optional[str] = None) -> bool:
+        if version:
+            row = self.conn.execute("SELECT 1 FROM packages WHERE name=? AND version=?", (name, version)).fetchone()
+        else:
+            row = self.conn.execute("SELECT 1 FROM packages WHERE name=?", (name,)).fetchone()
+        return row is not None
 
-    if build_id is not None:
-        cur.execute("UPDATE builds SET package_id = ? WHERE id = ?", (pkg_id, build_id))
-        conn.commit()
+    # ----------------------------
+    # Arquivos e dependências
+    # ----------------------------
+    def list_files(self, name: str) -> List[str]:
+        rows = self.conn.execute("SELECT file_path FROM files WHERE package_name=?", (name,)).fetchall()
+        return [r["file_path"] for r in rows]
 
-    return pkg_id
+    def list_deps(self, name: str) -> List[Dict]:
+        rows = self.conn.execute("SELECT dep_name, dep_version FROM dependencies WHERE package_name=?", (name,)).fetchall()
+        return [{"name": r["dep_name"], "version": r["dep_version"]} for r in rows]
 
-def list_installed(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, name, version, variant, installed_at, pkgfile, status
-        FROM packages
-        ORDER BY name ASC, version ASC
-    """)
-    return [dict(row) for row in cur.fetchall()]
+    def find_revdeps(self, pkg_name: str) -> List[str]:
+        rows = self.conn.execute("SELECT package_name FROM dependencies WHERE dep_name=?", (pkg_name,)).fetchall()
+        return [r["package_name"] for r in rows]
 
-def get_package(conn: sqlite3.Connection, name: str, version: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    cur = conn.cursor()
-    if version is not None:
-        cur.execute("SELECT * FROM packages WHERE name=? AND version=? LIMIT 1", (name, version))
-    else:
-        cur.execute("SELECT * FROM packages WHERE name=? ORDER BY installed_at DESC LIMIT 1", (name,))
-    row = cur.fetchone()
-    return dict(row) if row else None
+    # ----------------------------
+    # Eventos / logs
+    # ----------------------------
+    def log_event(self, pkg_name: str, stage: str, message: str, level: str = "INFO"):
+        now = int(time.time())
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO events(pkg_name, stage, message, level, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (pkg_name, stage, message, level, now),
+            )
 
-def remove_package(conn: sqlite3.Connection, name: str, version: Optional[str] = None) -> List[str]:
-    """Remove registro do pacote e retorna lista de paths."""
-    cur = conn.cursor()
-    if version:
-        cur.execute("SELECT id FROM packages WHERE name=? AND version=? LIMIT 1", (name, version))
-    else:
-        cur.execute("SELECT id FROM packages WHERE name=? ORDER BY installed_at DESC LIMIT 1", (name,))
-    row = cur.fetchone()
-    if not row:
-        return []
-    pkg_id = row["id"]
-    cur.execute("SELECT path FROM files WHERE package_id=?", (pkg_id,))
-    paths = [r["path"] for r in cur.fetchall()]
-    cur.execute("DELETE FROM packages WHERE id=?", (pkg_id,))
-    conn.commit()
-    return paths
+    def list_events(self, pkg_name: Optional[str] = None) -> List[Dict]:
+        if pkg_name:
+            rows = self.conn.execute("SELECT * FROM events WHERE pkg_name=? ORDER BY id DESC", (pkg_name,)).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM events ORDER BY id DESC").fetchall()
+        return [dict(r) for r in rows]
 
-def record_build_start(conn: sqlite3.Connection, meta) -> int:
-    cur = conn.cursor()
-    meta_json = json.dumps({
-        "name": getattr(meta, "name", None),
-        "version": getattr(meta, "version", None),
-        "variant": getattr(meta, "variant", None)
-    })
-    start_time = _now_iso()
-    cur.execute("""
-        INSERT INTO builds (meta_json, start_time, status)
-        VALUES (?, ?, ?)
-    """, (meta_json, start_time, "running"))
-    conn.commit()
-    return cur.lastrowid
-
-def record_build_finish(conn: sqlite3.Connection, build_id: int, status: str, log_path: Optional[str] = None):
-    cur = conn.cursor()
-    end_time = _now_iso()
-    cur.execute("""
-        UPDATE builds
-        SET end_time = ?, status = ?, log_path = ?
-        WHERE id = ?
-    """, (end_time, status, log_path, build_id))
-    conn.commit()
-
-def record_event(conn: sqlite3.Connection, level: str, component: str, message: str,
-                 metadata: Optional[Dict[str, Any]] = None) -> int:
-    cur = conn.cursor()
-    ts = _now_iso()
-    md = json.dumps(metadata or {})
-    cur.execute("""
-        INSERT INTO events (ts, level, component, message, metadata_json)
-        VALUES (?, ?, ?, ?, ?)
-    """, (ts, level, component, message, md))
-    conn.commit()
-    return cur.lastrowid
-
-# --- alias para integração com zeropkg_logger ---
-def log_event(pkg_name: str, stage: str, message: str, level: str = "INFO") -> None:
-    """Compatível com zeropkg_logger.log_event → grava evento no DB."""
-    db_path = "/var/lib/zeropkg/installed.sqlite3"
-    conn = connect(db_path)
-    try:
-        record_event(conn, level, f"{pkg_name}:{stage}", message)
-    finally:
-        conn.close()
-
-def query_events(conn: sqlite3.Connection, limit: int = 100) -> List[Dict[str, Any]]:
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM events ORDER BY ts DESC LIMIT ?
-    """, (limit,))
-    return [dict(row) for row in cur.fetchall()]
-
-def find_revdeps(conn: sqlite3.Connection, pkg_name: str) -> List[Dict[str, Any]]:
-    """Retorna os pacotes instalados que dependem de pkg_name."""
-    cur = conn.cursor()
-    cur.execute("SELECT id, name, version, dependencies_json FROM packages")
-    res = []
-    for row in cur.fetchall():
-        deps_json = row["dependencies_json"]
-        if not deps_json:
-            continue
-        try:
-            deps_list = json.loads(deps_json)
-        except Exception:
-            continue
-        for dep in deps_list:
-            dep_name = None
-            if isinstance(dep, dict):
-                dep_name = dep.get("name")
-            elif isinstance(dep, str):
-                dep_name = dep
-            if dep_name == pkg_name:
-                res.append({"id": row["id"], "name": row["name"], "version": row["version"]})
-                break
-    return res
+    def close(self):
+        self.conn.close()
