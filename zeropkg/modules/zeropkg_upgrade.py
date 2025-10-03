@@ -1,10 +1,10 @@
 """
 zeropkg_upgrade.py
 
-Módulo de upgrade para Zeropkg — versão revisada:
-- Verifica e constrói dependências automaticamente (resolve_dependencies)
-- Usa Builder/Installer integrados
-- Faz backup da versão anterior e rollback em caso de falha
+Módulo de upgrade para Zeropkg — versão com grafo global.
+- resolve_dependencies individuais
+- upgrade_package
+- upgrade_all agora faz grafo global e ordena pacotes (topological sort)
 """
 
 import os
@@ -12,13 +12,13 @@ import re
 import glob
 import shutil
 import logging
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Set
 
 from zeropkg_toml import parse_toml, PackageMeta
 from zeropkg_builder import Builder, BuildError
 from zeropkg_installer import Installer, InstallError
 from zeropkg_deps import check_missing, resolve_dependencies
-from zeropkg_db import connect, get_package
+from zeropkg_db import connect, get_package, list_installed
 from zeropkg_logger import log_event
 
 logger = logging.getLogger("zeropkg.upgrade")
@@ -75,7 +75,7 @@ def find_latest_metafile(pkgname: str, ports_dir: str = PORTS_DIR_DEFAULT) -> Op
 
 
 # ----------------------------
-# upgrade principal
+# upgrade de um único pacote
 # ----------------------------
 def upgrade_package(
     pkgname: str,
@@ -116,7 +116,6 @@ def upgrade_package(
     if dry_run:
         missing = check_missing(latest_meta, db_path=db_path)
         log_event(pkgname, "upgrade", f"[dry-run] Dependências faltantes: {missing}")
-        log_event(pkgname, "upgrade", "[dry-run] Plano: resolver dependências + build + install")
         return True
 
     # Resolver dependências automaticamente
@@ -165,6 +164,9 @@ def upgrade_package(
         return False
 
 
+# ----------------------------
+# upgrade global com grafo
+# ----------------------------
 def upgrade_all(
     db_path: str = DB_PATH_DEFAULT,
     ports_dir: str = PORTS_DIR_DEFAULT,
@@ -175,18 +177,58 @@ def upgrade_all(
 ) -> List[Tuple[str, bool]]:
     """
     Atualiza todos os pacotes instalados.
+    Constrói grafo global e aplica upgrade em ordem topológica.
     """
     conn = connect(db_path)
-    installed = conn.execute("SELECT name, version FROM packages").fetchall()
+    installed = list_installed(conn)
+    conn.close()
+
+    # Construir grafo {pkg: [deps]}
+    graph: Dict[str, Set[str]] = {}
+    to_upgrade: Dict[str, PackageMeta] = {}
+
+    for pkg in installed:
+        name = pkg["name"]
+        latest_path = find_latest_metafile(name, ports_dir)
+        if not latest_path:
+            continue
+        latest_meta = parse_toml(latest_path)
+        if compare_versions(latest_meta.version, pkg["version"]) > 0:
+            # precisa de upgrade
+            to_upgrade[name] = latest_meta
+            deps = resolve_dependencies(latest_meta, ports_dir=ports_dir, db_path=db_path)
+            graph[name] = set(deps)
+
+    # Topological sort
+    order: List[str] = []
+    visited: Set[str] = set()
+    temp: Set[str] = set()
+
+    def visit(n: str):
+        if n in visited:
+            return
+        if n in temp:
+            raise RuntimeError(f"Dependência cíclica detectada em {n}")
+        temp.add(n)
+        for d in graph.get(n, []):
+            if d in to_upgrade:
+                visit(d)
+        temp.remove(n)
+        visited.add(n)
+        order.append(n)
+
+    for pkg in to_upgrade:
+        visit(pkg)
+
+    # Executar upgrades na ordem
     results: List[Tuple[str, bool]] = []
-    for row in installed:
-        name = row["name"]
+    for pkg in order:
         try:
-            ok = upgrade_package(name, db_path=db_path, ports_dir=ports_dir,
+            ok = upgrade_package(pkg, db_path=db_path, ports_dir=ports_dir,
                                  pkg_cache=pkg_cache, dry_run=dry_run,
                                  root=root, verbose=verbose)
-            results.append((name, ok))
+            results.append((pkg, ok))
         except Exception as e:
-            log_event(name, "upgrade", f"Erro no upgrade_all: {e}", level="error")
-            results.append((name, False))
+            log_event(pkg, "upgrade", f"Erro no upgrade_all: {e}", level="error")
+            results.append((pkg, False))
     return results
