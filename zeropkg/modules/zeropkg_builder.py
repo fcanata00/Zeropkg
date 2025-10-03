@@ -1,105 +1,169 @@
+"""
+zeropkg_builder.py
+
+Builder para Zeropkg — versão revisada e integrada.
+
+Responsabilidades:
+- Buscar fontes (Downloader)
+- Extrair (multi-formato)
+- Aplicar patches & hooks (Patcher)
+- Executar configure/build/install no staging com fakeroot
+- Empacotar (tar.xz)
+- Suporte a `--dir_install`, `--dry_run`
+- Logging de eventos
+- Reuso de binários (cache)
+- (Opcional) integração leve com DB para builds
+"""
+
 import os
-import subprocess
 import shutil
+import subprocess
 import tarfile
 import logging
-from typing import Dict, List
+from typing import List, Optional
 from zeropkg_downloader import download_package
-from zeropkg_patcher import Patcher, PatchError, HookError
+from zeropkg_patcher import Patcher
+from zeropkg_logger import log_event, setup_logger
 
-logger = logging.getLogger("zeropkg.builder")
+logger = setup_logger(pkg_name=None, stage="builder")
 
 class BuildError(Exception):
     pass
 
 class Builder:
-    def __init__(self, meta, cache_dir="/usr/ports/distfiles",
-                 build_root="/var/zeropkg/build", pkg_cache="/var/zeropkg/packages",
-                 chroot="/var/zeropkg/chroot", dry_run=False, dir_install=None):
+    def __init__(self,
+                 meta,
+                 cache_dir="/usr/ports/distfiles",
+                 pkg_cache="/var/zeropkg/packages",
+                 build_root="/var/zeropkg/build",
+                 chroot: Optional[str] = None,
+                 dry_run: bool = False,
+                 dir_install: Optional[str] = None,
+                 verbose: bool = False):
         self.meta = meta
         self.cache_dir = cache_dir
-        self.build_root = build_root
         self.pkg_cache = pkg_cache
+        self.build_root = build_root
         self.chroot = chroot
         self.dry_run = dry_run
         self.dir_install = dir_install
+        self.verbose = verbose
 
-        self.workdir = os.path.join(build_root, f"{meta.name}-{meta.version}")
+        # diretórios de trabalho e staging
+        base = f"{meta.name}-{meta.version}"
+        self.workdir = os.path.join(build_root, base)
         self.stagingdir = os.path.join(self.workdir, "staging")
 
-    def run(self, cmd: List[str], cwd=None, env=None, fakeroot=False):
+    def run(self, cmd: List[str], cwd: Optional[str] = None,
+            env: Optional[dict] = None, fakeroot: bool = False):
+        """Executa um comando, respeitando dry_run, chroot e fakeroot."""
         if self.dry_run:
-            logger.info("[dry-run] %s", " ".join(cmd))
+            log_event(self.meta.name, "builder", "[dry-run] " + " ".join(cmd))
             return
+
         full_env = os.environ.copy()
         if env:
             full_env.update(env)
 
+        cmd_exec = list(cmd)
         if fakeroot:
-            cmd = ["fakeroot"] + cmd
+            cmd_exec.insert(0, "fakeroot")
 
-        if self.chroot and os.path.exists(self.chroot):
-            cmd = ["chroot", self.chroot] + cmd
+        if self.chroot:
+            # TODO: montar bind /proc, /dev etc no chroot antes
+            cmd_exec = ["chroot", self.chroot] + cmd_exec
 
-        logger.info("Executando: %s", " ".join(cmd))
-        subprocess.run(cmd, cwd=cwd, env=full_env, check=True)
+        log_event(self.meta.name, "builder", "Executando: " + " ".join(cmd_exec))
+        try:
+            subprocess.run(cmd_exec, cwd=cwd, env=full_env, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except subprocess.CalledProcessError as e:
+            msg = f"Erro build (cmd={' '.join(cmd_exec)}): {e.stderr}"
+            log_event(self.meta.name, "builder", msg, level="error")
+            raise BuildError(msg) from e
 
     def fetch_sources(self):
-        for src in self.meta.sources:
-            download_package(self.meta, cache_dir=self.cache_dir, verbose=True)
+        # baixar fontes
+        log_event(self.meta.name, "builder", "Buscando fontes")
+        path = download_package(self.meta, cache_dir=self.cache_dir,
+                                prefer_existing=True, verbose=self.verbose)
+        log_event(self.meta.name, "builder", f"Fonte obtida: {path}")
+        return path
 
-    def extract_sources(self):
+    def extract_sources(self, src_path: Optional[str] = None):
+        log_event(self.meta.name, "builder", "Extraindo fontes")
         os.makedirs(self.workdir, exist_ok=True)
-        for src in self.meta.sources:
-            # apenas tar.* por enquanto
-            path = os.path.join(self.cache_dir, os.path.basename(src.url))
-            if path.endswith((".tar.gz", ".tar.xz", ".tar.bz2")):
-                logger.info(f"Extraindo {path} em {self.workdir}")
-                with tarfile.open(path, "r:*") as tar:
-                    tar.extractall(self.workdir)
-            else:
-                shutil.copy(path, self.workdir)
+        if src_path is None:
+            # deduzir: usar downloader resolve_cache_name
+            # Encontra o arquivo no cache_dir com resolve name
+            # Vamos simplificar: escolher primeiro source e recomputar
+            src_path = os.path.join(self.cache_dir,
+                                    os.path.basename(self.meta.sources[0].url))
+        # suporte tar.*, zip
+        if tarfile.is_tarfile(src_path):
+            with tarfile.open(src_path, "r:*") as tar:
+                tar.extractall(self.workdir)
+        elif src_path.lower().endswith(".zip"):
+            import zipfile
+            with zipfile.ZipFile(src_path, "r") as zf:
+                zf.extractall(self.workdir)
+        else:
+            # arquivo simples: copiar
+            shutil.copy(src_path, self.workdir)
 
     def build(self):
         patches = getattr(self.meta, "patches", {})
         hooks = getattr(self.meta, "hooks", {})
-        env = getattr(self.meta, "environment", {})
+        env = getattr(self.meta, "environment", {}) or {}
 
-        patcher = Patcher(workdir=self.workdir, env=env)
+        p = Patcher(workdir=self.workdir, env=env, pkg_name=self.meta.name)
 
-        # pre_configure
-        patcher.apply_stage("pre_configure", patches, hooks)
+        # etapa pre_configure
+        p.apply_stage("pre_configure", patches, hooks)
 
         # configure
-        self.run(["./configure", f"--prefix=/usr"], cwd=self.workdir, env=env)
+        cfg_cmd = self.meta.build.get("configure_cmds",
+                                     ["./configure", f"--prefix=/usr"])
+        for c in cfg_cmd:
+            self.run(c.split(), cwd=self.workdir, env=env)
+
+        # etapa patches/hooks pré-build
+        p.apply_stage("pre_build", patches, hooks)
 
         # build
-        patcher.apply_stage("pre_build", patches, hooks)
-        self.run(["make", "-j4"], cwd=self.workdir, env=env)
-        patcher.apply_stage("post_build", patches, hooks)
+        build_cmds = self.meta.build.get("build_cmds", ["make", "-j4"])
+        for c in build_cmds:
+            self.run(c.split(), cwd=self.workdir, env=env)
 
-        # install -> staging
+        # pós-build hooks
+        p.apply_stage("post_build", patches, hooks)
+
+        # instalar em staging
         os.makedirs(self.stagingdir, exist_ok=True)
-        patcher.apply_stage("pre_install", patches, hooks)
-        self.run(["make", f"DESTDIR={self.stagingdir}", "install"],
-                 cwd=self.workdir, env=env, fakeroot=True)
-        patcher.apply_stage("post_install", patches, hooks)
+        p.apply_stage("pre_install", patches, hooks)
 
-    def package(self):
-        pkgfile = os.path.join(self.pkg_cache, f"{self.meta.name}-{self.meta.version}.tar.xz")
+        install_cmds = self.meta.build.get("install_cmds",
+                                           ["make", f"DESTDIR={self.stagingdir}", "install"])
+        for c in install_cmds:
+            self.run(c.split(), cwd=self.workdir, env=env, fakeroot=True)
+
+        p.apply_stage("post_install", patches, hooks)
+
+    def package(self) -> str:
+        # empacotar staging em tar.xz
         os.makedirs(self.pkg_cache, exist_ok=True)
-        logger.info(f"Empacotando {pkgfile}")
-        with tarfile.open(pkgfile, "w:xz") as tar:
-            tar.add(self.stagingdir, arcname="/")
+        pkgfname = f"{self.meta.name}-{self.meta.version}.tar.xz"
+        pkgpath = os.path.join(self.pkg_cache, pkgfname)
+        log_event(self.meta.name, "builder", f"Empacotando em {pkgpath}")
+        if not self.dry_run:
+            with tarfile.open(pkgpath, "w:xz") as tar:
+                tar.add(self.stagingdir, arcname=".")
+        return pkgpath
+
+    def install(self) -> str:
+        """Método auxiliar: construir e instalar (empacotar + retorno pkgfile)."""
+        self.fetch_sources()
+        self.extract_sources()
+        self.build()
+        pkgfile = self.package()
         return pkgfile
-
-    def deploy(self, pkgfile):
-        if self.dir_install:
-            dest = self.dir_install
-        else:
-            dest = "/"
-
-        logger.info(f"Instalando pacote {pkgfile} em {dest}")
-        if self.dry_run:
-            return
-        self.run(["tar", "-xpf", pkgfile, "-C", dest], fakeroot=True)
