@@ -4,14 +4,14 @@ zeropkg_chroot.py
 
 Gerenciamento seguro e robusto de chroot para Zeropkg (LFS).
 - prepare_chroot(root, copy_resolv=True, dry_run=False)
-- enter_chroot(root, command=None, env=None)
+- enter_chroot(root, command=None, env=None, dry_run=False)
 - cleanup_chroot(root, force_lazy=False, dry_run=False)
 
 Funcionalidades:
-- monta /dev, /dev/pts, /proc, /sys, /run, /dev/shm, /tmp (binds e fs types apropriados)
+- monta /dev, /dev/pts, /proc, /sys, /run, /dev/shm, /tmp
 - confere montagens existentes antes de montar (idempotente)
 - valida permissões/ownership dos diretórios
-- copia /etc/resolv.conf do host para o chroot (faz backup se já existir)
+- copia /etc/resolv.conf do host para o chroot (com backup)
 - desmontagem em ordem reversa com fallback lazy umount
 - exige root (verificação clara)
 - integra com zeropkg_logger.log_event
@@ -62,7 +62,7 @@ def _is_mounted(target: str) -> bool:
                 if len(parts) >= 2 and os.path.abspath(parts[1]) == target:
                     return True
     except FileNotFoundError:
-        # sistemas não-Linux? fallback para mountpoint check
+        # fallback
         return os.path.ismount(target)
     return False
 
@@ -72,8 +72,7 @@ def _run(cmd: List[str], dry_run: bool = False, capture: bool = False) -> subpro
     log_event("chroot", "cmd", f"CMD: {' '.join(cmd)}")
     if dry_run:
         logger.info("[dry-run] " + " ".join(cmd))
-        # Retornar um CompletedProcess simulado
-        return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
     try:
         if capture:
             return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -93,13 +92,14 @@ def _ensure_dir(path: str, mode: int = 0o755, dry_run: bool = False):
     else:
         if not os.path.isdir(path):
             raise ChrootError(f"{path} existe e não é diretório.")
-        # ajustar permissoes básicas se necessário
         try:
             st = os.stat(path)
             cur_mode = stat.S_IMODE(st.st_mode)
             if cur_mode != mode and not dry_run:
                 os.chmod(path, mode)
                 log_event("chroot", "prepare", f"Ajustado mode {oct(mode)} em {path}")
+        except Exception:
+            pass
 
 
 def prepare_chroot(root: str, copy_resolv: bool = True, dry_run: bool = False, mounts: Optional[List] = None) -> Dict:
@@ -107,10 +107,7 @@ def prepare_chroot(root: str, copy_resolv: bool = True, dry_run: bool = False, m
     Prepara o ambiente de chroot em 'root':
     - monta /dev, /dev/pts, /proc, /sys, /run, /dev/shm, /tmp
     - copia /etc/resolv.conf -> $root/etc/resolv.conf (com backup)
-    - verifica permissões dos diretórios alvo
-
-    Retorna dict com status e lista de montagens efetuadas.
-    Lança ChrootError em caso de problemas críticos.
+    - retorna dict com status e lista de montagens efetuadas.
     """
     _check_root()
     root = os.path.abspath(root)
@@ -123,9 +120,7 @@ def prepare_chroot(root: str, copy_resolv: bool = True, dry_run: bool = False, m
 
     mounted = []
     try:
-        # garantir /etc existe no chroot para o resolv
         _ensure_dir(os.path.join(root, "etc"), mode=0o755, dry_run=dry_run)
-
         for src, rel_target, fstype, opts, is_bind in mounts:
             target = os.path.join(root, rel_target)
             _ensure_dir(target, mode=0o755, dry_run=dry_run)
@@ -135,15 +130,12 @@ def prepare_chroot(root: str, copy_resolv: bool = True, dry_run: bool = False, m
                 mounted.append({"target": target, "action": "already_mounted"})
                 continue
 
-            # montar
             if is_bind:
                 cmd = ["mount", "--bind", src, target]
             else:
-                # fstype pode ser None -> usar bind fallback
                 if fstype is None:
                     cmd = ["mount", "--bind", src, target]
                 else:
-                    # options provided
                     if opts:
                         cmd = ["mount", "-t", fstype, "-o", opts, src, target]
                     else:
@@ -153,7 +145,7 @@ def prepare_chroot(root: str, copy_resolv: bool = True, dry_run: bool = False, m
             mounted.append({"target": target, "action": "mounted", "cmd": " ".join(cmd)})
             log_event("chroot", "prepare", f"Montado {src} -> {target} (fstype={fstype}, opts={opts})")
 
-            # para dev/pts: garantir ptmx symlink
+            # ptmx symlink
             if rel_target == "dev/pts":
                 ptmx = os.path.join(root, "dev", "ptmx")
                 if not os.path.exists(ptmx) and not dry_run:
@@ -168,7 +160,6 @@ def prepare_chroot(root: str, copy_resolv: bool = True, dry_run: bool = False, m
             host_resolv = "/etc/resolv.conf"
             dest = os.path.join(root, "etc", "resolv.conf")
             if os.path.exists(host_resolv):
-                # backup existing in chroot
                 if os.path.exists(dest):
                     bak = dest + ".zeropkg.bak"
                     if not dry_run:
@@ -185,7 +176,6 @@ def prepare_chroot(root: str, copy_resolv: bool = True, dry_run: bool = False, m
         return {"status": "ok", "mounted": mounted}
     except Exception as e:
         log_event("chroot", "prepare", f"Erro em prepare_chroot: {e}", level="error")
-        # tentar cleanup parcial das montagens efetuadas
         try:
             cleanup_chroot(root, force_lazy=True, dry_run=dry_run)
         except Exception:
@@ -195,9 +185,9 @@ def prepare_chroot(root: str, copy_resolv: bool = True, dry_run: bool = False, m
 
 def enter_chroot(root: str, command: Optional[List[str]] = None, env: Optional[Dict[str, str]] = None, dry_run: bool = False):
     """
-    Entra no chroot e executa 'command' com ambiente limpo como no livro LFS.
+    Entra no chroot e executa 'command' com ambiente limpo.
     - command: lista, ex: ['/bin/bash', '-lc', 'make -j4']
-    - env: dict de variáveis a exportar (ex: {'LFS':'/mnt/lfs', 'PATH':'/tools/bin'})
+    - env: dict de variáveis a exportar (ex: {'LFS':'/mnt/lfs'})
     """
     _check_root()
     root = os.path.abspath(root)
@@ -205,14 +195,11 @@ def enter_chroot(root: str, command: Optional[List[str]] = None, env: Optional[D
         raise ChrootError(f"Root inválido: {root}")
 
     cmd = ["chroot", root, "/usr/bin/env", "-i"]
-    # adicionar env VAR=VAL
     if env:
         for k, v in env.items():
             cmd.append(f'{k}={v}')
-    # garantir um conjunto seguro de envs por padrão (pode ser sobrescrito)
     if "PATH" not in (env or {}):
         cmd.append("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-    # comando por padrão é /bin/bash
     if command:
         cmd += command
     else:
@@ -222,7 +209,6 @@ def enter_chroot(root: str, command: Optional[List[str]] = None, env: Optional[D
     if dry_run:
         logger.info("[dry-run] " + " ".join(cmd))
         return {"status": "dry-run", "cmd": " ".join(cmd)}
-    # executar chroot (irá bloquear até sair)
     try:
         subprocess.run(cmd, check=True)
         log_event("chroot", "enter", "Comando em chroot executado com sucesso")
@@ -235,16 +221,14 @@ def enter_chroot(root: str, command: Optional[List[str]] = None, env: Optional[D
 def cleanup_chroot(root: str, force_lazy: bool = False, dry_run: bool = False) -> Dict:
     """
     Desmonta de forma segura tudo o que foi montado por prepare_chroot.
-    - desmonta em ordem reversa preferencialmente (pts, dev, proc, sys, run, tmp)
-    - tenta ummount normal, se falhar tenta 'umount -l' (lazy) quando force_lazy True
-    - retorna dict com resultados
+    - desmonta em ordem reversa preferencialmente
+    - tenta ummount normal, se falhar tenta 'umount -l' se force_lazy True
     """
     _check_root()
     root = os.path.abspath(root)
     log_event("chroot", "cleanup", f"Iniciando cleanup_chroot em {root}")
     results = {"attempts": []}
 
-    # lista de pontos que costumamos montar (na ordem reversa)
     targets = [
         os.path.join(root, "dev/pts"),
         os.path.join(root, "dev"),
@@ -263,12 +247,10 @@ def cleanup_chroot(root: str, force_lazy: bool = False, dry_run: bool = False) -
             results["attempts"].append({"target": t, "status": "not_mounted"})
             continue
 
-        # tentar umount normal
         try:
             _run(["umount", t], dry_run=dry_run)
             results["attempts"].append({"target": t, "status": "unmounted"})
             log_event("chroot", "cleanup", f"Desmontado {t}")
-            # pequena espera para que kernel finalize
             time.sleep(0.05)
         except Exception as e:
             log_event("chroot", "cleanup", f"Falha ao desmontar {t}: {e}", level="warning")
@@ -283,7 +265,6 @@ def cleanup_chroot(root: str, force_lazy: bool = False, dry_run: bool = False) -
             else:
                 results["attempts"].append({"target": t, "status": "failed", "error": str(e)})
 
-    # tentar remover ptmx symlink se existia
     ptmx = os.path.join(root, "dev", "ptmx")
     if os.path.islink(ptmx):
         try:
