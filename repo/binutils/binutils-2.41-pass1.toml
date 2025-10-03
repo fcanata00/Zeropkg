@@ -1,54 +1,105 @@
+# GNU Binutils — Pass 1 (LFS Toolchain)
+# Receita real para uso com Zeropkg
+# ------------------------------------------------------------
+# Esta fase constrói os utilitários binutils no ambiente toolchain,
+# dentro de /mnt/lfs/tools (isolado, sem headers ou libs do sistema host).
+# ------------------------------------------------------------
+
 [package]
 name = "binutils"
-version = "2.41-pass1"
-category = "toolchain"
-description = "Binutils (primeira passagem) para LFS toolchain"
+version = "2.43.1"
+category = "lfs"
+variant = "pass1"
+description = "GNU Binutils (fase 1) — montador e ligador para o toolchain inicial do LFS."
+maintainer = "Zeropkg Build System"
+license = "GPL-3.0"
 homepage = "https://www.gnu.org/software/binutils/"
-licenses = ["GPL-3.0-or-later"]
 
-[dependencies]
-build = ["gcc", "make"]
-runtime = []
+# ------------------------------------------------------------
+# Fontes — download principal e mirrors
+# ------------------------------------------------------------
+[sources]
 
-[source]
-# URL oficial
-urls = [
-    "https://ftp.gnu.org/gnu/binutils/binutils-2.41.tar.xz",
-    "https://ftpmirror.gnu.org/binutils/binutils-2.41.tar.xz"
-]
-sha256 = "5b9c09b2fffb2c9b03a07e0ed0b8e8ab9d40f83dbb2519038b7a769ffed3cf1a"
+[[sources.entries]]
+url = "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz"
+checksum = "sha256:57ff8e8fd0497355dfcae6db4b1daef82ad6e3f23ec9e85795e80f8a4630b1dd"
+format = "tar.xz"
+priority = 1
 
-[patches]
-files = []
+[[sources.entries]]
+url = "https://mirror.kernel.org/gnu/binutils/binutils-2.43.1.tar.xz"
+format = "tar.xz"
+priority = 2
 
-[build]
-configure = "../configure \
-    --prefix=/tools \
-    --with-sysroot=$LFS \
-    --target=$LFS_TGT \
-    --disable-nls \
-    --disable-werror"
-make = "make -j$(nproc)"
-check = ""   # testes geralmente pulados no pass1
-install = "make install"
-
-[build.env]
+# ------------------------------------------------------------
+# Ambiente — conforme manual do LFS
+# ------------------------------------------------------------
+[environment]
 LFS = "/mnt/lfs"
 LFS_TGT = "x86_64-lfs-linux-gnu"
-PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
-CONFIG_SITE = "none"
+PATH = "/mnt/lfs/tools/bin:/usr/bin"
+CONFIG_SITE = "/mnt/lfs/usr/share/config.site"
 
-[hooks]
-pre_configure = "echo '[HOOK] Preparando build do binutils-pass1...'"
-post_install = "echo '[HOOK] Binutils-pass1 instalado em $LFS/tools'"
+# ------------------------------------------------------------
+# Dependências — somente GCC e glibc quando disponíveis
+# ------------------------------------------------------------
+[dependencies]
+build = []
+runtime = []
 
-[options]
-fakeroot = true
+# ------------------------------------------------------------
+# Construção — passos reais do LFS
+# ------------------------------------------------------------
+[build]
+system = "custom"
+fakeroot = false
 chroot = false
-package_before_install = true
-run_tests = false
+strip_binaries = false
+commands = [
+    "mkdir -pv build",
+    "cd build",
+    "../configure --prefix=/mnt/lfs/tools --with-sysroot=$LFS --target=$LFS_TGT --disable-nls --enable-gprofng=no --disable-werror",
+    "make",
+    "make install"
+]
 
-[files]
-bin = ["/tools/bin/*"]
-lib = ["/tools/lib/*"]
-doc = []
+# ------------------------------------------------------------
+# Pós-instalação — limpeza e registro
+# ------------------------------------------------------------
+[post_install]
+register = true
+clean_build_dir = true
+update_cache = true
+
+# ------------------------------------------------------------
+# Configuração específica para LFS
+# ------------------------------------------------------------
+[lfs]
+stage = "toolchain"
+toolchain = true
+bootstrap = true
+chroot_required = false
+
+# ------------------------------------------------------------
+# Hooks (opcionais)
+# ------------------------------------------------------------
+[hooks]
+pre_configure = ""
+post_install = ""
+pre_remove = ""
+post_remove = ""
+
+# ------------------------------------------------------------
+# Segurança e empacotamento
+# ------------------------------------------------------------
+[security]
+verify_checksums = true
+use_chroot = false
+fakeroot = false
+
+[package_build]
+enabled = true
+type = "tar"
+output_dir = "/var/zeropkg/packages"
+compress = "xz"
+include_docs = false
