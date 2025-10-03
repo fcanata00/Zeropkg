@@ -1,188 +1,235 @@
 #!/usr/bin/env python3
 """
-zeropkg_cli.py
-
-Interface de linha de comando para Zeropkg, integrando todos os módulos:
-- install / remove / build / upgrade / update / depclean / revdep / search / info
-- Suporte para abreviações (-i, -r, -b, -u, -U, -s) e versões longas (--install, etc.)
-- Flags --dry-run e --dir-install
+zeropkg_cli.py - CLI integrado para Zeropkg
 """
 
-import argparse
-import sys
 import os
+import sys
+import argparse
+import traceback
 
-from zeropkg_toml import parse_package_file
+MODULES_PATH = "/usr/lib/zeropkg/modules"
+if MODULES_PATH not in sys.path:
+    sys.path.insert(0, MODULES_PATH)
+
+# imports certos conforme seus módulos
+from zeropkg_toml import parse_toml
 from zeropkg_builder import Builder
 from zeropkg_installer import Installer
-from zeropkg_deps import check_missing
+from zeropkg_sync import sync_repos
+from zeropkg_update import run_update_scan
 from zeropkg_depclean import depclean, revdep
 from zeropkg_upgrade import upgrade_package, upgrade_all
-from zeropkg_update import run_update_scan
+from zeropkg_db import connect, list_installed, get_package
 from zeropkg_logger import log_event
-from zeropkg_db import connect, get_package
+from zeropkg_deps import check_missing
 
-# configurações padrão
+# defaults
 PORTS_DIR = "/usr/ports"
 PKG_CACHE = "/var/zeropkg/packages"
 DB_PATH = "/var/lib/zeropkg/installed.sqlite3"
 
-def find_metafile(pkgname: str):
-    """Procura o arquivo .toml correspondente a pkgname sob PORTS_DIR."""
-    for root, dirs, files in os.walk(PORTS_DIR):
+
+def find_metafile(pkgname: str, ports_dir: str = PORTS_DIR) -> str:
+    for root, _, files in os.walk(ports_dir):
         for f in files:
             if f.endswith(".toml") and f.startswith(pkgname + "-"):
                 return os.path.join(root, f)
-    return None
+    candidate = os.path.join(ports_dir, pkgname, f"{pkgname}.toml")
+    if os.path.exists(candidate):
+        return candidate
+    raise FileNotFoundError(f"Metafile para {pkgname} não encontrado em {ports_dir}")
 
+
+def load_meta_from_name(pkgname: str, ports_dir: str = PORTS_DIR):
+    mf = find_metafile(pkgname, ports_dir)
+    return parse_toml(mf)
+
+
+def safe_print_exc(e: Exception):
+    print(f"Erro: {e}")
+    traceback.print_exc()
+
+
+# --- commands ---
 def cmd_install(pkgname: str, args):
-    mf = find_metafile(pkgname)
-    if not mf:
-        print(f"Pacote {pkgname} não encontrado em {PORTS_DIR}")
-        sys.exit(1)
-    meta = parse_package_file(mf)
-    log_event(meta.name, "cli", f"Comando install para {meta.name}-{meta.version}")
+    meta = load_meta_from_name(pkgname, args.ports_dir)
+    log_event(pkgname, "cli", f"cli: install {pkgname} (dry_run={args.dry_run})")
 
-    missing = check_missing(meta, db_path=DB_PATH)
+    missing = check_missing(meta, db_path=args.db_path)
     if missing:
         print("Dependências faltantes:", missing)
         for dep in missing:
-            depname = dep.split(":")[0]
-            mf_dep = find_metafile(depname)
-            if not mf_dep:
-                print(f"Metafile da dependência {dep} não encontrado.")
-                sys.exit(1)
-            dep_meta = parse_package_file(mf_dep)
-            b = Builder(dep_meta, cache_dir=PKG_CACHE, pkg_cache=PKG_CACHE,
-                        dry_run=args.dry_run, dir_install=args.dir_install)
-            b.fetch_sources()
-            b.extract_sources()
-            b.build()
-            pkgfile_dep = b.package()
-            inst_dep = Installer(DB_PATH, dry_run=args.dry_run, dir_install=args.dir_install)
-            inst_dep.install(pkgfile_dep, dep_meta)
+            dep_name = dep.split(":")[0] if isinstance(dep, str) else dep.get("name")
+            dep_meta = load_meta_from_name(dep_name, args.ports_dir)
+            print(f"[+] Construindo dependência {dep_name}")
+            builder = Builder(dep_meta,
+                              cache_dir=args.cache_dir,
+                              pkg_cache=args.cache_dir,
+                              build_root=args.build_root,
+                              dry_run=args.dry_run,
+                              use_fakeroot=args.fakeroot,
+                              chroot=args.chroot_root,
+                              db_path=args.db_path)
+            pkgfile_dep = builder.build(dir_install=None)
+            installer_dep = Installer(db_path=args.db_path,
+                                      dry_run=args.dry_run,
+                                      root=args.root,
+                                      use_fakeroot=args.fakeroot)
+            installer_dep.install(pkgfile_dep, dep_meta, compute_hash=True, run_hooks=True)
 
-    b = Builder(meta, cache_dir=PKG_CACHE, pkg_cache=PKG_CACHE,
-                dry_run=args.dry_run, dir_install=args.dir_install)
-    b.fetch_sources()
-    b.extract_sources()
-    b.build()
-    pkgfile = b.package()
+    builder = Builder(meta,
+                      cache_dir=args.cache_dir,
+                      pkg_cache=args.cache_dir,
+                      build_root=args.build_root,
+                      dry_run=args.dry_run,
+                      use_fakeroot=args.fakeroot,
+                      chroot=args.chroot_root,
+                      db_path=args.db_path)
+    pkgfile = builder.build(dir_install=None)
 
-    inst = Installer(DB_PATH, dry_run=args.dry_run, dir_install=args.dir_install)
-    inst.install(pkgfile, meta)
+    installer = Installer(db_path=args.db_path,
+                          dry_run=args.dry_run,
+                          root=args.root,
+                          use_fakeroot=args.fakeroot)
+    installed = installer.install(pkgfile, meta, compute_hash=True, run_hooks=True, build_id=None)
+    print(f"Instalados {len(installed)} arquivos.")
+
 
 def cmd_remove(target: str, args):
-    # target pode ser "pkgname:version" ou só "pkgname"
     name, _, version = target.partition(":")
-    inst = Installer(DB_PATH, dry_run=args.dry_run, dir_install=args.dir_install)
-    inst.remove(name, version)
+    installer = Installer(db_path=args.db_path,
+                          dry_run=args.dry_run,
+                          root=args.root,
+                          use_fakeroot=args.fakeroot)
+    removed = installer.remove(name, version or None, run_hooks=True)
+    print(f"Removidos {len(removed)} arquivos.")
+
 
 def cmd_build(pkgname: str, args):
-    mf = find_metafile(pkgname)
-    if not mf:
-        print(f"Pacote {pkgname} não encontrado")
-        sys.exit(1)
-    meta = parse_package_file(mf)
-    b = Builder(meta, cache_dir=PKG_CACHE, pkg_cache=PKG_CACHE,
-                dry_run=args.dry_run, dir_install=args.dir_install)
-    b.fetch_sources()
-    b.extract_sources()
-    b.build()
-    pkgfile = b.package()
+    meta = load_meta_from_name(pkgname, args.ports_dir)
+    builder = Builder(meta,
+                      cache_dir=args.cache_dir,
+                      pkg_cache=args.cache_dir,
+                      build_root=args.build_root,
+                      dry_run=args.dry_run,
+                      use_fakeroot=args.fakeroot,
+                      chroot=args.chroot_root,
+                      db_path=args.db_path)
+    pkgfile = builder.build(dir_install=args.dir_install)
     print(f"Pacote gerado: {pkgfile}")
+
 
 def cmd_upgrade(pkgname: str, args):
     ok = upgrade_package(pkgname,
-                         db_path=DB_PATH,
-                         ports_dir=PORTS_DIR,
-                         pkg_cache=PKG_CACHE,
+                         db_path=args.db_path,
+                         ports_dir=args.ports_dir,
+                         pkg_cache=args.cache_dir,
                          dry_run=args.dry_run,
                          dir_install=args.dir_install,
+                         backup=True,
                          verbose=True)
-    if not ok:
-        sys.exit(1)
+    print("Upgrade concluído." if ok else "Upgrade falhou.")
+
 
 def cmd_upgrade_all(args):
-    results = upgrade_all(db_path=DB_PATH,
-                          ports_dir=PORTS_DIR,
-                          pkg_cache=PKG_CACHE,
-                          dry_run=args.dry_run,
-                          dir_install=args.dir_install,
-                          verbose=True)
-    for name, ok in results:
-        status = "OK" if ok else "FAIL"
-        print(f"{name}: {status}")
+    res = upgrade_all(db_path=args.db_path,
+                      ports_dir=args.ports_dir,
+                      pkg_cache=args.cache_dir,
+                      dry_run=args.dry_run,
+                      dir_install=args.dir_install,
+                      verbose=True)
+    ok = sum(1 for _, s in res if s)
+    fail = len(res) - ok
+    print(f"Upgrade all: {ok} succeeded, {fail} failed")
+
 
 def cmd_update(args):
-    """Executa o scan upstream de novas versões e gera os relatórios."""
-    log_event("cli", "update", "Executando scan de updates")
-    run_update_scan(ports_dir=PORTS_DIR)
-    print("Scan de updates concluído. Verifique os arquivos de notificação e reports.")
+    print("Executando scan upstream...")
+    run_update_scan(ports_dir=args.ports_dir)
+    print("Scan concluído.")
+
+
+def cmd_sync(args):
+    print("Sincronizando repositório...")
+    sync_repos()
+    print("Sync concluído.")
+
 
 def cmd_depclean(args):
-    orphans = depclean(DB_PATH)
+    orphans = depclean(args.db_path)
     if not orphans:
-        print("Nenhum órfão encontrado.")
+        print("Nenhum órfão.")
     else:
-        print("Pacotes órfãos:", orphans)
+        for o in orphans:
+            print("  ", o)
+
 
 def cmd_revdep(args):
-    broken = revdep(DB_PATH)
+    broken = revdep(args.db_path)
     if not broken:
-        print("Nenhuma dependência quebrada encontrada.")
+        print("Nenhuma dependência quebrada.")
     else:
         for pkg, mis in broken.items():
-            print(f"{pkg} depende de ausentes: {mis}")
+            print(f"{pkg} depende de: {mis}")
+
 
 def cmd_search(query: str, args):
     results = []
-    for root, dirs, files in os.walk(PORTS_DIR):
+    for root, _, files in os.walk(args.ports_dir):
         for f in files:
             if f.endswith(".toml") and query in f:
-                results.append(f)
-    if not results:
-        print("Nenhum pacote encontrado.")
-    else:
-        print("Encontrados:", results)
+                results.append(os.path.join(root, f))
+    print("\n".join(results) if results else "Nenhum resultado.")
+
 
 def cmd_info(pkgname: str, args):
-    mf = find_metafile(pkgname)
-    if not mf:
-        print("Pacote não encontrado.")
-        return
-    meta = parse_package_file(mf)
-    print(f"Nome: {meta.name}")
-    print(f"Versão: {meta.version}")
-    print(f"Dependências: {meta.dependencies}")
+    meta = load_meta_from_name(pkgname, args.ports_dir)
+    print(f"Name: {meta.name}")
+    print(f"Version: {meta.version}")
+    print(f"Category: {getattr(meta, 'category', '')}")
+    print(f"Description: {getattr(meta, 'description', '')}")
+    print(f"Homepage: {getattr(meta, 'homepage', '')}")
+    print(f"Dependencies: {getattr(meta, 'dependencies', {})}")
+    print(f"Build directives: {getattr(meta, 'build', {})}")
+
+
+# --- CLI entrypoint ---
+def build_parser():
+    p = argparse.ArgumentParser(prog="zeropkg", description="Zeropkg - source-based package manager")
+    p.add_argument("-i", "--install", metavar="PKG")
+    p.add_argument("-r", "--remove", metavar="PKG[:VER]")
+    p.add_argument("-b", "--build", metavar="PKG")
+    p.add_argument("-u", "--upgrade", metavar="PKG")
+    p.add_argument("-U", "--update", action="store_true")
+    p.add_argument("--sync", action="store_true")
+    p.add_argument("--upgrade-all", action="store_true")
+    p.add_argument("--depclean", action="store_true")
+    p.add_argument("--revdep", action="store_true")
+    p.add_argument("-s", "--search", metavar="QUERY")
+    p.add_argument("--info", metavar="PKG")
+    # flags
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--root", default="/")
+    p.add_argument("--fakeroot", action="store_true")
+    p.add_argument("--chroot-root", default=None)
+    p.add_argument("--dir-install", default=None)
+    p.add_argument("--cache-dir", default=PKG_CACHE)
+    p.add_argument("--build-root", default="/var/zeropkg/build")
+    p.add_argument("--ports-dir", default=PORTS_DIR)
+    p.add_argument("--db-path", default=DB_PATH)
+    p.add_argument("--build-id", type=int, default=None)
+    return p
+
 
 def main():
-    parser = argparse.ArgumentParser(prog="zeropkg", description="Gerenciador ZeroPkg")
-    parser.add_argument("-i", "--install", help="Instalar pacote")
-    parser.add_argument("-r", "--remove", help="Remover pacote (nome:versão)")
-    parser.add_argument("-b", "--build", help="Compilar apenas")
-    parser.add_argument("-u", "--upgrade", help="Atualizar pacote")
-    parser.add_argument("-U", "--update", action="store_true", help="Scan upstream de novas versões")
-    parser.add_argument("--upgrade-all", action="store_true", help="Atualizar todos os pacotes instalados")
-    parser.add_argument("--depclean", action="store_true", help="Remover dependências órfãs")
-    parser.add_argument("--revdep", action="store_true", help="Checar dependências quebradas")
-    parser.add_argument("-s", "--search", help="Pesquisar pacote")
-    parser.add_argument("--info", help="Mostrar informações de pacote")
-    parser.add_argument("--sync", action="store_true", help="Sincroniza o repositório local de ports com o remoto")
-
-    parser.add_argument("--dry-run", action="store_true", help="Simular sem aplicar mudanças")
-    parser.add_argument("--dir-install", help="Instalar em diretório alternativo (ex: chroot)")
-
-    args = parser.parse_args()
-
-    # garantir que apenas um comando principal seja usado
-    cmd_count = sum(bool(x) for x in [
-        args.install, args.remove, args.build,
-        args.upgrade, args.update, args.upgrade_all,
-        args.depclean, args.revdep, args.search, args.info
-    ])
-    if cmd_count != 1:
-        parser.print_help()
+    p = build_parser()
+    args = p.parse_args()
+    cmds = [args.install, args.remove, args.build, args.upgrade,
+            args.update, args.sync, args.upgrade_all, args.depclean,
+            args.revdep, args.search, args.info]
+    if sum(bool(c) for c in cmds) != 1:
+        p.print_help()
         sys.exit(1)
 
     if args.install:
@@ -195,6 +242,8 @@ def main():
         cmd_upgrade(args.upgrade, args)
     elif args.update:
         cmd_update(args)
+    elif args.sync:
+        cmd_sync(args)
     elif args.upgrade_all:
         cmd_upgrade_all(args)
     elif args.depclean:
@@ -205,12 +254,7 @@ def main():
         cmd_search(args.search, args)
     elif args.info:
         cmd_info(args.info, args)
-    elif args.sync:
-         from zeropkg_sync import sync_repos
-         sync_repos()
-    else:
-        parser.print_help()
-        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
