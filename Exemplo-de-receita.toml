@@ -1,0 +1,78 @@
+# Receita Zeropkg exemplo (completa)
+# Caminho sugerido: /usr/ports/gcc/gcc-13.2.0.toml
+
+[package]
+name        = "gcc"
+version     = "13.2.0"
+release     = "1"
+category    = "development"
+description = "GNU Compiler Collection (C, C++, Fortran, etc.)"
+license     = "GPL-3.0"
+homepage    = "https://gcc.gnu.org"
+maintainer  = "Zeropkg Dev Team <dev@zeropkg.org>"
+
+[dependencies]
+build = ["gmp", "mpfr", "mpc"]
+runtime = ["glibc"]
+
+[source]
+# múltiplos formatos/espelhos
+urls = [
+  "https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.gz",
+  "https://mirror.example.org/gcc/gcc-13.2.0.tar.xz",
+  "https://backup.example.net/gcc-13.2.0.zip"
+]
+sha256 = "c3b2a03b35676f0fa5d4d5dbdb2c4b3f1b7ec1a4c3c8a1ef245ac7f1a123abcd"
+
+[environment]
+# Variáveis aplicadas durante a construção
+CC = "gcc"
+CXX = "g++"
+CFLAGS = "-O2 -pipe"
+CXXFLAGS = "-O2 -pipe"
+LDFLAGS = "-Wl,-O1"
+LANG = "C"
+
+[patches]
+# Patches aplicados automaticamente em ordem
+files = [
+  "/usr/ports/gcc/patches/fix-armv8-build.patch",
+  "/usr/ports/gcc/patches/remove-broken-tests.patch"
+]
+
+[hooks]
+# Hooks de automação
+pre_configure  = "echo '[HOOK] Preparando ambiente de build do GCC'"
+post_configure = "echo '[HOOK] Configure finalizado com sucesso'"
+pre_build      = "echo '[HOOK] Build será iniciado agora'"
+post_build     = "echo '[HOOK] Build finalizado com sucesso'"
+pre_install    = "echo '[HOOK] Instalando GCC no sistema'"
+post_install   = "echo '[HOOK] GCC instalado corretamente'"
+pre_remove     = "echo '[HOOK] Preparando remoção do GCC'"
+post_remove    = "echo '[HOOK] GCC foi removido com sucesso'"
+
+[build]
+# Opções de configuração
+configure = [
+  "./configure",
+  "--prefix=/usr",
+  "--enable-languages=c,c++,fortran",
+  "--disable-multilib"
+]
+make = "make -j$(nproc)"
+check = "make check"
+fakeroot = true
+chroot = true
+package_before_install = true
+
+[install]
+# Copia do builddir/fakeroot -> /usr
+make_install = "make install DESTDIR=$PKGDIR"
+
+[revdep]
+# Binários que devem ser checados com revdep
+check_binaries = [
+  "/usr/bin/gcc",
+  "/usr/bin/g++",
+  "/usr/lib/libgcc_s.so"
+]
