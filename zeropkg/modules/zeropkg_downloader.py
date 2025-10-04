@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# zeropkg_downloader.py - Downloader avançado do Zeropkg
+# zeropkg_downloader.py - Downloader avançado do Zeropkg (com suporte a extract_to)
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -7,6 +7,8 @@ import os
 import hashlib
 import shutil
 import subprocess
+import tarfile
+import zipfile
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Union
@@ -48,7 +50,7 @@ class Downloader:
         return actual.lower() == expected.lower()
 
     # --------------------------
-    # Core download
+    # Download
     # --------------------------
     def _download_file(self, url: str, dest: str, retries: int = RETRIES) -> str:
         log_event(os.path.basename(dest), "download", f"Baixando {url} → {dest}")
@@ -73,20 +75,42 @@ class Downloader:
         return dest_dir
 
     # --------------------------
+    # Extração de arquivos
+    # --------------------------
+    def _extract_file(self, file_path: str, build_root: str, extract_to: Optional[str] = None):
+        """Extrai o arquivo em build_root ou no subdiretório indicado."""
+        target_dir = os.path.join(build_root, extract_to) if extract_to else build_root
+        os.makedirs(target_dir, exist_ok=True)
+        log_event(os.path.basename(file_path), "extract", f"Extraindo em {target_dir}")
+
+        try:
+            if tarfile.is_tarfile(file_path):
+                with tarfile.open(file_path, "r:*") as tar:
+                    tar.extractall(path=target_dir)
+            elif zipfile.is_zipfile(file_path):
+                with zipfile.ZipFile(file_path, "r") as z:
+                    z.extractall(target_dir)
+            else:
+                logger.warning(f"Formato não reconhecido: {file_path}")
+        except Exception as e:
+            raise DownloadError(f"Falha ao extrair {file_path}: {e}")
+
+    # --------------------------
     # Interface pública
     # --------------------------
-    def fetch_sources(self, pkg_name: str, sources: List[Dict[str, str]], parallel: bool = True) -> List[str]:
+    def fetch_sources(self, pkg_name: str, sources: List[Dict[str, str]], build_root: str = "/var/zeropkg/build", parallel: bool = True) -> List[str]:
         """
-        Faz o download de múltiplas fontes de um pacote.
-        sources: lista de dicts com { "url": str, "checksum": str, "algo": "sha256"|"md5" }
+        Faz o download de múltiplas fontes de um pacote e as extrai se necessário.
         """
         results = []
         os.makedirs(self.dist_dir, exist_ok=True)
+        os.makedirs(build_root, exist_ok=True)
 
         def _fetch(entry):
             url = entry.get("url")
-            checksum = entry.get("checksum")
+            checksum = entry.get("checksum", "")
             algo = entry.get("algo", "sha256")
+            extract_to = entry.get("extract_to", None)
             if not url:
                 return None
 
@@ -98,18 +122,18 @@ class Downloader:
             filename = os.path.basename(url)
             dest_path = os.path.join(self.dist_dir, filename)
 
-            # Se arquivo já existe e checksum bate, reutiliza
             if os.path.exists(dest_path) and self._validate_checksum(dest_path, checksum, algo):
                 log_event(pkg_name, "download", f"Usando cache existente: {filename}")
-                return dest_path
+            else:
+                self._download_file(url, dest_path)
+                if checksum and not self._validate_checksum(dest_path, checksum, algo):
+                    os.remove(dest_path)
+                    raise DownloadError(f"Checksum incorreto para {filename}")
 
-            # Tenta baixar
-            self._download_file(url, dest_path)
-            if checksum and not self._validate_checksum(dest_path, checksum, algo):
-                os.remove(dest_path)
-                raise DownloadError(f"Checksum incorreto para {filename}")
+            # Se tiver extract_to → extrai diretamente para dentro do pacote principal
+            self._extract_file(dest_path, build_root, extract_to)
 
-            log_event(pkg_name, "download", f"Download completo: {filename}")
+            results.append(dest_path)
             return dest_path
 
         if parallel:
@@ -134,8 +158,8 @@ class Downloader:
 if __name__ == "__main__":
     dl = Downloader()
     srcs = [
-        {"url": "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz", "checksum": "", "algo": "sha256"},
-        {"url": "git+https://git.savannah.gnu.org/git/bash.git"},
+        {"url": "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz"},
+        {"url": "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz", "extract_to": "gcc-13.2.0/mpfr"},
     ]
-    files = dl.fetch_sources("testpkg", srcs)
+    files = dl.fetch_sources("gcc-test", srcs, build_root="/tmp/build")
     print("Arquivos baixados:", files)
