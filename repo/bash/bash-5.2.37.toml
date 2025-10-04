@@ -1,53 +1,81 @@
 [package]
 name = "bash"
-version = "5.2.37"
-category = "lfs"
-description = "GNU Bash — Bourne Again Shell (temporário para LFS Chapter 6.4)"
+version = "5.3"
+description = "Bourne-Again Shell"
+category = "shells"
+license = "GPLv3"
 homepage = "https://www.gnu.org/software/bash/"
-license = "GPL-3.0-or-later"
-maintainer = "zeropkg"
+maintainer = "Zeropkg LFS Automation"
+stage = "final"
+priority = "normal"
 
-[sources]
-urls = [
-  "https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz",
-  "https://invisible-mirror.net/archives/bash/bash-5.2.37.tar.gz"
-]
-checksum = "sha256:<COLOQUE_SHA256_REAL_DO_TARBALL>"
-extract_to = "bash-5.2.37"
+[source]
+urls = ["https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz"]
+sha256 = ["PLACEHOLDER_SHA256_BASH_5_3"]
+extract_to = "bash-5.3"
+
+[build]
+depends = ["ncurses"]  
+optional_depends = []
+use_chroot = true
+fakeroot = true
+workdir = "bash-5.3"
 
 [environment]
 LFS = "/mnt/lfs"
 LFS_TGT = "x86_64-lfs-linux-gnu"
-PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
-DESTDIR = "@DESTDIR@"
+MAKEFLAGS = "-j$(nproc)"
+PATH = "/tools/bin:/usr/bin:/bin"
+CFLAGS = "-O2 -pipe"
+LC_ALL = "POSIX"
 
-[build]
-chroot = true
-fakeroot = false
-cleanup_sources = true
+[prepare]
 commands = [
-  # Configuração conforme LFS
-  "./configure --prefix=/usr \\",
-  "  --build=$(sh support/config.guess) \\",
-  "  --host=$LFS_TGT \\",
-  "  --without-bash-malloc",
-  # Compilar
-  "make",
-  # Instalar no DESTDIR (chroot seguro)
-  "make DESTDIR=${DESTDIR} install",
-  # Criar link /bin/sh apontando para bash
-  "ln -sv bash ${DESTDIR}/bin/sh"
+  "mkdir -v build"  # embora não use build/ no LFS, manter compatibilidade com estrutura
+]
+
+[configure]
+commands = [
+  "pushd .",
+  "./configure --prefix=/usr --build=$(support/config.guess) --host=$LFS_TGT --without-bash-malloc",
+  "popd"
+]
+
+[compile]
+commands = ["make"]
+
+[install]
+commands = [
+  "make DESTDIR=$LFS install",
+  "ln -sv bash $LFS/bin/sh"
 ]
 
 [hooks]
-pre_build = "echo '==> Construindo Bash 5.2.37 (temporário LFS)'"
-post_install = "echo '==> Bash instalado e link /bin/sh criado'"
+post_install = [
+  "echo '[HOOK] Bash 5.3 instalado com sucesso'",
+  "ln -sv bash $LFS/bin/sh"
+]
 
-[dependencies]
-build = ["ncurses-6.5", "m4-1.4.19"]  # Ajuste dependendo das receitas que você tem
-runtime = []
+[patches]
+apply = []
+strip = 1
 
-[lfs]
-stage = "toolchain"
-bootstrap = true
-chroot_required = true
+[tests]
+enabled = false
+
+[package.files]
+bin = ["/usr/bin/bash", "/usr/bin/sh"]
+doc = ["/usr/share/doc/bash-5.3"]
+
+[install]
+root = "/mnt/lfs"
+safe_chroot = true
+parallel_install = false
+keep_build = false
+overwrite_existing = true
+
+[notifications]
+notify = true
+urgency = "normal"
+summary = "Bash 5.3 instalado"
+icon = "/usr/share/icons/bash.png"
