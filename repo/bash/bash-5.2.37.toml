@@ -1,0 +1,53 @@
+[package]
+name = "bash"
+version = "5.2.37"
+category = "lfs"
+description = "GNU Bash — Bourne Again Shell (temporário para LFS Chapter 6.4)"
+homepage = "https://www.gnu.org/software/bash/"
+license = "GPL-3.0-or-later"
+maintainer = "zeropkg"
+
+[sources]
+urls = [
+  "https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz",
+  "https://invisible-mirror.net/archives/bash/bash-5.2.37.tar.gz"
+]
+checksum = "sha256:<COLOQUE_SHA256_REAL_DO_TARBALL>"
+extract_to = "bash-5.2.37"
+
+[environment]
+LFS = "/mnt/lfs"
+LFS_TGT = "x86_64-lfs-linux-gnu"
+PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
+DESTDIR = "@DESTDIR@"
+
+[build]
+chroot = true
+fakeroot = false
+cleanup_sources = true
+commands = [
+  # Configuração conforme LFS
+  "./configure --prefix=/usr \\",
+  "  --build=$(sh support/config.guess) \\",
+  "  --host=$LFS_TGT \\",
+  "  --without-bash-malloc",
+  # Compilar
+  "make",
+  # Instalar no DESTDIR (chroot seguro)
+  "make DESTDIR=${DESTDIR} install",
+  # Criar link /bin/sh apontando para bash
+  "ln -sv bash ${DESTDIR}/bin/sh"
+]
+
+[hooks]
+pre_build = "echo '==> Construindo Bash 5.2.37 (temporário LFS)'"
+post_install = "echo '==> Bash instalado e link /bin/sh criado'"
+
+[dependencies]
+build = ["ncurses-6.5", "m4-1.4.19"]  # Ajuste dependendo das receitas que você tem
+runtime = []
+
+[lfs]
+stage = "toolchain"
+bootstrap = true
+chroot_required = true
