@@ -1,649 +1,593 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zeropkg_db.py — SQLite state & metadata manager for Zeropkg
+zeropkg_db.py — Database layer for Zeropkg
 
 Features:
- - Class ZeroPKGDB wrapping DB access and providing high-level API:
-     - install_record(), remove_package(), record_upgrade_event()
-     - get_package_manifest(), list_installed(), get_orphaned_packages(), find_revdeps()
- - WAL mode, pragmas for performance
- - In-memory caching for frequent reads, with simple invalidation
- - Integration with zeropkg_logger (log_event) if available
- - Snapshot (dump) before critical operations and rollback from snapshot
- - Integrity validation (SHA256) for registered files
- - Export / import helpers
+ - SQLite3 WAL database with schema for packages, files, deps, events, snapshots, meta
+ - Thread-safe API with simple in-memory caching
+ - Snapshot / rollback support by copying DB file
+ - Export/import (tar.gz) for backup/restore
+ - Integration with zeropkg_logger (if present) via log_event
+ - All queries parameterized to avoid injection
 """
 
 from __future__ import annotations
 import os
 import sqlite3
 import json
-import time
-import hashlib
 import shutil
-import tempfile
 import threading
+import time
+import tempfile
+import tarfile
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 
-# Try to import logger (optional)
-try:
-    from zeropkg_logger import log_event
-    LOG_AVAILABLE = True
-except Exception:
-    LOG_AVAILABLE = False
-    def log_event(pkg, stage, msg, level="info", extra=None):
-        # fallback simple print
-        print(f"[{level.upper()}] {pkg}:{stage} - {msg}")
-
-# Default DB path
-DEFAULT_DB_PATH = Path(os.environ.get("ZEROPKG_DB", "/var/lib/zeropkg/installed.sqlite3"))
-
-# Ensure parent dir exists
-DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-# Thread lock for DB operations
-_db_lock = threading.RLock()
-
-# Simple in-memory cache wrapper
-class _SimpleCache:
-    def __init__(self):
-        self._cache: Dict[str, Any] = {}
-        self._ts = 0
-
-    def get(self, key: str):
-        return self._cache.get(key)
-
-    def set(self, key: str, value: Any):
-        self._cache[key] = value
-        self._ts = int(time.time())
-
-    def invalidate(self, key: Optional[str] = None):
-        if key:
-            self._cache.pop(key, None)
-        else:
-            self._cache.clear()
-            self._ts = int(time.time())
-
-    def snapshot(self) -> Dict[str, Any]:
-        return dict(self._cache)
-
-    def load_snapshot(self, snap: Dict[str, Any]):
-        self._cache = dict(snap)
-        self._ts = int(time.time())
-
-# Utility helpers
-def _sha256_of_file(path: str) -> Optional[str]:
+# Safe import logger/config (optional)
+def _safe_import(name: str):
     try:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
+        return __import__(name, fromlist=["*"])
     except Exception:
         return None
 
-def _now_ts() -> int:
-    return int(time.time())
+logger_mod = _safe_import("zeropkg_logger")
+config_mod = _safe_import("zeropkg_config")
 
+if logger_mod and hasattr(logger_mod, "log_event"):
+    def _log_event(evt, msg, level="INFO", metadata=None):
+        try:
+            logger_mod.log_event(evt, msg, level=level, metadata=metadata)
+        except Exception:
+            pass
+else:
+    def _log_event(evt, msg, level="INFO", metadata=None):
+        # fallback simple print to stderr minimally (avoid noisy output)
+        try:
+            if level and level.upper() == "ERROR":
+                print(f"[ERROR] {evt}: {msg}", file=sys.stderr)
+        except Exception:
+            pass
+
+# Default paths (config manager may override)
+DEFAULT_STATE_DIR = Path("/var/lib/zeropkg")
+DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_DB_PATH = DEFAULT_STATE_DIR / "zeropkg.db"
+DEFAULT_SNAP_DIR = DEFAULT_STATE_DIR / "snapshots"
+DEFAULT_SNAP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Simple in-memory cache structure
+class _SimpleCache:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.packages_by_name: Dict[str, Dict[str, Any]] = {}
+        self.last_refresh = 0
+
+    def get(self, name: str):
+        with self._lock:
+            return self.packages_by_name.get(name)
+
+    def set(self, name: str, value: Dict[str, Any]):
+        with self._lock:
+            self.packages_by_name[name] = value
+
+    def delete(self, name: str):
+        with self._lock:
+            if name in self.packages_by_name:
+                del self.packages_by_name[name]
+
+    def clear(self):
+        with self._lock:
+            self.packages_by_name.clear()
+
+# Main DB class
 class ZeroPKGDB:
-    """
-    High-level DB manager for Zeropkg.
-    Use as context manager:
-        with ZeroPKGDB() as db:
-            db.record_install_quick(...)
-    Or instantiate and call methods.
-    """
-    def __init__(self, db_path: Optional[Path] = None, pragmas: Optional[Dict[str, Any]] = None):
-        self.db_path = Path(db_path or DEFAULT_DB_PATH)
-        self.pragmas = pragmas or {
-            "journal_mode": "WAL",
-            "synchronous": "NORMAL",
-            "temp_store": "MEMORY",
-            "foreign_keys": 1,
-            "cache_size": -20000
-        }
-        self._conn: Optional[sqlite3.Connection] = None
-        self.cache = _SimpleCache()
-        self._ensure_db()
-
-    def _connect(self):
-        if self._conn:
-            return self._conn
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        # apply pragmas
-        for k, v in self.pragmas.items():
+    def __init__(self, db_path: Optional[Path] = None, timeout: float = 30.0):
+        # allow config to override
+        if config_mod and hasattr(config_mod, "get_config_manager"):
             try:
-                if k == "journal_mode":
-                    cur.execute(f"PRAGMA journal_mode={v}")
-                else:
-                    cur.execute(f"PRAGMA {k}={v}")
+                mgr = config_mod.get_config_manager()
+                cfg_db = mgr.get("paths", "db_path", default=None)
+                if cfg_db:
+                    db_path = Path(cfg_db)
             except Exception:
                 pass
-        self._conn = conn
-        return conn
 
-    def _ensure_db(self):
-        with _db_lock:
-            conn = self._connect()
-            cur = conn.cursor()
-            # Create tables if not exists (idempotent)
-            cur.executescript("""
-            CREATE TABLE IF NOT EXISTS packages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                version TEXT,
-                install_ts INTEGER,
-                install_size INTEGER,
-                metadata JSON
-            );
-            CREATE TABLE IF NOT EXISTS files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pkg_id INTEGER NOT NULL,
-                path TEXT NOT NULL,
-                sha256 TEXT,
-                size INTEGER,
-                mtime INTEGER,
-                FOREIGN KEY(pkg_id) REFERENCES packages(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS dependencies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pkg_id INTEGER NOT NULL,
-                dependee TEXT NOT NULL,
-                version_req TEXT,
-                FOREIGN KEY(pkg_id) REFERENCES packages(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts INTEGER,
-                type TEXT,
-                pkg TEXT,
-                payload JSON
-            );
-            CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
-            CREATE INDEX IF NOT EXISTS idx_deps_pkg ON dependencies(pkg_id);
-            """)
-            conn.commit()
+        self.db_path = Path(db_path or DEFAULT_DB_PATH)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.RLock()
+        self._timeout = timeout
+        self.cache = _SimpleCache()
+        self._connect_and_init()
+
+    # -------------------------
+    # Connection and schema
+    # -------------------------
+    def _connect_and_init(self):
+        with self._lock:
+            exists = self.db_path.exists()
+            self._conn = sqlite3.connect(str(self.db_path), timeout=self._timeout, check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode=WAL;")
+            self._conn.execute("PRAGMA foreign_keys=ON;")
+            self._conn.row_factory = sqlite3.Row
+            if not exists:
+                self._ensure_schema()
+            else:
+                # ensure schema up-to-date (idempotent)
+                self._ensure_schema()
+            _log_event("db", f"Database opened at {self.db_path}", level="INFO")
+
+    def _ensure_schema(self):
+        # run schema creation statements (if tables already exist, ignore)
+        schema_sql = """
+        BEGIN;
+        CREATE TABLE IF NOT EXISTS meta (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        );
+        CREATE TABLE IF NOT EXISTS packages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            version TEXT,
+            installed_at INTEGER,
+            size INTEGER DEFAULT 0,
+            manifest_json TEXT,
+            UNIQUE(name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(name);
+
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            mode INTEGER,
+            uid INTEGER,
+            gid INTEGER,
+            size INTEGER,
+            sha256 TEXT,
+            UNIQUE(package_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_files_pkg ON files(package_id);
+
+        CREATE TABLE IF NOT EXISTS deps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
+            depends_on TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_deps_pkg ON deps(package_id);
+
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER,
+            type TEXT,
+            level TEXT,
+            package TEXT,
+            payload_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER,
+            path TEXT,
+            note TEXT
+        );
+        COMMIT;
+        """
+        cur = self._conn.cursor()
+        cur.executescript(schema_sql)
+        self._conn.commit()
 
     def close(self):
-        with _db_lock:
+        with self._lock:
             if self._conn:
                 try:
                     self._conn.commit()
+                except Exception:
+                    pass
+                try:
                     self._conn.close()
                 except Exception:
                     pass
                 self._conn = None
+                _log_event("db", "Database closed", level="INFO")
 
-    def __enter__(self):
-        self._connect()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
-
-    # ------------------------------
-    # Low level exec helpers
-    # ------------------------------
-    def _execute(self, sql: str, params: Tuple = (), commit: bool = False) -> sqlite3.Cursor:
-        with _db_lock:
-            conn = self._connect()
-            cur = conn.cursor()
+    # -------------------------
+    # Low-level helpers
+    # -------------------------
+    def _execute(self, sql: str, params: Tuple = (), commit: bool = False):
+        with self._lock:
+            cur = self._conn.cursor()
             cur.execute(sql, params)
             if commit:
-                conn.commit()
+                self._conn.commit()
             return cur
 
-    def _executemany(self, sql: str, seq_of_params: List[Tuple], commit: bool = False) -> None:
-        with _db_lock:
-            conn = self._connect()
-            cur = conn.cursor()
-            cur.executemany(sql, seq_of_params)
-            if commit:
-                conn.commit()
+    def _get_package_row(self, name: str) -> Optional[sqlite3.Row]:
+        cur = self._execute("SELECT * FROM packages WHERE name = ? LIMIT 1", (name,))
+        return cur.fetchone()
 
-    # ------------------------------
-    # High-level operations
-    # ------------------------------
-    def record_install_quick(self, pkg_name: str, manifest: Dict[str, Any], deps: List[Dict[str,Any]] = None, metadata: Dict[str,Any] = None) -> bool:
+    # -------------------------
+    # Core APIs
+    # -------------------------
+    def record_install_quick(self, name: str, version: str, manifest: Dict[str, Any], files: List[Dict[str, Any]], deps: List[str] = None) -> Dict[str, Any]:
         """
-        Record a package installation using its manifest dictionary.
-        manifest: {"files": [{"dst": "/usr/bin/...", "sha256": "...", "size": ...}, ...], "version": "x.y"}
-        deps: list of dicts { "name": "...", "version": ">=1.2" }
-        metadata: additional metadata dict
+        Record a package installation quickly:
+         - name, version, manifest (metadata), files (list of {path, size, sha256, mode, uid, gid}), deps list
+        Returns dict with status and package id.
         """
         deps = deps or []
-        metadata = metadata or {}
-        with _db_lock:
-            try:
-                conn = self._connect()
-                cur = conn.cursor()
-                version = manifest.get("version") or metadata.get("version")
-                install_size = sum([f.get("size", 0) for f in manifest.get("files", [])])
-                ts = _now_ts()
-                # upsert package
-                cur.execute("INSERT OR REPLACE INTO packages (id, name, version, install_ts, install_size, metadata) VALUES ((SELECT id FROM packages WHERE name=?), ?, ?, ?, ?, ?)",
-                            (pkg_name, pkg_name, version, ts, install_size, json.dumps(metadata)))
-                # get pkg_id
-                cur.execute("SELECT id FROM packages WHERE name=?", (pkg_name,))
-                row = cur.fetchone()
-                if not row:
-                    raise RuntimeError("failed to get pkg id")
+        ts = int(time.time())
+        manifest_json = json.dumps(manifest or {}, ensure_ascii=False)
+        size_total = sum((f.get("size") or 0) for f in files)
+        with self._lock:
+            row = self._get_package_row(name)
+            if row:
+                # update
                 pkg_id = row["id"]
-                # remove old files and deps
-                cur.execute("DELETE FROM files WHERE pkg_id=?", (pkg_id,))
-                cur.execute("DELETE FROM dependencies WHERE pkg_id=?", (pkg_id,))
-                # insert files
-                files_inserts = []
-                for f in manifest.get("files", []):
-                    dst = f.get("dst")
-                    sha = f.get("sha256") or f.get("sha")
-                    size = f.get("size") or (Path(dst).stat().st_size if Path(dst).exists() else 0)
-                    mtime = int(Path(dst).stat().st_mtime) if Path(dst).exists() else int(time.time())
-                    files_inserts.append((pkg_id, dst, sha, size, mtime))
-                if files_inserts:
-                    cur.executemany("INSERT INTO files (pkg_id, path, sha256, size, mtime) VALUES (?, ?, ?, ?, ?)", files_inserts)
-                # insert deps
-                deps_inserts = []
-                for d in deps:
-                    deps_inserts.append((pkg_id, d.get("name"), d.get("version")))
-                if deps_inserts:
-                    cur.executemany("INSERT INTO dependencies (pkg_id, dependee, version_req) VALUES (?, ?, ?)", deps_inserts)
-                # record event
-                payload = {"manifest": manifest, "deps": deps, "metadata": metadata}
-                cur.execute("INSERT INTO events (ts, type, pkg, payload) VALUES (?, 'install', ?, ?)", (ts, pkg_name, json.dumps(payload)))
-                conn.commit()
-                # invalidate cache entries relevant
-                self.cache.invalidate(pkg_name)
-                # optional logger
-                try:
-                    log_event(pkg_name, "db", f"Recorded install {pkg_name} version={version}", level="info", extra={"size": install_size})
-                except Exception:
-                    pass
-                return True
-            except Exception as e:
-                try:
-                    log_event("zeropkg.db", "record_install", f"error: {e}", level="error")
-                except Exception:
-                    pass
-                return False
-
-    def remove_package_quick(self, pkg_name: str) -> bool:
-        """
-        Remove package record and its files from DB (does not touch filesystem).
-        """
-        with _db_lock:
+                self._execute("UPDATE packages SET version=?, installed_at=?, size=?, manifest_json=? WHERE id=?", (version, ts, size_total, manifest_json, pkg_id), commit=True)
+                # delete old files and deps
+                self._execute("DELETE FROM files WHERE package_id = ?", (pkg_id,), commit=True)
+                self._execute("DELETE FROM deps WHERE package_id = ?", (pkg_id,), commit=True)
+            else:
+                cur = self._execute("INSERT INTO packages(name, version, installed_at, size, manifest_json) VALUES(?,?,?,?,?)", (name, version, ts, size_total, manifest_json), commit=True)
+                pkg_id = cur.lastrowid
+            # insert files
+            ins_files = []
+            for f in files:
+                p = f.get("path")
+                mode = f.get("mode")
+                uid = f.get("uid")
+                gid = f.get("gid")
+                size = f.get("size")
+                sha = f.get("sha256")
+                self._execute("INSERT OR REPLACE INTO files(package_id, path, mode, uid, gid, size, sha256) VALUES(?,?,?,?,?,?,?)", (pkg_id, p, mode, uid, gid, size, sha))
+            # deps
+            for d in deps:
+                self._execute("INSERT INTO deps(package_id, depends_on) VALUES(?,?)", (pkg_id, d))
+            self._conn.commit()
+            # update cache
             try:
-                conn = self._connect()
-                cur = conn.cursor()
-                # ensure exists
-                cur.execute("SELECT id FROM packages WHERE name=?", (pkg_name,))
-                r = cur.fetchone()
-                if not r:
-                    return False
-                pkg_id = r["id"]
-                cur.execute("DELETE FROM files WHERE pkg_id=?", (pkg_id,))
-                cur.execute("DELETE FROM dependencies WHERE pkg_id=?", (pkg_id,))
-                cur.execute("DELETE FROM packages WHERE id=?", (pkg_id,))
-                cur.execute("INSERT INTO events (ts, type, pkg, payload) VALUES (?, 'remove', ?, ?)", (_now_ts(), pkg_name, json.dumps({"removed": True})))
-                conn.commit()
-                self.cache.invalidate(pkg_name)
-                try:
-                    log_event(pkg_name, "db", "Recorded removal", level="info")
-                except Exception:
-                    pass
-                return True
-            except Exception as e:
-                try:
-                    log_event("zeropkg.db", "remove_package", f"error: {e}", level="error")
-                except Exception:
-                    pass
-                return False
+                self.cache.set(name, {"name": name, "version": version, "installed_at": ts, "size": size_total, "manifest": manifest})
+            except Exception:
+                pass
+            _log_event("install", f"Recorded install {name}-{version} (id={pkg_id})", level="INFO", metadata={"pkg": name, "ver": version})
+            return {"ok": True, "pkg_id": pkg_id}
 
-    def record_upgrade_event(self, pkg_name: str, old_version: Optional[str], new_version: Optional[str], success: bool = True, extra: Optional[Dict[str,Any]] = None) -> bool:
-        with _db_lock:
-            try:
-                conn = self._connect()
-                cur = conn.cursor()
-                payload = {"old": old_version, "new": new_version, "success": bool(success), "extra": extra or {}}
-                cur.execute("INSERT INTO events (ts, type, pkg, payload) VALUES (?, 'upgrade', ?, ?)", (_now_ts(), pkg_name, json.dumps(payload)))
-                conn.commit()
-                try:
-                    log_event(pkg_name, "db", f"Upgrade recorded {old_version} -> {new_version}", level="info", extra=payload)
-                except Exception:
-                    pass
-                return True
-            except Exception as e:
-                try:
-                    log_event("zeropkg.db", "record_upgrade", f"error: {e}", level="error")
-                except Exception:
-                    pass
-                return False
+    def remove_package_quick(self, name: str) -> Dict[str, Any]:
+        """
+        Remove package metadata entry (does NOT attempt to remove files on disk).
+        Returns summary.
+        """
+        with self._lock:
+            row = self._get_package_row(name)
+            if not row:
+                return {"ok": False, "error": "not_found"}
+            pkg_id = row["id"]
+            self._execute("DELETE FROM packages WHERE id = ?", (pkg_id,), commit=True)
+            # cache invalidate
+            self.cache.delete(name)
+            _log_event("remove", f"Removed metadata for package {name}", level="INFO", metadata={"pkg": name})
+            return {"ok": True, "pkg": name}
 
-    # ------------------------------
-    # Queries / utilities
-    # ------------------------------
-    def get_package_manifest(self, pkg_name: str) -> Optional[Dict[str,Any]]:
+    def get_package_manifest(self, name: str) -> Optional[Dict[str, Any]]:
         """
-        Return manifest-like dict for package (files list with sha/size/mtime).
+        Return manifest for package (manifest_json + files list + deps)
         """
-        cached = self.cache.get(f"manifest:{pkg_name}")
+        # try cache
+        cached = self.cache.get(name)
         if cached:
-            return cached
-        with _db_lock:
-            try:
-                conn = self._connect()
-                cur = conn.cursor()
-                cur.execute("SELECT id, name, version, install_ts, install_size, metadata FROM packages WHERE name=?", (pkg_name,))
-                p = cur.fetchone()
-                if not p:
-                    return None
-                pkg_id = p["id"]
-                cur.execute("SELECT path, sha256, size, mtime FROM files WHERE pkg_id=?", (pkg_id,))
-                files = []
-                for row in cur.fetchall():
-                    files.append({"dst": row["path"], "sha256": row["sha256"], "size": row["size"], "mtime": row["mtime"]})
-                manifest = {"package": {"name": p["name"], "version": p["version"]}, "files": files, "install_ts": p["install_ts"], "install_size": p["install_size"], "metadata": json.loads(p["metadata"]) if p["metadata"] else {}}
-                self.cache.set(f"manifest:{pkg_name}", manifest)
-                return manifest
-            except Exception as e:
-                log_event("zeropkg.db", "get_manifest", f"error: {e}", level="error")
+            return cached.get("manifest")
+        with self._lock:
+            row = self._get_package_row(name)
+            if not row:
                 return None
-
-    def list_installed_quick(self) -> List[Dict[str,Any]]:
-        """
-        Return list of installed packages with basic metadata.
-        """
-        cached = self.cache.get("installed:list")
-        if cached:
-            return cached
-        with _db_lock:
+            pkg_id = row["id"]
+            manifest = json.loads(row["manifest_json"]) if row["manifest_json"] else {}
+            cur = self._execute("SELECT path, mode, uid, gid, size, sha256 FROM files WHERE package_id = ?", (pkg_id,))
+            files = [dict(r) for r in cur.fetchall()]
+            cur = self._execute("SELECT depends_on FROM deps WHERE package_id = ?", (pkg_id,))
+            deps = [r["depends_on"] for r in cur.fetchall()]
+            result = {"name": name, "version": row["version"], "installed_at": row["installed_at"], "size": row["size"], "manifest": manifest, "files": files, "deps": deps}
+            # update cache
             try:
-                conn = self._connect()
-                cur = conn.cursor()
-                cur.execute("SELECT name, version, install_ts, install_size FROM packages ORDER BY name")
-                rows = []
-                for r in cur.fetchall():
-                    rows.append({"name": r["name"], "version": r["version"], "install_ts": r["install_ts"], "size": r["install_size"]})
-                self.cache.set("installed:list", rows)
-                return rows
-            except Exception as e:
-                log_event("zeropkg.db", "list_installed", f"error: {e}", level="error")
-                return []
+                self.cache.set(name, result)
+            except Exception:
+                pass
+            return result
+
+    def list_installed_quick(self) -> List[Dict[str, Any]]:
+        """
+        Return quick list of installed packages (name, version, size, installed_at)
+        """
+        with self._lock:
+            cur = self._execute("SELECT name, version, size, installed_at FROM packages ORDER BY name")
+            return [dict(r) for r in cur.fetchall()]
+
+    def find_revdeps(self, name: str) -> List[str]:
+        """
+        Return list of packages that depend on 'name'
+        """
+        with self._lock:
+            cur = self._execute("SELECT p.name FROM deps d JOIN packages p ON p.id = d.package_id WHERE d.depends_on = ? GROUP BY p.name", (name,))
+            return [r["name"] for r in cur.fetchall()]
 
     def get_orphaned_packages(self) -> List[str]:
         """
-        Identify orphan packages: installed packages that are not required by any other installed package.
+        Find packages that are not required by any other installed package (orphans).
+        This is a best-effort: excludes packages marked as required in meta (if any).
         """
-        with _db_lock:
-            try:
-                conn = self._connect()
-                cur = conn.cursor()
-                # packages that appear as dependee in dependencies
-                cur.execute("SELECT DISTINCT pkg_id FROM dependencies")
-                dep_pkg_ids = set([r["pkg_id"] for r in cur.fetchall()])
-                # packages referenced as dependee by name
-                cur.execute("SELECT DISTINCT dependee FROM dependencies")
-                dependees = set([r["dependee"] for r in cur.fetchall()])
-                # collect all package names
-                cur.execute("SELECT id, name FROM packages")
-                orphans = []
-                id_to_name = {}
-                for r in cur.fetchall():
-                    id_to_name[r["id"]] = r["name"]
-                # An orphan is a package with no other package depending on it (no record where dependee == its name)
-                for pid, name in id_to_name.items():
-                    if name not in dependees:
-                        # exclude essential core packages? leave to caller
-                        orphans.append(name)
-                return orphans
-            except Exception as e:
-                log_event("zeropkg.db", "orphans", f"error: {e}", level="error")
-                return []
+        with self._lock:
+            cur = self._execute("""
+                SELECT p.name FROM packages p
+                WHERE p.name NOT IN (SELECT DISTINCT depends_on FROM deps)
+                ORDER BY p.name
+            """)
+            return [r["name"] for r in cur.fetchall()]
 
-    def find_revdeps(self, pkg_name: str) -> List[str]:
+    # -------------------------
+    # Integrity and audit
+    # -------------------------
+    def validate_integrity(self, package_name: Optional[str] = None) -> Dict[str, Any]:
         """
-        Return list of package names that depend on the given package (reverse deps).
+        Validate file integrity for a package (or all packages if package_name is None).
+        Computes sha256 for recorded files and compares to stored values.
+        Returns report dict.
         """
-        with _db_lock:
-            try:
-                conn = self._connect()
-                cur = conn.cursor()
-                # find packages whose dependencies list includes pkg_name as dependee
-                cur.execute("SELECT p.name FROM dependencies d JOIN packages p ON p.id = d.pkg_id WHERE d.dependee = ?", (pkg_name,))
-                return [r["name"] for r in cur.fetchall()]
-            except Exception as e:
-                log_event("zeropkg.db", "revdeps", f"error: {e}", level="error")
-                return []
+        report = {"checked": 0, "errors": []}
+        with self._lock:
+            if package_name:
+                rows = [self._get_package_row(package_name)]
+            else:
+                cur = self._execute("SELECT name FROM packages")
+                rows = [self._get_package_row(r["name"]) for r in cur.fetchall()]
+            for row in rows:
+                if not row:
+                    continue
+                name = row["name"]
+                pkg_id = row["id"]
+                cur = self._execute("SELECT path, sha256 FROM files WHERE package_id = ?", (pkg_id,))
+                for frow in cur.fetchall():
+                    p = Path(frow["path"])
+                    expected = frow["sha256"]
+                    report["checked"] += 1
+                    try:
+                        if not p.exists():
+                            report["errors"].append({"pkg": name, "path": str(p), "error": "missing"})
+                            continue
+                        # compute sha256
+                        h = self._compute_sha256(p)
+                        if expected and h.lower() != expected.lower():
+                            report["errors"].append({"pkg": name, "path": str(p), "error": "sha_mismatch", "expected": expected, "got": h})
+                    except Exception as e:
+                        report["errors"].append({"pkg": name, "path": str(p), "error": str(e)})
+        return report
 
-    def export_db(self, dest_path: Path, compress: bool = True) -> Path:
-        """
-        Export DB to file (SQLite copy). If compress True, create .tar.gz containing dump.
-        Returns path to created file.
-        """
-        with _db_lock:
-            dest_path = Path(dest_path)
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            tmpf = tempfile.NamedTemporaryFile(delete=False)
-            tmpf.close()
-            # Use sqlite online backup API
-            try:
-                src_conn = self._connect()
-                bconn = sqlite3.connect(tmpf.name)
-                with bconn:
-                    src_conn.backup(bconn)
-                bconn.close()
-                if compress:
-                    archive = str(dest_path)
-                    shutil.make_archive(base_name=str(dest_path), format="gztar", root_dir=os.path.dirname(tmpf.name), base_dir=os.path.basename(tmpf.name))
-                    os.unlink(tmpf.name)
-                    return Path(archive + ".tar.gz") if not str(dest_path).endswith(".tar.gz") else Path(archive)
-                else:
-                    shutil.move(tmpf.name, str(dest_path))
-                    return dest_path
-            except Exception as e:
+    def _compute_sha256(self, path: Path) -> str:
+        import hashlib
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024*1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    # -------------------------
+    # Events and auditing
+    # -------------------------
+    def record_event(self, etype: str, level: str = "INFO", package: Optional[str] = None, payload: Optional[Dict[str, Any]] = None) -> None:
+        ts = int(time.time())
+        payload_json = json.dumps(payload or {}, ensure_ascii=False)
+        with self._lock:
+            self._execute("INSERT INTO events(ts, type, level, package, payload_json) VALUES(?,?,?,?,?)", (ts, etype, level, package, payload_json), commit=True)
+            _log_event(etype, f"{package or '-'}: {etype} {payload or {}}", level=level, metadata=payload)
+
+    def query_events(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._lock:
+            cur = self._execute("SELECT ts,type,level,package,payload_json FROM events ORDER BY ts DESC LIMIT ?", (limit,))
+            out = []
+            for r in cur.fetchall():
+                o = dict(r)
                 try:
-                    log_event("zeropkg.db", "export", f"error: {e}", level="error")
+                    o["payload"] = json.loads(o.pop("payload_json") or "{}")
                 except Exception:
-                    pass
-                raise
+                    o["payload"] = {}
+                out.append(o)
+            return out
 
-    def import_db(self, src_path: Path, replace: bool = False) -> bool:
+    # -------------------------
+    # Snapshot / export / import
+    # -------------------------
+    def snapshot(self, note: Optional[str] = None) -> Dict[str, Any]:
         """
-        Import DB from SQLite file or tar.gz produced by export_db. If replace True, replace active DB.
+        Create a snapshot copy of the DB file and register it.
+        Returns snapshot metadata.
         """
-        with _db_lock:
+        with self._lock:
+            ts = int(time.time())
+            name = f"snapshot-{ts}.db"
+            snap_dir = DEFAULT_SNAP_DIR
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            dest = snap_dir / name
+            # flush and copy
             try:
-                src = Path(src_path)
-                if not src.exists():
-                    raise FileNotFoundError(src)
-                # if tar.gz, extract
-                tmpdir = tempfile.mkdtemp(prefix="zeropkg-import-")
-                if str(src).endswith(".tar.gz") or str(src).endswith(".tgz"):
-                    shutil.unpack_archive(str(src), tmpdir)
-                    # assume contains one file
-                    files = list(Path(tmpdir).glob("*"))
-                    if not files:
-                        raise RuntimeError("import archive empty")
-                    src_file = files[0]
-                else:
-                    src_file = src
-                if replace:
-                    # backup current DB
-                    bak = str(self.db_path) + ".bak." + str(int(time.time()))
-                    shutil.copy2(str(self.db_path), bak)
-                    shutil.copy2(str(src_file), str(self.db_path))
-                    # reconnect
-                    self.close()
-                    self._connect()
-                else:
-                    # merge: open both and copy entries (simple approach: attach db and copy)
-                    conn = self._connect()
-                    cur = conn.cursor()
-                    cur.execute(f"ATTACH DATABASE '{str(src_file)}' AS srcdb")
-                    # copy packages and files where not exist (best-effort)
-                    cur.execute("""
-                    INSERT OR IGNORE INTO packages (id, name, version, install_ts, install_size, metadata)
-                    SELECT id, name, version, install_ts, install_size, metadata FROM srcdb.packages
-                    """)
-                    cur.execute("""
-                    INSERT OR IGNORE INTO files (id, pkg_id, path, sha256, size, mtime)
-                    SELECT id, pkg_id, path, sha256, size, mtime FROM srcdb.files
-                    """)
-                    cur.execute("""
-                    INSERT INTO events (ts, type, pkg, payload)
-                    SELECT ts, type, pkg, payload FROM srcdb.events
-                    """)
-                    conn.commit()
-                    cur.execute("DETACH DATABASE srcdb")
-                self.cache.invalidate()
-                return True
-            except Exception as e:
-                log_event("zeropkg.db", "import", f"error: {e}", level="error")
-                return False
-
-    def validate_integrity(self, pkg_name: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Validate SHA256 and sizes for files recorded in DB.
-        If pkg_name is None, validate all packages.
-        Returns dict with results per package.
-        """
-        results = {}
-        with _db_lock:
-            try:
-                conn = self._connect()
-                cur = conn.cursor()
-                if pkg_name:
-                    cur.execute("SELECT id, name FROM packages WHERE name=?", (pkg_name,))
-                    rows = cur.fetchall()
-                else:
-                    cur.execute("SELECT id, name FROM packages")
-                    rows = cur.fetchall()
-                for r in rows:
-                    pid = r["id"]
-                    name = r["name"]
-                    cur.execute("SELECT path, sha256, size FROM files WHERE pkg_id=?", (pid,))
-                    bad = []
-                    for f in cur.fetchall():
-                        p = f["path"]
-                        expected_sha = f["sha256"]
-                        expected_size = f["size"]
-                        actual_sha = _sha256_of_file(p) if os.path.exists(p) else None
-                        actual_size = os.path.getsize(p) if os.path.exists(p) else None
-                        if expected_sha and actual_sha != expected_sha:
-                            bad.append({"path": p, "error": "sha-mismatch", "expected": expected_sha, "actual": actual_sha})
-                        elif expected_size and actual_size != expected_size:
-                            bad.append({"path": p, "error": "size-mismatch", "expected": expected_size, "actual": actual_size})
-                    results[name] = {"ok": len(bad) == 0, "issues": bad}
-                return results
-            except Exception as e:
-                log_event("zeropkg.db", "validate", f"error: {e}", level="error")
-                return {}
-
-    # ------------------------------
-    # Snapshot / rollback (simple file copy)
-    # ------------------------------
-    def snapshot(self, dest_dir: Optional[Path] = None) -> Path:
-        """
-        Save a copy of the DB file to dest_dir and return path.
-        """
-        with _db_lock:
-            dest_dir = Path(dest_dir or (self.db_path.parent / "snapshots"))
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            snap_path = dest_dir / f"installed.sqlite3.{int(time.time())}.snapshot"
-            self.close()
-            shutil.copy2(str(self.db_path), str(snap_path))
-            # reconnect
-            self._connect()
-            return snap_path
-
-    def rollback_from_snapshot(self, snapshot_path: Path) -> bool:
-        with _db_lock:
-            try:
-                if not Path(snapshot_path).exists():
-                    return False
-                self.close()
-                shutil.copy2(str(snapshot_path), str(self.db_path))
-                self._connect()
-                self.cache.invalidate()
-                log_event("zeropkg.db", "rollback", f"Rolled back DB from {snapshot_path}", level="warning")
-                return True
-            except Exception as e:
-                log_event("zeropkg.db", "rollback", f"error: {e}", level="error")
-                return False
-
-    # ------------------------------
-    # Convenience wrapper: install (builder -> installer handshake)
-    # ------------------------------
-    def install(self, pkg_name: str, manifest: Dict[str,Any], deps: List[Dict[str,Any]] = None, metadata: Dict[str,Any] = None) -> bool:
-        """
-        High-level helper for installer to call after successful install.
-        Calls record_install_quick and emits event.
-        """
-        ok = self.record_install_quick(pkg_name, manifest, deps=deps, metadata=metadata)
-        if ok:
-            try:
-                log_event(pkg_name, "db", f"install recorded (install helper)", level="info")
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             except Exception:
                 pass
-        return ok
+            # ensure closed briefly for copy safety
+            self._conn.commit()
+            shutil.copy2(str(self.db_path), str(dest))
+            cur = self._execute("INSERT INTO snapshots(ts, path, note) VALUES(?,?,?)", (ts, str(dest), note or ""), commit=True)
+            snap_id = cur.lastrowid
+            _log_event("snapshot", f"Created snapshot {dest}", level="INFO", metadata={"snapshot_id": snap_id})
+            return {"ok": True, "snapshot_id": snap_id, "path": str(dest), "ts": ts}
 
-    # ------------------------------
-    # Helper: get packages that depend on pkg_name recursively (deep revdeps)
-    # ------------------------------
-    def find_revdeps_recursive(self, pkg_name: str) -> List[str]:
+    def rollback_from_snapshot(self, snapshot_id: int) -> Dict[str, Any]:
         """
-        Return reverse dependencies recursively (breadth first).
+        Rollback DB to a snapshot (by id).
+        WARNING: this replaces the DB file; callers should ensure service restart if needed.
         """
-        found = set()
-        queue = [pkg_name]
-        while queue:
-            current = queue.pop(0)
-            revs = self.find_revdeps(current)
-            for r in revs:
-                if r not in found:
-                    found.add(r)
-                    queue.append(r)
-        return list(found)
+        with self._lock:
+            cur = self._execute("SELECT path FROM snapshots WHERE id = ? LIMIT 1", (snapshot_id,))
+            row = cur.fetchone()
+            if not row:
+                return {"ok": False, "error": "snapshot_not_found"}
+            snap_path = Path(row["path"])
+            if not snap_path.exists():
+                return {"ok": False, "error": "snapshot_file_missing"}
+            # close connection, replace file, reconnect
+            try:
+                self.close()
+                shutil.copy2(str(snap_path), str(self.db_path))
+                # reopen
+                self._connect_and_init()
+                self.cache.clear()
+                _log_event("rollback", f"Rolled back DB from snapshot {snapshot_id}", level="INFO", metadata={"snapshot_id": snapshot_id})
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
 
-# Convenience module-level functions for backward compatibility
-_default_db = None
-def _get_default_db():
-    global _default_db
-    if _default_db is None:
-        _default_db = ZeroPKGDB()
-    return _default_db
+    def export_db(self, dest: Optional[Path] = None, compress: bool = True) -> str:
+        """
+        Export DB to dest (file or directory) as tar.gz if compress True, else raw copy.
+        Returns path to exported file.
+        """
+        dest = Path(dest or (DEFAULT_STATE_DIR / f"zeropkg-db-export-{int(time.time())}.tar.gz"))
+        with self._lock:
+            try:
+                # ensure checkpoint to avoid WAL issues
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                except Exception:
+                    pass
+                self._conn.commit()
+                if compress:
+                    with tarfile.open(str(dest), "w:gz") as tf:
+                        tf.add(str(self.db_path), arcname=self.db_path.name)
+                else:
+                    shutil.copy2(str(self.db_path), str(dest))
+                _log_event("export", f"Exported DB to {dest}", level="INFO")
+                return str(dest)
+            except Exception as e:
+                _log_event("export_error", str(e), level="ERROR")
+                raise
 
-def record_install_quick(pkg_name: str, manifest: Dict[str,Any], deps: List[Dict[str,Any]] = None, metadata: Dict[str,Any] = None) -> bool:
-    return _get_default_db().record_install_quick(pkg_name, manifest, deps=deps, metadata=metadata)
+    def import_db(self, src: Path, overwrite: bool = False) -> Dict[str, Any]:
+        """
+        Import DB from tar.gz or raw DB file. If overwrite=True, replace current DB.
+        """
+        src = Path(src)
+        with self._lock:
+            try:
+                tmpdir = Path(tempfile.mkdtemp(prefix="zeropkg-import-"))
+                try:
+                    if tarfile.is_tarfile(str(src)):
+                        with tarfile.open(str(src), "r:*") as tf:
+                            tf.extractall(path=str(tmpdir))
+                        # find a .db file inside
+                        found = list(tmpdir.glob("**/*.db"))
+                        if not found:
+                            return {"ok": False, "error": "no_db_in_archive"}
+                        src_db = found[0]
+                    else:
+                        src_db = src
+                    # copy to place
+                    if overwrite:
+                        self.close()
+                        shutil.copy2(str(src_db), str(self.db_path))
+                        self._connect_and_init()
+                    else:
+                        # import into same DB by reading and merging; basic approach: attach and copy
+                        # attach src in sqlite and copy tables
+                        attach_name = "srcdb"
+                        cur = self._execute(f"ATTACH DATABASE ? AS {attach_name}", (str(src_db),))
+                        # naive copy: insert or ignore into packages then files/deps/events
+                        self._execute(f"INSERT OR IGNORE INTO packages(name, version, installed_at, size, manifest_json) SELECT name, version, installed_at, size, manifest_json FROM {attach_name}.packages", commit=True)
+                        # copy files by joining
+                        self._execute(f"INSERT OR IGNORE INTO files(package_id, path, mode, uid, gid, size, sha256) SELECT p.id, f.path, f.mode, f.uid, f.gid, f.size, f.sha256 FROM {attach_name}.files f JOIN {attach_name}.packages sp ON sp.id = f.package_id JOIN packages p ON p.name = sp.name", commit=True)
+                        # deps and events
+                        self._execute(f"INSERT INTO deps(package_id, depends_on) SELECT p.id, d.depends_on FROM {attach_name}.deps d JOIN {attach_name}.packages sp ON sp.id = d.package_id JOIN packages p ON p.name = sp.name", commit=True)
+                        self._execute(f"INSERT INTO events(ts, type, level, package, payload_json) SELECT ts, type, level, package, payload_json FROM {attach_name}.events", commit=True)
+                        self._execute(f"DETACH DATABASE {attach_name}", (), commit=True)
+                    self.cache.clear()
+                    _log_event("import", f"Imported DB from {src}", level="INFO")
+                    return {"ok": True}
+                finally:
+                    try:
+                        shutil.rmtree(str(tmpdir))
+                    except Exception:
+                        pass
+            except Exception as e:
+                _log_event("import_error", str(e), level="ERROR")
+                return {"ok": False, "error": str(e)}
 
-def remove_package_quick(pkg_name: str) -> bool:
-    return _get_default_db().remove_package_quick(pkg_name)
+    # -------------------------
+    # Utility / close
+    # -------------------------
+    def close_and_cleanup(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
-def record_upgrade_event(event: Dict[str,Any]) -> bool:
-    try:
-        pkg = event.get("pkg") or event.get("package")
-        old = event.get("old")
-        new = event.get("new")
-        ok = _get_default_db().record_upgrade_event(pkg, old, new, success=event.get("success", True), extra=event.get("extra"))
-        return ok
-    except Exception:
-        return False
+# Singleton convenience
+_DEFAULT_DB: Optional[ZeroPKGDB] = None
 
-def get_package_manifest(pkg_name: str) -> Optional[Dict[str,Any]]:
-    return _get_default_db().get_package_manifest(pkg_name)
+def _get_default_db() -> ZeroPKGDB:
+    global _DEFAULT_DB
+    if _DEFAULT_DB is None:
+        _DEFAULT_DB = ZeroPKGDB()
+    return _DEFAULT_DB
 
-def list_installed_quick() -> List[Dict[str,Any]]:
-    return _get_default_db().list_installed_quick()
+# Provide module-level simple functions for quick use
+def record_install_quick(name: str, version: str, manifest: Dict[str, Any], files: List[Dict[str, Any]], deps: List[str] = None):
+    db = _get_default_db()
+    return db.record_install_quick(name, version, manifest, files, deps)
 
-def get_orphaned_packages() -> List[str]:
-    return _get_default_db().get_orphaned_packages()
+def remove_package_quick(name: str):
+    db = _get_default_db()
+    return db.remove_package_quick(name)
 
-def find_revdeps(pkg_name: str) -> List[str]:
-    return _get_default_db().find_revdeps(pkg_name)
+def get_package_manifest(name: str):
+    db = _get_default_db()
+    return db.get_package_manifest(name)
 
-# End of module
+def list_installed_quick():
+    db = _get_default_db()
+    return db.list_installed_quick()
+
+def find_revdeps(name: str):
+    db = _get_default_db()
+    return db.find_revdeps(name)
+
+def get_orphaned_packages():
+    db = _get_default_db()
+    return db.get_orphaned_packages()
+
+def record_event(etype: str, level: str = "INFO", package: Optional[str] = None, payload: Optional[Dict[str, Any]] = None):
+    db = _get_default_db()
+    return db.record_event(etype, level, package, payload)
+
+# Basic CLI for quick introspection
+if __name__ == "__main__":
+    import argparse, pprint
+    p = argparse.ArgumentParser(prog="zeropkg-db", description="Zeropkg DB inspector")
+    p.add_argument("--list", action="store_true", help="List installed packages")
+    p.add_argument("--manifest", help="Show package manifest")
+    p.add_argument("--export", help="Export db to path (tar.gz recommended)")
+    p.add_argument("--import", dest="import_path", help="Import db from path")
+    p.add_argument("--snapshot", action="store_true", help="Create snapshot")
+    p.add_argument("--validate", action="store_true", help="Validate integrity (may be slow)")
+    args = p.parse_args()
+    db = _get_default_db()
+    if args.list:
+        pprint.pprint(db.list_installed_quick())
+    if args.manifest:
+        pprint.pprint(db.get_package_manifest(args.manifest))
+    if args.export:
+        print(db.export_db(Path(args.export)))
+    if args.import_path:
+        print(db.import_db(Path(args.import_path)))
+    if args.snapshot:
+        print(db.snapshot())
+    if args.validate:
+        print(db.validate_integrity())
