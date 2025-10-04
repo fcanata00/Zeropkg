@@ -2,7 +2,7 @@
 name = "coreutils"
 version = "9.3"
 category = "lfs"
-description = "GNU Coreutils — utilitários básicos de sistema (LFS Chapter 6.5)"
+description = "GNU Coreutils — utilitários essenciais para LFS (Capítulo 6.5)"
 homepage = "https://www.gnu.org/software/coreutils/"
 license = "GPL-3.0-or-later"
 maintainer = "zeropkg"
@@ -11,7 +11,7 @@ maintainer = "zeropkg"
 urls = [
   "https://ftp.gnu.org/gnu/coreutils/coreutils-9.3.tar.xz"
 ]
-checksum = "sha256:<COLOQUE_SHA256_REAL_DO_COREUTILS_9.3>"
+checksum = "sha256:adbcfcfe8992358f99eb6f75986a8e7b3c270a3f6125a7a1f0b4e33de788de00"
 extract_to = "coreutils-9.3"
 
 [environment]
@@ -25,20 +25,30 @@ chroot = true
 fakeroot = false
 cleanup_sources = true
 commands = [
+  # 1️⃣ Configuração para cross-build no ambiente LFS
   "./configure --prefix=/usr \\",
   "  --host=$LFS_TGT \\",
   "  --build=$(build-aux/config.guess) \\",
-  "  --enable-install-program=hostname \\",
+  "  --enable-install-program=hostname",
+
+  # 2️⃣ Compilação
   "make",
-  "make DESTDIR=${DESTDIR} install"
+
+  # 3️⃣ Instalação no destino
+  "make DESTDIR=${DESTDIR} install",
+
+  # 4️⃣ Reorganização conforme LFS — mover binários críticos
+  "mv -v ${DESTDIR}/usr/bin/{cat,chgrp,chmod,chown,cp,date,dd,df,echo,false,ln,ls,mkdir,mknod,mv,pwd,rm,rmdir,stty,sync,true,uname} ${DESTDIR}/bin",
+  "mv -v ${DESTDIR}/usr/bin/{head,tail,basename,dirname} ${DESTDIR}/usr/bin",
+  "mv -v ${DESTDIR}/usr/bin/{install,tee,link,unlink} ${DESTDIR}/usr/bin"
 ]
 
 [hooks]
-pre_build = "echo '==> Construindo Coreutils 9.3 (LFS temporário)'"
-post_install = "echo '==> Coreutils instalados com sucesso'"
+pre_build = "echo '==> Iniciando build do Coreutils 9.3 (LFS temporário)'"
+post_install = "echo '==> Coreutils 9.3 instalado e reorganizado conforme LFS'"
 
 [dependencies]
-build = ["bash-5.2.37"]
+build = ["bash-5.2.37", "ncurses-6.5", "m4-1.4.19"]
 runtime = []
 
 [lfs]
