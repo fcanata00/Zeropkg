@@ -1,0 +1,45 @@
+[package]
+name = "m4"
+version = "1.4.19"
+category = "lfs"
+description = "GNU M4 — macro processor usado em compilação de ferramentas temporárias"
+homepage = "https://www.gnu.org/software/m4/"
+license = "GPL-3.0-or-later"
+maintainer = "zeropkg"
+
+[sources]
+urls = [
+  "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz"
+]
+checksum = "sha256:f702f273a7d85d837b8cd0e68e4f3e854cd40ce5960a93d98ad6c69b1aa584e8"
+extract_to = "m4-1.4.19"
+
+[environment]
+LFS = "/mnt/lfs"
+LFS_TGT = "x86_64-lfs-linux-gnu"
+PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
+DESTDIR = "@DESTDIR@"
+
+[build]
+chroot = true
+fakeroot = false
+cleanup_sources = true
+commands = [
+  # configuração cross compilação
+  "./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess)",
+  "make",
+  "make DESTDIR=${DESTDIR} install"
+]
+
+[hooks]
+pre_build = "echo '==> Construindo M4 (temporário)'"
+post_install = "echo '==> M4 instalado no prefixo temporário'"
+
+[dependencies]
+build = []
+runtime = []
+
+[lfs]
+stage = "toolchain"
+bootstrap = true
+chroot_required = true
