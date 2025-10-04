@@ -104,7 +104,7 @@ PATH = "/tools/bin:/usr/bin:/bin"
 # Aplicação automática de patches locais ou remotos
 apply = [
   "https://example.org/patches/example-fix-paths.patch",
-  "local-fixes/0001-fix-env-vars.patch"
+  "patches/0001-fix-env-vars.patch"
 ]
 strip = 1
 
