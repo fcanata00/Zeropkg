@@ -1,102 +1,91 @@
-# glibc-2.42.toml — receita completa adaptada ao LFS (capítulo Glibc)
 [package]
 name = "glibc"
 version = "2.42"
-category = "lfs"
-description = "GNU C Library (glibc) — conforme LFS chapter: installation + sanity checks"
+stage = "pass1"
+description = "GNU C Library - Fase 1 do Toolchain"
+category = "toolchain"
+license = "LGPLv2.1+"
 homepage = "https://www.gnu.org/software/libc/"
-license = "LGPL-2.1-or-later"
-maintainer = "zeropkg"
+maintainer = "Zeropkg LFS Automation"
+priority = "critical"
 
-[sources]
-urls = [
-  "https://ftp.gnu.org/gnu/libc/glibc-2.42.tar.xz"
-]
-# preencha o checksum com o sha256 oficial do tarball que você baixar
-checksum = "sha256:<COLOQUE_SHA256_AQUI>"
+[source]
+urls = ["https://ftp.gnu.org/gnu/glibc/glibc-2.42.tar.xz"]
+sha256 = ["PLACEHOLDER_SHA256"]
 extract_to = "glibc-2.42"
+
+[build]
+depends = ["linux-api-headers"]
+use_chroot = true
+fakeroot = true
+workdir = "build"
 
 [environment]
 LFS = "/mnt/lfs"
 LFS_TGT = "x86_64-lfs-linux-gnu"
-PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
-DESTDIR = "@DESTDIR@"   # builder/installer substituirão este token
+PATH = "/tools/bin:/usr/bin:/bin"
+MAKEFLAGS = "-j$(nproc)"
+CFLAGS = "-O2 -pipe"
+CXXFLAGS = "-O2 -pipe"
+LANG = "en_US.UTF-8"
 
-[patches]
-# Se você mantiver o patch glibc-2.42-fhs-1.patch em /usr/ports/glibc/patches/
-files = [
-  "patches/glibc-2.42-fhs-1.patch"
+[prepare]
+commands = [
+  "case $(uname -m) in",
+  "  i?86) ln -sfv ld-linux.so.2 $LFS/lib/ld-lsb.so.3 ;;",
+  "  x86_64) ln -sfv ../lib/ld-linux-x86-64.so.2 $LFS/lib64 &&",
+  "           ln -sfv ../lib/ld-linux-x86-64.so.2 $LFS/lib64/ld-lsb-x86-64.so.3 ;;",
+  "esac",
+  "patch -Np1 -i ../glibc-2.42-fhs-1.patch",
+  "echo \"rootsbindir=/usr/sbin\" > configparms",
+  "mkdir -v build"
 ]
 
-[build]
-# Executar em chroot LFS; fakeroot para preservar UID/GID se necessário
-chroot = true
-fakeroot = true
-cleanup_sources = true
-
-# Sequência de comandos — fiel ao LFS chapter (ordem importa)
+[configure]
 commands = [
-  # 0) Cria symlinks LSB / compat no destino LFS (feito antes da instalação)
-  "case $(uname -m) in \\",
-  "  i?86) ln -sfv ld-linux.so.2 ${LFS}/lib/ld-lsb.so.3 ;; \\",
-  "  x86_64) ln -sfv ../lib/ld-linux-x86-64.so.2 ${LFS}/lib64 && ln -sfv ../lib/ld-linux-x86-64.so.2 ${LFS}/lib64/ld-lsb-x86-64.so.3 ;; \\",
-  "esac",
-
-  # 1) Prepare build dir e aplique patch FHS (se presente)
-  "mkdir -v build",
   "cd build",
-  "echo 'rootsbindir=/usr/sbin' > configparms",
+  "../configure",
+  "--prefix=/usr",
+  "--host=$LFS_TGT",
+  "--build=$(../scripts/config.guess)",
+  "--enable-kernel=5.4",
+  "--with-headers=$LFS/usr/include",
+  "libc_cv_slibdir=/usr/lib"
+]
 
-  # 2) Configure conforme LFS (descreve uso de --host/--build e libc_cv_slibdir)
-  "../configure \\",
-  "  --prefix=/usr \\",
-  "  --host=$LFS_TGT \\",
-  "  --build=$(../scripts/config.guess) \\",
-  "  --disable-nscd \\",
-  "  libc_cv_slibdir=/usr/lib \\",
-  "  --enable-kernel=5.4",
+[compile]
+commands = ["make"]
 
-  # 3) Compile
-  "make",
+[install]
+commands = ["make DESTDIR=$LFS install"]
 
-  # 4) Testes (make check). LFS recomenda; pode falhar em alguns ambientes --> não abortar automaticamente
-  "make check || true",
-
-  # 5) Instalação no DESTDIR (sempre usar DESTDIR para não tocar host)
-  "make DESTDIR=${DESTDIR} install",
-
-  # 6) Corrigir o script ldd conforme LFS
-  "sed '/RTLDLIST=/s@/usr@@g' -i ${DESTDIR}/usr/bin/ldd",
-
-  # 7) Sanity checks (compilador/linker deve apontar para o LFS correto)
-  "echo 'int main(){}' | ${LFS_TGT}-gcc -x c - -v -Wl,--verbose &> /tmp/dummy.log || true",
-  "readelf -l a.out | grep ': /lib' || true",
-  "grep -E -o \"$LFS/lib.*/S?crt[1in].*succeeded\" /tmp/dummy.log || true",
-  "grep -B3 \"^ $LFS/usr/include\" /tmp/dummy.log || true",
-
-  # 8) Limpeza de testes
-  "rm -v a.out || true",
-  "rm -v /tmp/dummy.log || true",
-
-  # 9) criar /etc/nsswitch.conf e ld.so.conf padrão dentro do DESTDIR
-  "mkdir -pv ${DESTDIR}/etc",
-  "printf '%s\n' 'passwd: files' > ${DESTDIR}/etc/nsswitch.conf",
-  "printf '%s\n' 'group:  files' >> ${DESTDIR}/etc/nsswitch.conf",
-  "cat > ${DESTDIR}/etc/ld.so.conf << 'EOF'\n/usr/local/lib\n/opt/lib\nEOF",
-  "mkdir -pv ${DESTDIR}/etc/ld.so.conf.d"
+[tests]
+enabled = true
+commands = [
+  "echo 'int main(){}' > dummy.c",
+  "$LFS_TGT-gcc dummy.c -o dummy",
+  "readelf -l dummy | grep ld-linux",
+  "grep -E -o '$LFS/lib.*/S?crt[1in].*succeeded' dummy.log || true",
+  "rm -v dummy.c dummy dummy.log"
 ]
 
 [hooks]
-pre_build = "echo '==> Preparando Glibc-2.42 (LFS) — criando configparms e symlinks LSB...'"
-post_install = "echo '==> Glibc instalado. Verifique erros em logs e testes.'"
+post_install = [
+  "sed '/RTLDLIST=/s@/usr@@g' -i $LFS/usr/bin/ldd",
+  "echo '[HOOK] Glibc Pass1 instalado com sucesso em $LFS/usr'"
+]
 
-[dependencies]
-# use nomes exatos das receitas/versões que você tem no ports (ajuste conforme seu repositório)
-build = ["linux-headers-6.6.54", "gcc-13.2.0-pass1", "binutils-2.43.1"]
-runtime = []
-optional = []
+[package.files]
+lib = ["/usr/lib/libc.so.6"]
+doc = ["/usr/share/doc/glibc-2.42"]
 
-[lfs]
-stage = "toolchain"
-bootstrap = false
-chroot_required = true
+[package.meta]
+provides = ["glibc-pass1"]
+group = "toolchain"
+
+[install]
+root = "/mnt/lfs"
+safe_chroot = true
+parallel_install = false
+keep_build = false
+overwrite_existing = true
