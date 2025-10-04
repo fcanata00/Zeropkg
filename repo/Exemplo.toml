@@ -131,11 +131,12 @@ post_remove = ["echo '[HOOK] Remoção concluída'"]
 
 # ------------------------------------------------------------------------
 [package.files]
-# Arquivos rastreados após instalação (usado por zeropkg_db)
-bin = ["/usr/bin/example-app"]
-lib = ["/usr/lib/libexample.so"]
-conf = ["/etc/example.conf"]
-doc = ["/usr/share/doc/example-app/README"]
+bin = ["/usr/bin/*"]
+sbin = ["/usr/sbin/*"]
+lib = ["/usr/lib/*.so*"]
+doc = ["/usr/share/doc/bash-5.3/*"]
+man = ["/usr/share/man/man1/*", "/usr/share/man/man8/*"]
+conf = ["/etc/bash.bashrc"]
 
 # ------------------------------------------------------------------------
 [tests]
