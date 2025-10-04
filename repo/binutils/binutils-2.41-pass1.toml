@@ -1,105 +1,100 @@
-# GNU Binutils — Pass 1 (LFS Toolchain)
-# Receita real para uso com Zeropkg
-# ------------------------------------------------------------
-# Esta fase constrói os utilitários binutils no ambiente toolchain,
-# dentro de /mnt/lfs/tools (isolado, sem headers ou libs do sistema host).
-# ------------------------------------------------------------
-
 [package]
 name = "binutils"
 version = "2.43.1"
-category = "lfs"
-variant = "pass1"
-description = "GNU Binutils (fase 1) — montador e ligador para o toolchain inicial do LFS."
-maintainer = "Zeropkg Build System"
-license = "GPL-3.0"
+stage = "pass1"
+description = "Binutils - ferramentas essenciais de linkagem e montagem (fase 1 do toolchain)"
+category = "toolchain"
+license = "GPLv3"
+maintainer = "Zeropkg LFS Automation"
 homepage = "https://www.gnu.org/software/binutils/"
+priority = "critical"
 
-# ------------------------------------------------------------
-# Fontes — download principal e mirrors
-# ------------------------------------------------------------
-[sources]
+[source]
+urls = ["https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz"]
+sha256 = ["0a9d4f9ed53d5cdb7d9a7c3eb2ad04dbb6f0b0c8a01a3c0b637d2a5b4e870ae4"]
+extract_to = "binutils-2.43.1"
 
-[[sources.entries]]
-url = "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz"
-checksum = "sha256:57ff8e8fd0497355dfcae6db4b1daef82ad6e3f23ec9e85795e80f8a4630b1dd"
-format = "tar.xz"
-priority = 1
+[build]
+depends = []
+optional_depends = []
+use_chroot = true
+fakeroot = true
+workdir = "build"
 
-[[sources.entries]]
-url = "https://mirror.kernel.org/gnu/binutils/binutils-2.43.1.tar.xz"
-format = "tar.xz"
-priority = 2
-
-# ------------------------------------------------------------
-# Ambiente — conforme manual do LFS
-# ------------------------------------------------------------
 [environment]
 LFS = "/mnt/lfs"
 LFS_TGT = "x86_64-lfs-linux-gnu"
-PATH = "/mnt/lfs/tools/bin:/usr/bin"
-CONFIG_SITE = "/mnt/lfs/usr/share/config.site"
+PATH = "/usr/bin:/bin"
+MAKEFLAGS = "-j$(nproc)"
+LC_ALL = "POSIX"
+CC = "gcc"
+CXX = "g++"
+CFLAGS = "-O2 -pipe"
+CXXFLAGS = "-O2 -pipe"
 
-# ------------------------------------------------------------
-# Dependências — somente GCC e glibc quando disponíveis
-# ------------------------------------------------------------
-[dependencies]
-build = []
-runtime = []
-
-# ------------------------------------------------------------
-# Construção — passos reais do LFS
-# ------------------------------------------------------------
-[build]
-system = "custom"
-fakeroot = false
-chroot = false
-strip_binaries = false
+[prepare]
 commands = [
-    "mkdir -pv build",
-    "cd build",
-    "../configure --prefix=/mnt/lfs/tools --with-sysroot=$LFS --target=$LFS_TGT --disable-nls --enable-gprofng=no --disable-werror",
-    "make",
-    "make install"
+  "mkdir -pv build"
 ]
 
-# ------------------------------------------------------------
-# Pós-instalação — limpeza e registro
-# ------------------------------------------------------------
-[post_install]
-register = true
-clean_build_dir = true
-update_cache = true
+[configure]
+commands = [
+  "cd build",
+  "../configure",
+  "--prefix=$LFS/tools",
+  "--with-sysroot=$LFS",
+  "--target=$LFS_TGT",
+  "--disable-nls",
+  "--enable-gprofng=no",
+  "--disable-werror"
+]
 
-# ------------------------------------------------------------
-# Configuração específica para LFS
-# ------------------------------------------------------------
-[lfs]
-stage = "toolchain"
-toolchain = true
-bootstrap = true
-chroot_required = false
+[compile]
+commands = [
+  "cd build",
+  "make -j$(nproc)"
+]
 
-# ------------------------------------------------------------
-# Hooks (opcionais)
-# ------------------------------------------------------------
+[install]
+commands = [
+  "cd build",
+  "make install"
+]
+
 [hooks]
-pre_configure = ""
-post_install = ""
-pre_remove = ""
-post_remove = ""
+pre_configure = [
+  "echo '[HOOK] Iniciando build do Binutils (Pass 1)'"
+]
+post_install = [
+  "echo '[HOOK] Binutils Pass 1 instalado em $LFS/tools/bin'"
+]
 
-# ------------------------------------------------------------
-# Segurança e empacotamento
-# ------------------------------------------------------------
-[security]
-verify_checksums = true
-use_chroot = false
-fakeroot = false
+[patches]
+apply = []
+strip = 1
 
-[package_build]
-enabled = true
-type = "tar"
-output_dir = "/var/zeropkg/packages"
-compress = "xz"
-include_docs = false
+[tests]
+enabled = false
+
+[package.meta]
+provides = ["as", "ld", "nm", "objdump", "ar", "strip"]
+group = "toolchain"
+conflicts = []
+replaces = []
+
+[install]
+root = "/mnt/lfs"
+keep_build = false
+safe_chroot = true
+parallel_install = false
+overwrite_existing = true
+
+[package.files]
+bin = ["/mnt/lfs/tools/bin/as", "/mnt/lfs/tools/bin/ld"]
+lib = ["/mnt/lfs/tools/lib/bfd", "/mnt/lfs/tools/lib/opcodes"]
+
+[notifications]
+notify = true
+urgency = "critical"
+summary = "Binutils (Pass 1) instalado com sucesso em $LFS/tools"
+icon = "/usr/share/icons/binutils.png"
