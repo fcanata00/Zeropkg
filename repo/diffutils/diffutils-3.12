@@ -1,0 +1,44 @@
+[package]
+name = "diffutils"
+version = "3.12"
+category = "lfs"
+description = "GNU Diffutils — utilitários diff/patch básicos (LFS chap. 6.6)"
+homepage = "https://www.gnu.org/software/diffutils/"
+license = "GPL-3.0-or-later"
+maintainer = "zeropkg"
+
+[sources]
+urls = [
+  "https://ftp.gnu.org/gnu/diffutils/diffutils-3.12.tar.xz"
+]
+checksum = "sha256:<COLOQUE_SHA256_REAL_AQUI>"
+extract_to = "diffutils-3.11"
+
+[environment]
+LFS = "/mnt/lfs"
+LFS_TGT = "x86_64-lfs-linux-gnu"
+PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
+DESTDIR = "@DESTDIR@"
+
+[build]
+chroot = true
+fakeroot = false
+cleanup_sources = true
+commands = [
+  "./configure --prefix=/usr --host=$LFS_TGT --build=$(./build-aux/config.guess)",
+  "make",
+  "make DESTDIR=${DESTDIR} install"
+]
+
+[hooks]
+pre_build = "echo '==> Construindo Diffutils 3.11 (LFS)'"
+post_install = "echo '==> Diffutils 3.11 instalado'"
+
+[dependencies]
+build = []
+runtime = []
+
+[lfs]
+stage = "toolchain"
+bootstrap = true
+chroot_required = true
