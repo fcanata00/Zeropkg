@@ -1,133 +1,126 @@
-# GNU Binutils — Fase Final
-# Receita completa para uso com Zeropkg (LFS ou sistema normal)
-# ------------------------------------------------------------
-# Esta receita constrói e instala os binários definitivos de montagem e linkagem
-# após a construção do toolchain (binutils-pass1, gcc-pass1, glibc, etc.)
-# ------------------------------------------------------------
-
 [package]
 name = "binutils"
 version = "2.43.1"
-category = "base"
-variant = "final"
-description = "GNU Binutils — conjunto de ferramentas para montagem e linkagem (fase final)."
-maintainer = "Zeropkg Build System"
-license = "GPL-3.0"
+description = "GNU Binutils - Conjunto de ferramentas para manipular arquivos binários e objetos"
+category = "development"
+license = "GPLv3"
 homepage = "https://www.gnu.org/software/binutils/"
+maintainer = "Zeropkg LFS Automation"
+stage = "final"
+priority = "critical"
 
-# ------------------------------------------------------------
-# Fontes — múltiplos mirrors
-# ------------------------------------------------------------
-[sources]
-
-[[sources.entries]]
-url = "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz"
-checksum = "sha256:57ff8e8fd0497355dfcae6db4b1daef82ad6e3f23ec9e85795e80f8a4630b1dd"
-format = "tar.xz"
-priority = 1
-
-[[sources.entries]]
-url = "https://mirror.kernel.org/gnu/binutils/binutils-2.43.1.tar.xz"
-format = "tar.xz"
-priority = 2
-
-# ------------------------------------------------------------
-# Ambiente
-# ------------------------------------------------------------
-[environment]
-CFLAGS = "-O2 -pipe -fPIC"
-CXXFLAGS = "-O2 -pipe -fPIC"
-LDFLAGS = "-Wl,-O1"
-MAKEFLAGS = "-j$(nproc)"
-LANG = "C.UTF-8"
-LC_ALL = "C.UTF-8"
-
-# ------------------------------------------------------------
-# Dependências
-# ------------------------------------------------------------
-[dependencies]
-build = ["gcc", "make", "bash", "texinfo"]
-runtime = ["glibc", "zlib"]
-optional = ["gdb"]
-
-# ------------------------------------------------------------
-# Patches opcionais (se aplicáveis)
-# ------------------------------------------------------------
-[patches]
-files = []
-
-# ------------------------------------------------------------
-# Hooks (pré/pós estágios)
-# ------------------------------------------------------------
-[hooks]
-pre_configure = ""
-post_configure = ""
-pre_build = ""
-post_build = ""
-pre_install = ""
-post_install = "scripts/update-info-dir.sh"
-pre_remove = ""
-post_remove = ""
-
-# ------------------------------------------------------------
-# Construção real
-# ------------------------------------------------------------
-[build]
-system = "custom"
-fakeroot = true
-chroot = true
-strip_binaries = true
-commands = [
-    "mkdir -pv build",
-    "cd build",
-    "../configure --prefix=/usr            \\
-                  --enable-gold            \\
-                  --enable-ld=default      \\
-                  --enable-plugins         \\
-                  --enable-shared          \\
-                  --disable-werror         \\
-                  --enable-64-bit-bfd      \\
-                  --enable-lto             \\
-                  --with-system-zlib",
-    "make tooldir=/usr",
-    "make check || true",
-    "make install tooldir=/usr",
-    "rm -fv /usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes}.a"
+[source]
+urls = [
+  "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz"
 ]
+sha256 = [
+  "0a9d4f9ed53d5cdb7d9a7c3eb2ad04dbb6f0b0c8a01a3c0b637d2a5b4e870ae4"
+]
+extract_to = "binutils-2.43.1"
 
-# ------------------------------------------------------------
-# Pós-instalação
-# ------------------------------------------------------------
-[post_install]
-register = true
-update_cache = true
-clean_build_dir = true
-notify = true
-
-# ------------------------------------------------------------
-# Empacotamento binário
-# ------------------------------------------------------------
-[package_build]
-enabled = true
-type = "tar"
-output_dir = "/var/zeropkg/packages"
-compress = "xz"
-include_docs = true
-
-# ------------------------------------------------------------
-# Segurança e integridade
-# ------------------------------------------------------------
-[security]
-verify_checksums = true
+[build]
+depends = ["glibc", "zlib"]
+optional_depends = []
 use_chroot = true
 fakeroot = true
-signature_check = false
+workdir = "build"
 
-# ------------------------------------------------------------
-# Configuração LFS
-# ------------------------------------------------------------
-[lfs]
-stage = "final"
-toolchain = false
-bootstrap = false
-chroot_required = true
+[environment]
+PATH = "/usr/bin:/bin"
+LC_ALL = "POSIX"
+MAKEFLAGS = "-j$(nproc)"
+CC = "gcc"
+CXX = "g++"
+CFLAGS = "-O2 -pipe"
+CXXFLAGS = "-O2 -pipe"
+LDFLAGS = "-Wl,-O1,--as-needed"
+
+[prepare]
+commands = [
+  "mkdir -v build"
+]
+
+[configure]
+commands = [
+  "cd build",
+  "../configure",
+  "--prefix=/usr",
+  "--enable-gold",
+  "--enable-ld=default",
+  "--enable-plugins",
+  "--enable-shared",
+  "--disable-werror",
+  "--enable-64-bit-bfd",
+  "--with-system-zlib"
+]
+
+[compile]
+commands = [
+  "cd build",
+  "make -j$(nproc) tooldir=/usr"
+]
+
+[check]
+enabled = true
+commands = [
+  "cd build",
+  "make -k check || true"
+]
+
+[install]
+commands = [
+  "cd build",
+  "make tooldir=/usr install"
+]
+
+[post_install_cleanup]
+commands = [
+  "rm -fv /usr/lib/libbfd.a /usr/lib/libopcodes.a"
+]
+
+[patches]
+apply = []
+strip = 1
+
+[hooks]
+pre_configure = [
+  "echo '[HOOK] Preparando Binutils final para compilação...'"
+]
+post_install = [
+  "echo '[HOOK] Binutils 2.43.1 instalado com sucesso em /usr/bin'"
+]
+post_remove = [
+  "echo '[HOOK] Binutils removido. Recompile o toolchain se necessário.'"
+]
+
+[tests]
+enabled = true
+commands = [
+  "cd build",
+  "expect -c 'spawn make -k check; expect eof' || true",
+  "grep '^FAIL' build/test-suite.log || true"
+]
+
+[package.files]
+bin = ["/usr/bin/as", "/usr/bin/ld", "/usr/bin/nm", "/usr/bin/objdump"]
+lib = ["/usr/lib/bfd*", "/usr/lib/libopcodes*"]
+doc = ["/usr/share/doc/binutils-2.43.1"]
+
+[package.meta]
+provides = ["as", "ld", "nm", "objdump", "ar", "strip"]
+conflicts = ["binutils-pass1"]
+group = "toolchain"
+keywords = ["linker", "assembler", "toolchain", "bfd"]
+
+[install]
+root = "/"
+keep_build = false
+safe_chroot = true
+parallel_install = true
+overwrite_existing = true
+
+[notifications]
+notify = true
+urgency = "critical"
+summary = "Binutils (Final) instalado com sucesso"
+icon = "/usr/share/icons/binutils.png"
