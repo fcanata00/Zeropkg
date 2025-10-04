@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zeropkg_builder.py — Zeropkg build system
-Full-featured builder integrated with config, downloader, patcher, chroot, deps, db, installer and vuln.
+zeropkg_builder.py — Builder integrado para Zeropkg
+
+Integrações/expectativas:
+ - zeropkg_config.get_config_manager() or get_config_manager()
+ - zeropkg_toml.load_recipe / to_builder_spec
+ - zeropkg_downloader.Downloader
+ - zeropkg_patcher (apply_patches)
+ - zeropkg_chroot (prepare_chroot, cleanup_chroot, run_in_chroot, exec_in_chroot)
+ - zeropkg_installer (Installer class or install_from_staging function)
+ - zeropkg_db.record_install_quick
+ - zeropkg_logger.log_event / perf_timer
+
+Este módulo tenta usar cada integração via import seguro e tem fallbacks quando um módulo não existir.
 """
 
 from __future__ import annotations
@@ -10,551 +21,638 @@ import os
 import sys
 import json
 import shutil
-import tempfile
 import subprocess
+import tempfile
+import tarfile
 import time
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Optional, List, Dict, Any, Tuple
 
-# Try to import project modules; fallback safe shims
-try:
-    from zeropkg_config import load_config
-except Exception:
-    def load_config(path=None):
-        return {
-            "paths": {
-                "build_root": "/var/tmp/zeropkg/build",
-                "cache_dir": "/var/cache/zeropkg",
-                "binpkg_dir": "/var/cache/zeropkg/binpkgs",
-                "distfiles": "/usr/ports/distfiles",
-                "logs": "/var/log/zeropkg",
-                "root": "/"
-            },
-            "build": {"jobs": 1, "use_chroot": True, "fakeroot_default": False}
-        }
+# -------------------------
+# Safe imports of project modules (graceful fallback)
+# -------------------------
+def _safe_import(name: str):
+    try:
+        return __import__(name, fromlist=["*"])
+    except Exception:
+        return None
 
-try:
-    from zeropkg_logger import get_logger
-    log = get_logger("builder")
-except Exception:
-    import logging
-    log = logging.getLogger("zeropkg_builder")
-    if not log.handlers:
-        h = logging.StreamHandler(sys.stdout)
-        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        log.addHandler(h)
-    log.setLevel(logging.INFO)
+config_mod = _safe_import("zeropkg_config")
+toml_mod = _safe_import("zeropkg_toml")
+downloader_mod = _safe_import("zeropkg_downloader")
+patcher_mod = _safe_import("zeropkg_patcher")
+chroot_mod = _safe_import("zeropkg_chroot")
+installer_mod = _safe_import("zeropkg_installer")
+db_mod = _safe_import("zeropkg_db")
+logger_mod = _safe_import("zeropkg_logger")
+deps_mod = _safe_import("zeropkg_deps")
 
-try:
-    from zeropkg_downloader import Downloader
-except Exception:
-    Downloader = None
-
-try:
-    from zeropkg_patcher import Patcher
-except Exception:
-    Patcher = None
-
-try:
-    from zeropkg_chroot import prepare_chroot, cleanup_chroot, run_in_chroot
-except Exception:
-    def prepare_chroot(rootfs: Path):
-        return []
-    def cleanup_chroot(rootfs: Path, mounts: list):
-        return
-    def run_in_chroot(cfg, cmd):
-        raise RuntimeError("zeropkg_chroot.run_in_chroot not available")
-
-try:
-    from zeropkg_db import record_install_quick, get_manifest_quick, list_installed_quick
-except Exception:
-    record_install_quick = None
-    get_manifest_quick = None
-    list_installed_quick = None
-
-try:
-    from zeropkg_installer import ZeropkgInstaller
-except Exception:
-    ZeropkgInstaller = None
-
-try:
-    from zeropkg_deps import DepsManager
-except Exception:
-    DepsManager = None
-
-try:
-    from zeropkg_vuln import ZeroPKGVulnManager
-except Exception:
-    ZeroPKGVulnManager = None
-
-try:
-    from zeropkg_toml import ZeropkgTOML, resolve_macros
-except Exception:
-    ZeropkgTOML = None
-    def resolve_macros(x, env=None): return x
-
-# Utilities
-def sh_check(cmd, cwd=None, env=None, capture=False, shell=False):
-    log.debug(f"RUN: {' '.join(cmd) if isinstance(cmd, (list,tuple)) else cmd} (cwd={cwd})")
-    if capture:
-        res = subprocess.run(cmd, cwd=cwd, env=env, shell=shell,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        return res.returncode, res.stdout, res.stderr
+# Logger fallback
+def _log(evt: str, msg: str, level: str = "INFO", metadata: Optional[Dict[str,Any]]=None):
+    if logger_mod and hasattr(logger_mod, "log_event"):
+        try:
+            logger_mod.log_event(evt, msg, level=level, metadata=metadata)
+            return
+        except Exception:
+            pass
+    # fallback to stderr
+    if level == "ERROR":
+        print(f"[{level}] {evt}: {msg}", file=sys.stderr)
     else:
-        subprocess.run(cmd, cwd=cwd, env=env, shell=shell, check=True)
-        return 0, "", ""
+        print(f"[{level}] {evt}: {msg}", file=sys.stdout)
 
-def safe_mkdir(p: Path):
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+# Perf decorator fallback
+def _perf_timer(func):
+    if logger_mod and hasattr(logger_mod, "perf_timer"):
+        return logger_mod.perf_timer(func)
+    else:
+        # passthrough
+        from functools import wraps
+        @wraps(func)
+        def wrapper(*a, **k):
+            start = time.time()
+            res = func(*a, **k)
+            dur = time.time() - start
+            _log("perf", f"{func.__name__} executed in {dur:.2f}s", level="PERF", metadata={"duration": dur})
+            return res
+        return wrapper
 
-# Main builder
-class ZeropkgBuilder:
-    def __init__(self, config_path: Optional[str] = None):
-        self.cfg = load_config(config_path)
-        self.build_root = Path(self.cfg["paths"].get("build_root", "/var/tmp/zeropkg/build")).resolve()
-        self.cache_dir = Path(self.cfg["paths"].get("cache_dir", "/var/cache/zeropkg")).resolve()
-        self.binpkg_dir = Path(self.cfg["paths"].get("binpkg_dir", str(self.cache_dir / "binpkgs"))).resolve()
-        self.distfiles = Path(self.cfg["paths"].get("distfiles", "/usr/ports/distfiles")).resolve()
-        self.logs_dir = Path(self.cfg["paths"].get("logs", "/var/log/zeropkg")).resolve()
-        self.root_dir = Path(self.cfg["paths"].get("root", "/")).resolve()
-        safe_mkdir(self.build_root)
-        safe_mkdir(self.cache_dir)
-        safe_mkdir(self.binpkg_dir)
-        safe_mkdir(self.distfiles)
-        safe_mkdir(self.logs_dir)
-        # integrations
-        self.downloader = Downloader(self.cfg) if Downloader else None
-        self.patcher = Patcher(self.build_root, self.cfg, fakeroot=False) if Patcher else None
-        self.installer = ZeropkgInstaller() if ZeropkgInstaller else None
-        self.deps = DepsManager() if DepsManager else None
-        self.vuln = ZeroPKGVulnManager() if ZeroPKGVulnManager else None
-        self.toml = ZeropkgTOML() if ZeropkgTOML else None
-        self.jobs = int(self.cfg.get("build", {}).get("jobs", 1))
-        self.use_chroot_default = bool(self.cfg.get("build", {}).get("use_chroot", True))
-        self.fakeroot_default = bool(self.cfg.get("build", {}).get("fakeroot_default", False))
+# Downloader class fallback wrapper
+DownloaderClass = None
+if downloader_mod and hasattr(downloader_mod, "Downloader"):
+    DownloaderClass = downloader_mod.Downloader
 
-    # ---------------------------
-    # High-level build entrypoints
-    # ---------------------------
-    def build(self, recipe_path: str, *,
-              use_chroot: Optional[bool] = None,
-              fakeroot: Optional[bool] = None,
-              dry_run: bool = False,
-              use_cache: bool = True,
-              dir_install: Optional[str] = None,
-              force_rebuild: bool = False) -> Dict[str,Any]:
-        """
-        Build a single recipe (path to .toml). Returns dict with status and artifacts.
-        """
-        recipe_path = Path(recipe_path)
-        log.info(f"Starting build for recipe: {recipe_path}")
-        if not recipe_path.exists():
-            raise FileNotFoundError(recipe_path)
+# toml loader
+def _load_recipe(path: str):
+    if toml_mod and hasattr(toml_mod, "load_recipe"):
+        return toml_mod.load_recipe(path)
+    # fallback: try reading JSON/TOML minimal parse
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(path)
+    try:
+        # attempt JSON
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        # last resort, return dict with minimal info
+        return {"_meta": {"path": str(p)}, "package": {"name": p.stem, "version": "0.0"}, "build": {"commands": []}}
 
-        # read recipe
-        recipe = self._load_recipe(recipe_path)
+# patcher apply function fallback
+def _apply_patches(recipe_spec: dict, workdir: Path, dry_run: bool=False) -> Dict[str,Any]:
+    if patcher_mod and hasattr(patcher_mod, "apply_patches"):
+        try:
+            return patcher_mod.apply_patches(recipe_spec, workdir, dry_run=dry_run)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    # fallback: no patches applied
+    return {"ok": True, "applied": []}
 
-        # check vuln (if integration enabled)
-        if self.vuln:
-            vulns = self.vuln.vulndb.get_vulns(recipe["package"]["name"])
-            critical = [v for v in vulns if v.get("severity") == "critical"]
-            if critical:
-                log.warning(f"Package {recipe['package']['name']} has critical vulnerabilities: {len(critical)}. Aborting build.")
-                return {"ok": False, "error": "vulnerable", "details": critical}
+# installer fallback
+def _installer_install_from_staging(staging_dir: Path, target_root: str = "/", fakeroot: bool=False) -> Dict[str,Any]:
+    if installer_mod:
+        try:
+            # try common interfaces
+            if hasattr(installer_mod, "Installer"):
+                inst = installer_mod.Installer()
+                return inst.install_from_staging(str(staging_dir), root=target_root, fakeroot=fakeroot)
+            if hasattr(installer_mod, "install_from_staging"):
+                return installer_mod.install_from_staging(str(staging_dir), root=target_root, fakeroot=fakeroot)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    # fallback: naive copy (requires root)
+    try:
+        for src in staging_dir.rglob("*"):
+            rel = src.relative_to(staging_dir)
+            dest = Path(target_root) / rel
+            if src.is_dir():
+                dest.mkdir(parents=True, exist_ok=True)
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dest))
+        return {"ok": True, "method": "fallback_copy"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-        use_chroot = self.use_chroot_default if use_chroot is None else bool(use_chroot)
-        fakeroot = self.fakeroot_default if fakeroot is None else bool(fakeroot)
+# DB record fallback
+def _record_install_quick(name: str, version: str, manifest: Dict[str,Any], files: List[Dict[str,Any]], deps: List[str]=None):
+    if db_mod and hasattr(db_mod, "record_install_quick"):
+        try:
+            return db_mod.record_install_quick(name, version, manifest, files, deps)
+        except Exception as e:
+            _log("db", f"record_install_quick failed: {e}", level="ERROR", metadata={"pkg": name})
+            return {"ok": False, "error": str(e)}
+    # fallback: write small metadata in /var/lib/zeropkg/installed/<name>.json
+    try:
+        state_dir = Path("/var/lib/zeropkg")
+        state_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = state_dir / f"{name}.installed.json"
+        meta = {"name": name, "version": version, "manifest": manifest, "files": files, "deps": deps or []}
+        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        return {"ok": True, "note": "written_to_state_dir", "path": str(meta_path)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-        # resolve dependencies (unless skip)
-        if self.deps and not recipe.get("options", {}).get("skip_deps", False):
+# chroot helpers fallback
+def _prepare_chroot(profile: Optional[str], root: Optional[str], workdir: Optional[str]) -> Dict[str,Any]:
+    if chroot_mod and hasattr(chroot_mod, "prepare_chroot"):
+        try:
+            return chroot_mod.prepare_chroot(profile=profile, root=root, workdir=workdir)
+        except Exception as e:
+            _log("chroot", f"prepare_chroot failed: {e}", level="WARNING")
+            return {"ok": False, "error": str(e)}
+    # fallback: no chroot created (host mode)
+    return {"ok": False, "fallback": "host_mode"}
+
+def _cleanup_chroot(profile: Optional[str], root: Optional[str], workdir: Optional[str]) -> Dict[str,Any]:
+    if chroot_mod and hasattr(chroot_mod, "cleanup_chroot"):
+        try:
+            return chroot_mod.cleanup_chroot(profile=profile, root=root, workdir=workdir)
+        except Exception as e:
+            _log("chroot", f"cleanup_chroot failed: {e}", level="WARNING")
+            return {"ok": False, "error": str(e)}
+    return {"ok": False, "fallback": "host_mode_cleanup"}
+
+def _run_cmd_local(cmd: List[str], cwd: Optional[str]=None, env: Optional[Dict[str,str]]=None, dry_run: bool=False) -> Dict[str,Any]:
+    """Run a command in the local host environment (fallback)"""
+    try:
+        if dry_run:
+            _log("cmd", f"[dry-run] {' '.join(cmd)}", level="INFO")
+            return {"ok": True, "cmd": cmd, "dry_run": True}
+        proc = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ok = proc.returncode == 0
+        return {"ok": ok, "rc": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def _run_in_chroot(cmd: List[str], chroot_ctx: Dict[str,Any], cwd: Optional[str]=None, env: Optional[Dict[str,str]]=None, dry_run: bool=False) -> Dict[str,Any]:
+    """
+    Prefer chroot_mod.run_in_chroot / exec_in_chroot if available, else fallback to local run.
+    chroot_ctx is whatever _prepare_chroot returned.
+    """
+    if chroot_mod:
+        if hasattr(chroot_mod, "run_in_chroot"):
             try:
-                deps_result = self.deps.resolve([recipe["package"]["name"]])
-                if not deps_result["ok"]:
-                    log.warning(f"Dependency resolution reported cycles: {deps_result.get('cycles')}")
-                # Optionally build deps first if requested
-                if recipe.get("options", {}).get("build_deps", True):
-                    log.info("Building dependencies first (resolve_and_build)...")
-                    self.deps.resolve_and_build([recipe["package"]["name"]], jobs=self.jobs, dry_run=dry_run)
+                return chroot_mod.run_in_chroot(cmd, chroot_ctx, cwd=cwd, env=env, dry_run=dry_run)
             except Exception as e:
-                log.warning(f"Dependency resolver not available or failed: {e}")
-
-        # prepare build workdir
-        with tempfile.TemporaryDirectory(prefix=f"zeropkg-build-{recipe['package']['name']}-") as td:
-            workdir = Path(td)
-            build_dir = workdir / "build"
-            safe_mkdir(build_dir)
-            src_dir = workdir / "src"
-            safe_mkdir(src_dir)
-            logs = self.logs_dir / f"{recipe['package']['name']}-{int(time.time())}.log"
-            summary = {"package": recipe["package"]["name"], "version": recipe["package"].get("version"), "stages": []}
-
+                _log("chroot", f"run_in_chroot failed: {e}", level="WARNING")
+        if hasattr(chroot_mod, "exec_in_chroot"):
             try:
-                # fetch sources (downloader handles mirrors + cache)
-                if dry_run:
-                    log.info("[dry-run] fetch sources")
-                else:
-                    self._fetch_sources(recipe, src_dir, use_cache=use_cache)
+                return chroot_mod.exec_in_chroot(cmd, chroot_ctx.get("root") if isinstance(chroot_ctx, dict) else None, cwd=cwd, env=env, dry_run=dry_run)
+            except Exception as e:
+                _log("chroot", f"exec_in_chroot failed: {e}", level="WARNING")
+    # fallback to local
+    return _run_cmd_local(cmd, cwd=cwd, env=env, dry_run=dry_run)
 
-                # extract
-                if dry_run:
-                    log.info("[dry-run] extract sources")
-                else:
-                    self._extract_sources(recipe, src_dir, build_dir)
+# -------------------------
+# Builder core
+# -------------------------
+class ZeropkgBuilder:
+    def __init__(self, config: Optional[dict] = None):
+        # config resolution
+        self.config = config or {}
+        if not self.config and config_mod and hasattr(config_mod, "get_config_manager"):
+            try:
+                mgr = config_mod.get_config_manager()
+                self.config = mgr.config
+            except Exception:
+                self.config = {}
+        # downloader instance
+        self.downloader = DownloaderClass(distdir=Path(self.config.get("paths",{}).get("distfiles_dir","/usr/ports/distfiles"))) if DownloaderClass else None
+        self.default_profile = (self.config.get("_active_profile") if self.config.get("_active_profile") else self.config.get("profiles",{}).get("default",{}))
+        self.chroot_profile_default = self.config.get("chroot",{}).get("default_profile", "lfs")
+        self.tmpdir_base = Path(self.config.get("paths",{}).get("state_dir","/var/lib/zeropkg")) / "builds"
+        self.tmpdir_base.mkdir(parents=True, exist_ok=True)
 
-                # apply patches
-                if dry_run:
-                    log.info("[dry-run] apply patches")
-                else:
-                    self._apply_patches(recipe, build_dir, fakeroot=fakeroot)
+    # -------------------------
+    # Utility funcs
+    # -------------------------
+    def _mk_build_dir(self, name: str) -> Path:
+        t = tempfile.mkdtemp(prefix=f"zeropkg-build-{name}-", dir=str(self.tmpdir_base))
+        return Path(t)
 
-                # prepare chroot
-                tmp_mounts = []
-                if use_chroot:
-                    log.info("Preparing chroot for build")
-                    tmp_mounts = prepare_chroot(self.root_dir)
-                    # copy resolv.conf to chroot for network access
-                    try:
-                        resolv_src = Path("/etc/resolv.conf")
-                        resolv_dst = self.root_dir / "etc" / "resolv.conf"
-                        resolv_dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(resolv_src, resolv_dst)
-                    except Exception:
-                        log.debug("Could not copy resolv.conf into chroot (may not be necessary)")
+    def _pack_staging(self, staging_dir: Path, out_dir: Optional[Path]=None) -> Path:
+        out_dir = Path(out_dir or (self.tmpdir_base / "packages"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        pkg_name = f"{staging_dir.name}.tar.gz"
+        out_path = out_dir / pkg_name
+        with tarfile.open(out_path, "w:gz") as tf:
+            tf.add(str(staging_dir), arcname=".")
+        return out_path
 
-                # run build commands (configure/make/make install or commands in recipe)
-                build_output_dir = build_dir / "pkgroot"
-                safe_mkdir(build_output_dir)
-                env = os.environ.copy()
-                # merge environment from recipe
-                for k,v in recipe.get("build", {}).get("environment", {}).items():
-                    env[k] = resolve_macros(str(v), env)
+    def _collect_installed_files_manifest(self, staging_dir: Path) -> List[Dict[str,Any]]:
+        files = []
+        for p in staging_dir.rglob("*"):
+            if p.is_file():
+                stat = p.stat()
+                import hashlib
+                h = hashlib.sha256()
+                with open(p, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024*1024), b""):
+                        h.update(chunk)
+                files.append({
+                    "path": str(p.relative_to(staging_dir)),
+                    "size": stat.st_size,
+                    "mode": stat.st_mode,
+                    "uid": stat.st_uid,
+                    "gid": stat.st_gid,
+                    "sha256": h.hexdigest()
+                })
+        return files
 
-                # choose actual build directory (if recipe has subdir)
-                src_sub = recipe.get("extract_to") or recipe.get("build", {}).get("source_subdir")
-                actual_src = build_dir
-                if src_sub:
-                    actual_src = build_dir / src_sub
-
-                build_ok = True
-                try:
-                    if dry_run:
-                        log.info("[dry-run] would run build commands")
+    # -------------------------
+    # High level build steps
+    # -------------------------
+    @_perf_timer
+    def fetch_sources(self, spec: Dict[str,Any], workdir: Path, dry_run: bool=False) -> Dict[str,Any]:
+        """
+        Use downloader to fetch all sources listed in spec['sources'].
+        Places files in workdir/distfiles (or config distfiles).
+        Returns mapping of source->local path.
+        """
+        res = {"ok": True, "fetched": [], "errors": []}
+        sources = spec.get("sources", [])
+        if not sources:
+            _log("fetch", "no sources defined in spec", level="WARNING", metadata={"spec": spec.get("name")})
+            return res
+        for s in sources:
+            url = s.get("url") or s.get("path")
+            filename = s.get("filename")
+            checksums = s.get("checksums") or s.get("hashes") or None
+            mirrors = s.get("mirrors") or None
+            try:
+                if self.downloader:
+                    dres = self.downloader.fetch(url, dest_dir=workdir / "distfiles", filename=filename, checksums=checksums, mirrors=mirrors, dry_run=dry_run)
+                    if not dres.get("ok"):
+                        res["errors"].append({"url": url, "error": dres.get("error")})
                     else:
-                        self._run_build_steps(recipe, actual_src, build_output_dir, env, logs, fakeroot, use_chroot, dir_install)
-                    summary["stages"].append("built")
-                except Exception as e:
-                    build_ok = False
-                    summary["error"] = str(e)
-                    log.error(f"Build failed: {e}")
-                    raise
-
-                # packaging
-                if build_ok and not dry_run:
-                    pkg_archive = self._pack_binary(recipe, build_output_dir)
-                    summary["pkg_archive"] = str(pkg_archive)
-                    summary["ok"] = True
-                    # register in DB
-                    try:
-                        if record_install_quick:
-                            manifest = self._build_manifest_from_pkgroot(build_output_dir)
-                            record_install_quick(f"{recipe['package']['name']}-{recipe['package'].get('version','unknown')}", manifest, deps=[], metadata={"archive": str(pkg_archive)})
-                    except Exception as e:
-                        log.warning(f"DB registration failed: {e}")
-
-                    # install from binpkg if requested / installer integration
-                    if dir_install:
-                        log.info(f"Installing package into dir: {dir_install}")
-                        self._install_to_dir(pkg_archive, dir_install, fakeroot=fakeroot)
+                        res["fetched"].append({"url": url, "path": dres.get("path"), "action": dres.get("action")})
+                else:
+                    # fallback: copy local path if path exists
+                    p = Path(url)
+                    if p.exists():
+                        dest = (workdir / "distfiles") / p.name
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        if not dry_run:
+                            shutil.copy2(str(p), str(dest))
+                        res["fetched"].append({"url": url, "path": str(dest)})
                     else:
-                        # try to perform real installation into system (via installer) if requested and installer available
-                        if self.installer and recipe.get("options", {}).get("auto_install", False):
-                            log.info("Installing package via ZeropkgInstaller")
-                            manifest = self._build_manifest_from_pkgroot(build_output_dir)
-                            self.installer.install(recipe["package"]["name"], build_output_dir, manifest, recipe["package"].get("version","unknown"), fakeroot_mode=fakeroot, use_chroot=use_chroot)
-                summary["finished_at"] = int(time.time())
-                return summary
-            finally:
-                # cleanup chroot mounts
-                if use_chroot:
-                    try:
-                        cleanup_chroot(self.root_dir, tmp_mounts)
-                    except Exception as e:
-                        log.warning(f"cleanup_chroot failed: {e}")
+                        res["errors"].append({"url": url, "error": "downloader-not-available-or-source-missing"})
+            except Exception as e:
+                res["errors"].append({"url": url, "error": str(e)})
+        if res["errors"]:
+            res["ok"] = False
+        return res
 
-    # ---------------------------
-    # Toolchain utilities (LFS bootstrapping)
-    # ---------------------------
-    def build_toolchain(self, world_list: List[str], *, lfs_root: Optional[str] = None, dry_run: bool = False):
+    @_perf_timer
+    def extract_sources(self, fetched: List[Dict[str,Any]], workdir: Path, extract_to: Optional[str]=None, dry_run: bool=False) -> Dict[str,Any]:
         """
-        High level helper to build a LFS toolchain sequence.
-        world_list: ordered list of recipe paths/names to build for toolchain.
-        lfs_root: chroot /mnt/lfs path
+        Extract sources into workdir/src (or specified extract_to)
         """
-        lfs_root = Path(lfs_root or self.cfg["paths"].get("root", "/mnt/lfs"))
-        log.info(f"Starting toolchain build into {lfs_root}")
-        for item in world_list:
-            # item may be recipe path or package name -> try to find recipe
-            recipe_path = Path(item) if Path(item).exists() else self._find_recipe_for_pkg(item)
-            if not recipe_path:
-                log.error(f"Recipe for {item} not found; aborting toolchain build")
-                return {"ok": False, "error": f"recipe-not-found:{item}"}
-            res = self.build(str(recipe_path), use_chroot=True, fakeroot=True, dry_run=dry_run, dir_install=str(lfs_root))
-            if not res.get("ok"):
-                log.error(f"Toolchain build failed for {item}: {res.get('error')}")
-                return {"ok": False, "failed": item, "details": res}
-        return {"ok": True}
-
-    # ---------------------------
-    # Build world: sequence build of many packages
-    # ---------------------------
-    def build_world(self, world_file: Optional[str] = None, *, dry_run: bool = False):
-        """
-        Build a world file: text file with list of recipe paths/names (one per line).
-        """
-        if not world_file:
-            raise ValueError("world_file required")
-        with open(world_file, "r", encoding="utf-8") as f:
-            items = [l.strip() for l in f.readlines() if l.strip() and not l.startswith("#")]
-        results = {}
-        for it in items:
-            recipe_path = Path(it) if Path(it).exists() else self._find_recipe_for_pkg(it)
-            if not recipe_path:
-                results[it] = {"ok": False, "error": "recipe-not-found"}
+        res = {"ok": True, "extracted": [], "errors": []}
+        target = workdir / (extract_to or "src")
+        target.mkdir(parents=True, exist_ok=True)
+        for f in fetched:
+            path = f.get("path")
+            if not path:
+                res["errors"].append({"path": path, "error": "no-path"})
                 continue
-            results[it] = self.build(str(recipe_path), dry_run=dry_run)
+            p = Path(path)
+            try:
+                if dry_run:
+                    _log("extract", f"[dry-run] would extract {p}", level="INFO")
+                    res["extracted"].append(str(p))
+                    continue
+                # attempt to use downloader.extract_to if available
+                if self.downloader and hasattr(self.downloader, "extract_to"):
+                    er = self.downloader.extract_to(p, target, strip_components=0, dry_run=dry_run)
+                    if not er.get("ok"):
+                        # fallback to shutil.unpack_archive
+                        shutil.unpack_archive(str(p), str(target))
+                        res["extracted"].append(str(p))
+                    else:
+                        res["extracted"].append(str(p))
+                else:
+                    # use shutil.unpack_archive
+                    try:
+                        shutil.unpack_archive(str(p), str(target))
+                        res["extracted"].append(str(p))
+                    except Exception:
+                        # try tarfile fallback
+                        import tarfile, zipfile
+                        if tarfile.is_tarfile(str(p)):
+                            with tarfile.open(str(p), "r:*") as tf:
+                                tf.extractall(str(target))
+                            res["extracted"].append(str(p))
+                        elif zipfile.is_zipfile(str(p)):
+                            with zipfile.ZipFile(str(p), "r") as zf:
+                                zf.extractall(str(target))
+                            res["extracted"].append(str(p))
+                        else:
+                            res["errors"].append({"path": str(p), "error": "unknown-archive"})
+            except Exception as e:
+                res["errors"].append({"path": str(p), "error": str(e)})
+        if res["errors"]:
+            res["ok"] = False
+        return res
+
+    @_perf_timer
+    def apply_patches(self, spec: Dict[str,Any], srcdir: Path, dry_run: bool=False) -> Dict[str,Any]:
+        """
+        Apply patches defined in spec['patches'] using patcher module or fallback.
+        """
+        try:
+            return _apply_patches(spec, srcdir, dry_run=dry_run)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @_perf_timer
+    def run_build_commands(self, spec: Dict[str,Any], srcdir: Path, chroot_ctx: Optional[Dict[str,Any]]=None, use_chroot: bool=True, fakeroot: bool=False, dry_run: bool=False) -> Dict[str,Any]:
+        """
+        Run build commands inside chroot if available, else on host.
+        spec['build']['commands'] is expected to be a list of shell commands.
+        """
+        b = spec.get("build", {}) or {}
+        commands = b.get("commands", []) or []
+        build_dir = b.get("directory") or str(srcdir)
+        env = dict(os.environ)
+        env.update(spec.get("build", {}).get("env", {} or {}))
+        results = {"ok": True, "commands": []}
+        for cmd in commands:
+            # support string commands (shell)
+            cmd_list = ["sh", "-c", cmd]
+            # prefix fakeroot if requested and available on system (simple)
+            if fakeroot:
+                # prefer fakeroot binary if present
+                if shutil.which("fakeroot"):
+                    cmd_list = ["fakeroot"] + cmd_list
+            try:
+                if use_chroot and chroot_ctx:
+                    r = _run_in_chroot(cmd_list, chroot_ctx, cwd=build_dir, env=env, dry_run=dry_run)
+                else:
+                    r = _run_cmd_local(cmd_list, cwd=build_dir, env=env, dry_run=dry_run)
+                results["commands"].append({"cmd": cmd, "result": r})
+                if not r.get("ok"):
+                    results["ok"] = False
+                    # stop on first failure
+                    break
+            except Exception as e:
+                results["commands"].append({"cmd": cmd, "error": str(e)})
+                results["ok"] = False
+                break
         return results
 
-    # ---------------------------
-    # Internal helpers
-    # ---------------------------
-    def _load_recipe(self, recipe_path: Path) -> Dict[str,Any]:
-        if self.toml:
+    @_perf_timer
+    def stage_install(self, spec: Dict[str,Any], build_dir: Path, staging_dir: Path, chroot_ctx: Optional[Dict[str,Any]]=None, use_chroot: bool=True, fakeroot: bool=False, dry_run: bool=False) -> Dict[str,Any]:
+        """
+        Run installation commands into staging_dir (DESTDIR-like) — installer may expect this.
+        We expect spec['install']['commands'] or standard 'make install DESTDIR=...'
+        """
+        inst = spec.get("install", {}) or {}
+        commands = inst.get("commands") or []
+        results = {"ok": True, "commands": []}
+        if not commands:
+            # default: try 'make install DESTDIR=staging_dir'
+            cmd = f"make install DESTDIR={str(staging_dir)}"
+            commands = [cmd]
+        for cmd in commands:
+            cmd_list = ["sh", "-c", cmd]
+            if fakeroot:
+                if shutil.which("fakeroot"):
+                    cmd_list = ["fakeroot"] + cmd_list
             try:
-                return self.toml.load(recipe_path)
+                if use_chroot and chroot_ctx:
+                    r = _run_in_chroot(cmd_list, chroot_ctx, cwd=str(build_dir), env=None, dry_run=dry_run)
+                else:
+                    r = _run_cmd_local(cmd_list, cwd=str(build_dir), env=None, dry_run=dry_run)
+                results["commands"].append({"cmd": cmd, "result": r})
+                if not r.get("ok"):
+                    results["ok"] = False
+                    break
             except Exception as e:
-                log.warning(f"TOML parser failed: {e}; falling back to minimal parse")
-        # fallback minimal recipe
-        data = {"package": {"name": recipe_path.stem, "version": None}, "sources": [], "patches": [], "build": {"commands": []}, "options": {}}
-        return data
+                results["commands"].append({"cmd": cmd, "error": str(e)})
+                results["ok"] = False
+                break
+        return results
 
-    def _fetch_sources(self, recipe: Dict[str,Any], src_dir: Path, *, use_cache: bool = True):
-        sources = recipe.get("sources", []) or []
-        if not sources:
-            log.info("No sources defined in recipe")
-            return
-        if not self.downloader:
-            raise RuntimeError("Downloader not available")
-        for src in sources:
-            # downloader returns path in distfiles/cache
-            p = self.downloader.fetch_all([src], jobs=self.jobs, dry_run=False)
-            # fetch_all returns list of futures results; ensure returned path or list
-        return True
-
-    def _extract_sources(self, recipe: Dict[str,Any], src_dir: Path, build_dir: Path):
-        # For simplicity: extract everything in distfiles found with downloader into build_dir
-        for src in recipe.get("sources", []) or []:
-            file_name = src.get("url") if isinstance(src, dict) else src
-            # try resolve name
-            if isinstance(file_name, dict):
-                file_name = file_name.get("url")
-            if not file_name:
-                continue
-            distname = os.path.basename(file_name.split("@")[0])
-            possible = list(self.distfiles.glob(f"*{distname}*"))
-            if not possible:
-                # maybe downloader put it in cache_dir
-                possible = list(self.cache_dir.glob(f"*{distname}*"))
-            if not possible:
-                log.warning(f"Source {distname} not found in distfiles or cache")
-                continue
-            # extract first match
-            srcpath = possible[0]
-            try:
-                if srcpath.suffix in (".zip",):
-                    import zipfile
-                    with zipfile.ZipFile(srcpath, "r") as z:
-                        z.extractall(build_dir)
-                else:
-                    import tarfile
-                    with tarfile.open(srcpath, "r:*") as tar:
-                        safe_names = [m for m in tar.getmembers() if not (m.name.startswith("/") or ".." in m.name)]
-                        tar.extractall(build_dir, members=safe_names)
-                log.info(f"Extracted {srcpath} -> {build_dir}")
-            except Exception as e:
-                log.error(f"Extraction failed for {srcpath}: {e}")
-
-    def _apply_patches(self, recipe: Dict[str,Any], build_dir: Path, *, fakeroot: bool=False):
-        patches = recipe.get("patches", []) or []
-        if not patches:
-            return
-        if not self.patcher:
-            raise RuntimeError("Patcher not available")
-        # Patcher expects work_dir; create adapter
-        p = Patcher(build_dir, self.cfg, fakeroot=fakeroot)
-        p.apply_all(recipe["package"]["name"], {"patches": patches, "hooks": recipe.get("hooks", {})})
-
-    def _run_build_steps(self, recipe: Dict[str,Any], src_dir: Path, pkgroot_dir: Path, env: Dict[str,str], logs: Path, fakeroot: bool, use_chroot: bool, dir_install: Optional[str]):
+    # -------------------------
+    # Top-level build flow
+    # -------------------------
+    def build_package(self, recipe_path: str, *,
+                      use_chroot: Optional[bool] = True,
+                      chroot_profile: Optional[str] = None,
+                      dir_install: Optional[bool] = False,
+                      staging_dir_override: Optional[str] = None,
+                      fakeroot: Optional[bool] = False,
+                      dry_run: bool = False,
+                      install_after: bool = False,
+                      install_from_cache: Optional[str] = None,
+                      jobs: Optional[int] = None,
+                      root_for_install: Optional[str] = "/") -> Dict[str,Any]:
         """
-        Standard sequence:
-         - configure (if present)
-         - make (-j)
-         - make install into pkgroot_dir (DESTDIR)
-        Also respects recipe['build']['commands'] for custom sequences.
+        Build a package from a recipe path (TOML). Returns build report.
+        Steps:
+         - load recipe (toml_mod.load_recipe)
+         - to_builder_spec()
+         - fetch_sources -> extract -> apply_patches -> prepare_chroot -> run_build_commands -> stage_install -> pack -> record_db -> optionally install
         """
-        # default make -j
-        jobs = self.jobs or 1
-        build_commands = recipe.get("build", {}).get("commands") or []
-        if not build_commands:
-            # try autodetect typical sequence
-            if (src_dir / "configure").exists():
-                build_commands = [
-                    f"./configure --prefix=/usr {' '.join(recipe.get('build', {}).get('configure_args', []))}"
-                ]
-            if (src_dir / "Makefile").exists() or any(src_dir.glob("**/Makefile")):
-                build_commands.append(f"make -j{jobs}")
-                if dir_install:
-                    build_commands.append(f"make DESTDIR={dir_install} install")
-                else:
-                    build_commands.append(f"make DESTDIR={pkgroot_dir} install")
-        # run commands in order
-        for cmd in build_commands:
-            # expand macros
-            cmd = resolve_macros(cmd, env)
-            log.info(f"BUILD CMD: {cmd}")
-            if use_chroot:
-                # run the command inside chroot (we assume src_dir is available inside chroot path)
-                try:
-                    run_in_chroot(self.cfg, cmd)
-                except Exception as e:
-                    # fallback: try running locally in src_dir
-                    log.warning(f"run_in_chroot failed: {e}; trying local run")
-                    sh_check(cmd, cwd=str(src_dir), shell=True, env=env)
-            else:
-                if fakeroot:
-                    # wrap with fakeroot
-                    sh_check(["fakeroot", "sh", "-c", cmd], cwd=str(src_dir), env=env)
-                else:
-                    sh_check(cmd, cwd=str(src_dir), shell=True, env=env)
-        return True
-
-    def _pack_binary(self, recipe: Dict[str,Any], pkgroot_dir: Path) -> Path:
-        """
-        Create binary package from pkgroot_dir and store in binpkg_dir.
-        """
-        pkgname = recipe["package"]["name"]
-        version = recipe["package"].get("version", "0")
-        timestamp = int(time.time())
-        archive_name = f"{pkgname}-{version}-{timestamp}.tar.zst"
-        archive_path = self.binpkg_dir / archive_name
-        # prefer zstd if available
+        report: Dict[str,Any] = {"ok": True, "steps": [], "recipe": recipe_path}
+        # 1) load recipe
         try:
-            import subprocess
-            if shutil.which("zstd"):
-                # create tar and pipe to zstd
-                tar_path = str(self.cache_dir / f"{pkgname}-{version}.tar")
-                sh_check(["tar", "-cf", tar_path, "-C", str(pkgroot_dir), "."], cwd=str(pkgroot_dir))
-                sh_check(["zstd", "-q", "-19", tar_path, "-o", str(archive_path)])
-                Path(tar_path).unlink(missing_ok=True)
-            else:
-                sh_check(["tar", "-C", str(pkgroot_dir), "-cJf", str(archive_path), "."])
-        except Exception:
-            # fallback python tar
-            import tarfile
-            with tarfile.open(archive_path, "w:gz") as tar:
-                tar.add(str(pkgroot_dir), arcname=".")
-        log.info(f"Packaged binary to {archive_path}")
-        return archive_path
-
-    def _build_manifest_from_pkgroot(self, pkgroot_dir: Path) -> Dict[str, List[str]]:
-        """
-        Build a simple manifest grouped by category (bin, lib, etc.) from pkgroot.
-        """
-        manifest = {}
-        for p in pkgroot_dir.rglob("*"):
-            if p.is_dir():
-                continue
-            rel = "/" + str(p.relative_to(pkgroot_dir)).lstrip("./")
-            cat = "misc"
-            if rel.startswith("/usr/bin") or rel.startswith("/bin"):
-                cat = "bin"
-            elif rel.startswith("/usr/lib") or rel.startswith("/lib"):
-                cat = "lib"
-            manifest.setdefault(cat, []).append(rel)
-        return manifest
-
-    def _install_to_dir(self, archive_path: Path, target_dir: str, *, fakeroot: bool=False):
-        """
-        Extract binpkg archive into target_dir (used for dir-install option).
-        """
-        target = Path(target_dir)
-        safe_mkdir(target)
-        log.info(f"Installing archive {archive_path} into {target}")
-        try:
-            # prefer zstd
-            if str(archive_path).endswith(".zst"):
-                tmp = tempfile.TemporaryDirectory()
-                tmpf = Path(tmp.name) / "pkg.tar"
-                # decompress
-                sh_check(["zstd", "-d", str(archive_path), "-o", str(tmpf)])
-                sh_check(["tar", "-xf", str(tmpf), "-C", str(target)])
-            else:
-                sh_check(["tar", "-xzf", str(archive_path), "-C", str(target)])
+            raw = _load_recipe(recipe_path)
+            spec = toml_mod.to_builder_spec(raw) if toml_mod and hasattr(toml_mod, "to_builder_spec") else raw
+            name = spec.get("name") or raw.get("package",{}).get("name") or Path(recipe_path).stem
+            version = spec.get("version") or raw.get("package",{}).get("version") or "0.0"
+            report["pkg"] = f"{name}-{version}"
         except Exception as e:
-            log.error(f"Failed to extract archive into {target}: {e}")
+            _log("build", f"failed to load recipe {recipe_path}: {e}", level="ERROR")
+            return {"ok": False, "error": f"load_recipe: {e}"}
 
-    # ---------------------------
-    # Utilities for locating recipes
-    # ---------------------------
-    def _find_recipe_for_pkg(self, pkgname: str) -> Optional[Path]:
-        # look for {pkgname}.toml under /usr/ports
-        ports = Path(self.cfg["paths"].get("recipes_dir", "/usr/ports"))
-        candidates = list(ports.rglob(f"{pkgname}*.toml"))
-        return candidates[0] if candidates else None
+        workdir = self._mk_build_dir(name)
+        (workdir / "distfiles").mkdir(parents=True, exist_ok=True)
+        (workdir / "src").mkdir(parents=True, exist_ok=True)
+        report["workdir"] = str(workdir)
 
-# ---------------------------
-# CLI wrapper
-# ---------------------------
+        # choose chroot profile
+        chroot_profile = chroot_profile or self.chroot_profile_default
+        chroot_ctx = None
+        chroot_used = False
+        if use_chroot:
+            _log("build", f"preparing chroot profile={chroot_profile}", level="INFO")
+            chprep = _prepare_chroot(profile=chroot_profile, root=None, workdir=str(workdir))
+            if chprep.get("ok"):
+                chroot_ctx = chprep
+                chroot_used = True
+                report["chroot"] = chprep
+            else:
+                _log("build", "chroot not available, falling back to host mode", level="WARNING")
+                report["chroot"] = chprep
+
+        # 2) fetch sources
+        fetch_res = self.fetch_sources(spec, workdir, dry_run=dry_run)
+        report["steps"].append({"fetch": fetch_res})
+        if not fetch_res.get("ok"):
+            _log("build", f"fetch failed for {name}: {fetch_res.get('errors')}", level="ERROR")
+            # cleanup chroot if created
+            if chroot_used:
+                _cleanup_chroot(chroot_profile, None, str(workdir))
+            return {"ok": False, "error": "fetch_failed", "details": fetch_res}
+
+        # 3) extract
+        extract_res = self.extract_sources(fetch_res.get("fetched", []), workdir, extract_to=spec.get("extract_to") or None, dry_run=dry_run)
+        report["steps"].append({"extract": extract_res})
+        if not extract_res.get("ok"):
+            _log("build", f"extract failed for {name}: {extract_res.get('errors')}", level="ERROR")
+            if chroot_used:
+                _cleanup_chroot(chroot_profile, None, str(workdir))
+            return {"ok": False, "error": "extract_failed", "details": extract_res}
+
+        # determine srcdir - try spec.build.directory relative to workdir/src
+        src_root = workdir / (spec.get("extract_to") or "src")
+        build_dir_candidate = None
+        binfo = spec.get("build",{}) or {}
+        if binfo.get("directory"):
+            cand = Path(binfo.get("directory"))
+            if not cand.is_absolute():
+                # relative to src_root
+                cand = src_root / cand
+            build_dir_candidate = cand
+        else:
+            # heuristics: find top-level directory in src_root
+            entries = [p for p in src_root.iterdir() if p.is_dir()]
+            build_dir_candidate = entries[0] if entries else src_root
+
+        build_dir = build_dir_candidate
+        report["build_dir"] = str(build_dir)
+
+        # 4) apply patches
+        patch_res = self.apply_patches(spec, build_dir, dry_run=dry_run)
+        report["steps"].append({"patch": patch_res})
+        if not patch_res.get("ok"):
+            _log("build", f"patching failed for {name}: {patch_res.get('error')}", level="ERROR")
+            if chroot_used:
+                _cleanup_chroot(chroot_profile, None, str(workdir))
+            return {"ok": False, "error": "patch_failed", "details": patch_res}
+
+        # 5) run build commands (configure, make, etc)
+        run_res = self.run_build_commands(spec, build_dir, chroot_ctx=chroot_ctx, use_chroot=chroot_used, fakeroot=fakeroot, dry_run=dry_run)
+        report["steps"].append({"build": run_res})
+        if not run_res.get("ok"):
+            _log("build", f"build commands failed for {name}", level="ERROR", metadata={"pkg": name})
+            if chroot_used:
+                _cleanup_chroot(chroot_profile, None, str(workdir))
+            return {"ok": False, "error": "build_failed", "details": run_res}
+
+        # 6) staging installation
+        staging_dir = Path(staging_dir_override) if staging_dir_override else (workdir / "staging")
+        if dir_install:
+            # user requested dir-install: simply stage and package
+            staging_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            # always create staging dir to capture files before installing into /
+            staging_dir.mkdir(parents=True, exist_ok=True)
+
+        stage_res = self.stage_install(spec, build_dir, staging_dir, chroot_ctx=chroot_ctx, use_chroot=chroot_used, fakeroot=fakeroot, dry_run=dry_run)
+        report["steps"].append({"stage": stage_res})
+        if not stage_res.get("ok"):
+            _log("build", f"stage/install failed for {name}", level="ERROR", metadata={"pkg": name})
+            if chroot_used:
+                _cleanup_chroot(chroot_profile, None, str(workdir))
+            return {"ok": False, "error": "stage_failed", "details": stage_res}
+
+        # 7) packaging: pack staging to archive
+        try:
+            pkg_archive = self._pack_staging(staging_dir, out_dir=(self.tmpdir_base / "packages"))
+            report["package"] = str(pkg_archive)
+        except Exception as e:
+            _log("build", f"packing failed: {e}", level="ERROR")
+            if chroot_used:
+                _cleanup_chroot(chroot_profile, None, str(workdir))
+            return {"ok": False, "error": "pack_failed", "details": str(e)}
+
+        # 8) collect files manifest and record to db
+        try:
+            files_manifest = self._collect_installed_files_manifest(staging_dir)
+            manifest_meta = {"recipe": recipe_path, "built_at": time.time()}
+            dbres = _record_install_quick(name, version, manifest_meta, files_manifest, deps=spec.get("variants",{}).get("deps", []) or spec.get("dependencies", []))
+            report["db_record"] = dbres
+        except Exception as e:
+            report["db_record"] = {"ok": False, "error": str(e)}
+            _log("db", f"failed to record install: {e}", level="WARNING")
+
+        # 9) optionally install (copy to /) after packing
+        if install_after and not dry_run:
+            # if install_from_cache provided, try using that
+            if install_from_cache:
+                # install from binary cache path
+                try:
+                    src_archive = Path(install_from_cache)
+                    if src_archive.exists():
+                        tmp_unpack = Path(tempfile.mkdtemp(prefix="zeropkg-install-"))
+                        with tarfile.open(src_archive, "r:*") as tf:
+                            tf.extractall(str(tmp_unpack))
+                        inst_res = _installer_install_from_staging(tmp_unpack, target_root=root_for_install, fakeroot=fakeroot)
+                        report["install"] = inst_res
+                        # cleanup tmp_unpack
+                        shutil.rmtree(str(tmp_unpack), ignore_errors=True)
+                    else:
+                        report["install"] = {"ok": False, "error": "install_from_cache_not_found"}
+                except Exception as e:
+                    report["install"] = {"ok": False, "error": str(e)}
+            else:
+                inst_res = _installer_install_from_staging(staging_dir, target_root=root_for_install, fakeroot=fakeroot)
+                report["install"] = inst_res
+
+        # 10) cleanup chroot if used
+        if chroot_used:
+            try:
+                _cleanup_chroot(chroot_profile, None, str(workdir))
+            except Exception as e:
+                _log("chroot", f"cleanup_chroot exception: {e}", level="WARNING")
+
+        # final success
+        report["ok"] = True
+        return report
+
+# -------------------------
+# CLI
+# -------------------------
 def _cli():
     import argparse
-    parser = argparse.ArgumentParser(prog="zeropkg-builder", description="Zeropkg builder")
-    parser.add_argument("--recipe", "-r", help="Path to recipe TOML or package name", required=False)
-    parser.add_argument("--build-world", help="Path to world file (one recipe per line)", required=False)
-    parser.add_argument("--toolchain", action="store_true", help="Build LFS toolchain (requires ordered list in --recipe or world)")
-    parser.add_argument("--dir-install", help="Install into target directory after build (DESTDIR style)", default=None)
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--no-chroot", action="store_true")
-    parser.add_argument("--fakeroot", action="store_true")
-    parser.add_argument("--use-cache", action="store_true")
-    parser.add_argument("--rebuild", action="store_true")
-    parser.add_argument("--jobs", "-j", type=int, default=None)
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(prog="zeropkg-build", description="Zeropkg builder CLI")
+    p.add_argument("-r", "--recipe", required=True, help="Path to recipe TOML")
+    p.add_argument("-c", "--chroot-profile", default=None, help="Chroot profile to use (overrides config)")
+    p.add_argument("--no-chroot", action="store_true", help="Do not use chroot for build")
+    p.add_argument("--dir-install", action="store_true", help="Create dir install (pack staging) but do not install into /")
+    p.add_argument("--staging", help="Override staging directory")
+    p.add_argument("--fakeroot", action="store_true", help="Use fakeroot for install steps")
+    p.add_argument("--dry-run", action="store_true", help="Dry-run — do not execute build commands")
+    p.add_argument("--install-after", action="store_true", help="Install into / after build")
+    p.add_argument("--install-from-cache", help="Install from provided binary archive path instead of building")
+    p.add_argument("--jobs", "-j", type=int, default=None, help="Number of parallel jobs (unused here but passed to env)")
+    p.add_argument("--root", default="/", help="Target root for install (default /)")
+    args = p.parse_args()
 
-    builder = ZeropkgBuilder()
-    if args.recipe:
-        # recipe may be name or path
-        rp = Path(args.recipe)
-        if not rp.exists():
-            rp = builder._find_recipe_for_pkg(args.recipe)
-            if not rp:
-                print("Recipe not found")
-                sys.exit(2)
-        res = builder.build(str(rp), use_chroot=not args.no_chroot, fakeroot=args.fakeroot, dry_run=args.dry_run, dir_install=args.dir_install, use_cache=args.use_cache, force_rebuild=args.rebuild)
-        print(json.dumps(res, indent=2))
-    elif args.build_world:
-        res = builder.build_world(args.build_world, dry_run=args.dry_run)
-        print(json.dumps(res, indent=2))
-    elif args.toolchain:
-        # expects recipe param or world file
-        if args.recipe:
-            world = [l.strip() for l in open(args.recipe).read().splitlines() if l.strip()]
-            res = builder.build_toolchain(world, dry_run=args.dry_run)
-            print(json.dumps(res, indent=2))
-        else:
-            print("Provide ordered list via --recipe (file) for toolchain")
-            sys.exit(2)
-    else:
-        parser.print_help()
+    # apply minimal config
+    cfg_mgr = None
+    try:
+        if config_mod and hasattr(config_mod, "get_config_manager"):
+            cfg_mgr = config_mod.get_config_manager()
+    except Exception:
+        cfg_mgr = None
+
+    builder = ZeropkgBuilder(config=cfg_mgr.config if cfg_mgr else None)
+    res = builder.build_package(args.recipe,
+                                use_chroot=(not args.no_chroot),
+                                chroot_profile=args.chroot_profile,
+                                dir_install=args.dir_install,
+                                staging_dir_override=args.staging,
+                                fakeroot=args.fakeroot,
+                                dry_run=args.dry_run,
+                                install_after=args.install_after,
+                                install_from_cache=args.install_from_cache,
+                                jobs=args.jobs,
+                                root_for_install=args.root)
+    print(json.dumps(res, indent=2, ensure_ascii=False))
 
 if __name__ == "__main__":
     _cli()
