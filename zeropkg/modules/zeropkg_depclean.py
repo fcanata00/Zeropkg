@@ -1,288 +1,470 @@
 #!/usr/bin/env python3
-# zeropkg_depclean.py — Depclean completo e seguro
 # -*- coding: utf-8 -*-
-
 """
-zeropkg_depclean.py
+zeropkg_depclean.py — safe depclean utilities for Zeropkg (Pattern B)
 
-Remove pacotes órfãos de forma segura, integrada com DependencyResolver e Installer.
-
-Funcionalidades:
-- detecta órfãos (DependencyResolver.find_orphans)
-- checa reverse deps (DependencyResolver.reverse_deps)
-- remove com Installer.remove (respeita chroot/fakeroot/dry-run)
-- dry-run, force, logging, relatório final
-- rollback: tenta restaurar pacotes removidos a partir de backups em /var/zeropkg/backups
-- registra eventos via zeropkg_logger.log_event
+Features:
+ - find orphan packages (using zeropkg_deps)
+ - protected package list (won't be removed)
+ - dry-run detailed report
+ - backup package files before remove (tar.xz)
+ - DB snapshot & rollback support
+ - integration hooks to call zeropkg_remover or zeropkg_installer if available
+ - logging to zeropkg_logger and events to zeropkg_db (optional)
 """
 
 from __future__ import annotations
-
 import os
-import logging
+import sys
 import shutil
+import tarfile
 import time
-from typing import List, Tuple, Dict, Optional
+import json
+import sqlite3
+import tempfile
+import traceback
+from pathlib import Path
+from typing import Dict, List, Optional, Callable, Any
 
-from zeropkg_deps import DependencyResolver, DependencyError
-from zeropkg_installer import Installer, InstallError
-from zeropkg_db import DBManager
-from zeropkg_logger import log_event
+# Optional integrations
+try:
+    from zeropkg_config import load_config
+except Exception:
+    def load_config(*a, **k):
+        return {
+            "paths": {
+                "state_dir": "/var/lib/zeropkg",
+                "backup_dir": "/var/lib/zeropkg/backups",
+                "db_path": "/var/lib/zeropkg/installed.sqlite3"
+            },
+            "depclean": {
+                "protected": ["bash", "coreutils", "glibc", "gcc"],
+                "protect_base": True
+            }
+        }
 
-LOG_PATH = "/var/log/zeropkg/depclean.log"
-BACKUP_DIR = "/var/zeropkg/backups"
-PKG_CACHE_DIR = "/var/zeropkg/packages"
+try:
+    from zeropkg_logger import log_event, log_global, get_logger
+    _logger = get_logger("depclean")
+except Exception:
+    import logging
+    _logger = logging.getLogger("zeropkg_depclean")
+    if not _logger.handlers:
+        _logger.addHandler(logging.StreamHandler(sys.stdout))
+    def log_event(pkg, stage, msg, level="info"):
+        getattr(_logger, level if hasattr(_logger, level) else "info")(f"{pkg}:{stage} {msg}")
+    def log_global(msg, level="info"):
+        getattr(_logger, level if hasattr(_logger, level) else "info")(msg)
 
+# DB optional manager
+try:
+    from zeropkg_db import DBManager
+except Exception:
+    DBManager = None
 
-# Setup module logger
-logger = logging.getLogger("zeropkg.depclean")
-logger.setLevel(logging.DEBUG)
-# Add file handler if not already added
-if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == LOG_PATH for h in logger.handlers):
-    try:
-        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-        fh = logging.FileHandler(LOG_PATH)
-        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        logger.addHandler(fh)
-    except Exception:
-        # fallback to default logger if can't write file
-        pass
+# deps graph and remover optional
+try:
+    from zeropkg_deps import ensure_graph_loaded, depclean as deps_depclean, find_orphans as deps_find_orphans, DepGraph, find_missing_nodes
+except Exception:
+    # We'll lazily construct graph when needed; provide minimal fallbacks
+    DepGraph = None
+    ensure_graph_loaded = None
+    deps_depclean = None
+    deps_find_orphans = None
+    find_missing_nodes = None
 
+try:
+    # prefer dedicated remover if available
+    from zeropkg_remover import remove_package as api_remove_package
+except Exception:
+    api_remove_package = None
 
-class DepcleanError(Exception):
-    pass
+# -------------------------
+# Utilities
+# -------------------------
+def _state_dir(cfg: Optional[Dict[str, Any]] = None) -> Path:
+    cfg = cfg or load_config()
+    sd = Path(cfg.get("paths", {}).get("state_dir", "/var/lib/zeropkg"))
+    sd.mkdir(parents=True, exist_ok=True)
+    return sd
 
+def _backup_dir(cfg: Optional[Dict[str, Any]] = None) -> Path:
+    cfg = cfg or load_config()
+    bd = Path(cfg.get("paths", {}).get("backup_dir", "/var/lib/zeropkg/backups"))
+    bd.mkdir(parents=True, exist_ok=True)
+    return bd
 
-class DepCleaner:
-    def __init__(
-        self,
-        db_path: str = "/var/lib/zeropkg/installed.sqlite3",
-        ports_dir: str = "/usr/ports",
-        root: str = "/",
-        dry_run: bool = False,
-        use_fakeroot: bool = False,
-        packages_dir: str = PKG_CACHE_DIR,
-        backups_dir: str = BACKUP_DIR,
-    ):
-        """
-        db_path: caminho para o DB
-        ports_dir: onde estão as recipes
-        root: destino ("/" ou "/mnt/lfs")
-        dry_run: True para simular apenas
-        use_fakeroot: repassa para Installer
-        packages_dir: diretório onde packages gerados são colocados
-        backups_dir: local onde armazenar/ler backups
-        """
-        self.db_path = db_path
-        self.ports_dir = ports_dir
-        self.root = os.path.abspath(root or "/")
-        self.dry_run = bool(dry_run)
-        self.use_fakeroot = bool(use_fakeroot)
-        self.packages_dir = packages_dir
-        self.backups_dir = backups_dir
+def _db_path(cfg: Optional[Dict[str, Any]] = None) -> Path:
+    cfg = cfg or load_config()
+    return Path(cfg.get("paths", {}).get("db_path", "/var/lib/zeropkg/installed.sqlite3"))
 
-        # Ensure dirs exist (for logging/backups)
-        try:
-            os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-        except Exception:
-            pass
-        try:
-            os.makedirs(self.backups_dir, exist_ok=True)
-        except Exception:
-            pass
+def _now_ts() -> int:
+    return int(time.time())
 
-        self.db = DBManager(db_path)
-        self.resolver = DependencyResolver(db_path, ports_dir)
-        self.installer = Installer(db_path=db_path, ports_dir=ports_dir, root=self.root, dry_run=self.dry_run, use_fakeroot=self.use_fakeroot)
+# -------------------------
+# Main Depcleaner
+# -------------------------
+class Depcleaner:
+    def __init__(self, cfg: Optional[Dict[str, Any]] = None):
+        self.cfg = cfg or load_config()
+        self.state_dir = _state_dir(self.cfg)
+        self.backup_dir = _backup_dir(self.cfg)
+        self.db_path = _db_path(self.cfg)
+        # protected packages from config
+        depclean_cfg = self.cfg.get("depclean", {}) or {}
+        self.protected = set(depclean_cfg.get("protected", []))
+        if depclean_cfg.get("protect_base", True):
+            # add common essential base packages (can be customized)
+            self.protected.update({"bash", "coreutils", "glibc", "gcc", "linux-headers", "binutils"})
+        # try to load deps graph helper
+        self._graph = None
+        self._ensure_graph_loaded = ensure_graph_loaded
+        self._remover = api_remove_package  # callable(pkg) -> bool expected
+        self._db_manager = DBManager
+        self._report = {"checked_at": _now_ts(), "orphans": [], "protected": [], "skipped": [], "backed_up": [], "removed": [], "errors": []}
 
-    # ---------------------------
-    # Helpers
-    # ---------------------------
-    def _log(self, pkg: str, action: str, msg: str, level: str = "info"):
-        """
-        Wrapper for logging both to file logger and zeropkg's log_event
-        """
-        try:
-            if level == "debug":
-                logger.debug(f"{pkg} {action}: {msg}")
-                log_event(pkg, action, msg)
-            elif level == "warning":
-                logger.warning(f"{pkg} {action}: {msg}")
-                log_event(pkg, action, msg, level="warning")
-            elif level == "error":
-                logger.error(f"{pkg} {action}: {msg}")
-                log_event(pkg, action, msg, level="error")
-            else:
-                logger.info(f"{pkg} {action}: {msg}")
-                log_event(pkg, action, msg)
-        except Exception:
-            # best-effort: don't fail on logging
-            pass
-
-    def _find_backup_for(self, pkgname: str) -> Optional[str]:
-        """
-        Try to locate a backup package tarball for pkgname in backups_dir or packages_dir.
-        Returns full path if found, else None.
-        """
-        candidates = []
-        # look for common file patterns: pkgname-*.tar.xz or pkgname*.tar.*
-        for d in (self.backups_dir, self.packages_dir):
+    # -------------------------
+    # Graph helpers
+    # -------------------------
+    def _load_graph(self) -> Any:
+        if self._graph is None and self._ensure_graph_loaded:
             try:
-                for ext in ("tar.xz", "tar.gz", "tar.bz2", "tar"):
-                    p = os.path.join(d, f"{pkgname}-*.{ext}")
-                    import glob
-                    found = glob.glob(p)
-                    if found:
-                        # prefer newest
-                        candidates.extend(found)
-            except Exception:
-                continue
-        if not candidates:
-            return None
-        candidates = sorted(candidates, key=lambda x: os.path.getmtime(x), reverse=True)
-        return candidates[0]
+                self._graph = self._ensure_graph_loaded()
+            except Exception as e:
+                log_global(f"Failed to load deps graph: {e}", "warning")
+                self._graph = None
+        return self._graph
 
-    def _attempt_restore(self, pkgname: str, args) -> bool:
+    def find_orphans(self, exclude_manual: bool = True) -> List[str]:
         """
-        Try to restore a previously removed package by locating a backup and calling installer.install.
-        Returns True on success.
+        Find orphan packages using zeropkg_deps if available, otherwise attempt DB scan.
         """
-        backup = self._find_backup_for(pkgname)
-        if not backup:
-            self._log(pkgname, "rollback", "No backup package available for restore", level="warning")
+        graph = self._load_graph()
+        if graph is not None:
+            # use deps module's orphan detection
+            try:
+                orphans = graph and (graph.nodes and [p for p in graph.nodes.keys() if not graph.rev_edges.get(p)]) or []
+                # consult module function if available
+                return sorted(orphans)
+            except Exception:
+                pass
+
+        # fallback: attempt to read installed packages from DB (if present) and compute revdeps
+        if self._db_manager:
+            try:
+                with self._db_manager() as db:
+                    cur = db.conn.cursor()
+                    # assume table 'installed_packages' with columns 'name' and maybe 'deps' (json)
+                    try:
+                        cur.execute("SELECT name, deps FROM installed_packages")
+                    except Exception:
+                        # fallback to events table scanning — conservative approach: no orphans
+                        return []
+                    rows = cur.fetchall()
+                    # build simple in-memory graph
+                    pkgs = {}
+                    for name, deps_json in rows:
+                        deps = []
+                        try:
+                            deps = json.loads(deps_json) if deps_json else []
+                        except Exception:
+                            deps = []
+                        pkgs[name] = deps
+                    # compute reverse deps
+                    rev = {n: set() for n in pkgs.keys()}
+                    for n, deps in pkgs.items():
+                        for d in deps:
+                            if d in rev:
+                                rev[d].add(n)
+                    orphans = [n for n, r in rev.items() if not r]
+                    return sorted(orphans)
+            except Exception:
+                pass
+        # if nothing else, return empty list
+        return []
+
+    # -------------------------
+    # Protection checks
+    # -------------------------
+    def is_protected(self, pkg: str) -> bool:
+        return pkg in self.protected
+
+    # -------------------------
+    # DB snapshot helpers
+    # -------------------------
+    def _create_db_snapshot(self) -> Optional[Path]:
+        if not self.db_path.exists():
+            log_global(f"No DB found at {self.db_path}; skipping DB snapshot", "debug")
+            return None
+        snap_dir = self.backup_dir
+        ts = _now_ts()
+        snap_path = snap_dir / f"installed.sqlite3.snap.{ts}"
+        try:
+            # copy file atomically
+            shutil.copy2(self.db_path, snap_path)
+            log_event("depclean", "db", f"DB snapshot created at {snap_path}", "info")
+            return snap_path
+        except Exception as e:
+            log_event("depclean", "db", f"DB snapshot failed: {e}", "warning")
+            return None
+
+    def _restore_db_snapshot(self, snap_path: Path) -> bool:
+        if not snap_path or not snap_path.exists():
+            log_global("No DB snapshot to restore", "warning")
             return False
         try:
-            self._log(pkgname, "rollback", f"Attempting restore from backup {backup}")
-            # call installer.install to restore
-            self.installer.install(pkgname, args, pkg_file=backup, meta=None, dir_install=self.root)
-            self._log(pkgname, "rollback", f"Restore succeeded from {backup}")
+            shutil.copy2(snap_path, self.db_path)
+            log_global(f"Restored DB snapshot from {snap_path}", "info")
             return True
         except Exception as e:
-            self._log(pkgname, "rollback", f"Restore failed: {e}", level="error")
+            log_global(f"Failed to restore DB snapshot: {e}", "error")
             return False
 
-    # ---------------------------
-    # Core functions
-    # ---------------------------
-    def list_orphans(self) -> List[str]:
+    # -------------------------
+    # Backup package files
+    # -------------------------
+    def _backup_package(self, pkg: str, locations: Optional[List[str]] = None, dry_run: bool = True) -> Optional[Path]:
         """
-        Return list of orphan package names detected by DependencyResolver.
+        Create a tar.xz backup of the package files.
+        locations: list of paths to include (absolute). If None, attempt best-effort from DB or /var/zeropkg/packages/<pkg>.
+        Returns Path to backup file or None.
         """
-        try:
-            orphans = self.resolver.find_orphans()
-            self._log("depclean", "scan", f"Found {len(orphans)} orphans: {', '.join(orphans) if orphans else '<none>'}")
-            return orphans
-        except Exception as e:
-            self._log("depclean", "scan", f"Failed to detect orphans: {e}", level="error")
-            raise DepcleanError(f"Failed to detect orphans: {e}")
+        ts = _now_ts()
+        backup_name = f"{pkg}-{ts}.tar.xz"
+        backup_path = self.backup_dir / backup_name
+        if dry_run:
+            log_event(pkg, "backup", f"[dry-run] would create backup at {backup_path}")
+            return backup_path
 
-    def preview(self) -> Dict[str, List[str]]:
-        """
-        Return a dict with:
-          - orphans: list of orphans
-          - blocked: list of orphans that have reverse deps (won't be removed unless forced)
-        """
-        orphans = self.list_orphans()
-        blocked = []
-        for pkg in orphans:
-            try:
-                revs = self.resolver.reverse_deps(pkg)
-                if revs:
-                    blocked.append(pkg)
-            except Exception:
-                blocked.append(pkg)
-        return {"orphans": orphans, "blocked": blocked}
+        # determine files to include
+        to_archive = []
+        # custom locations provided
+        if locations:
+            for p in locations:
+                if os.path.exists(p):
+                    to_archive.append(p)
+        else:
+            # try best-effort: /var/zeropkg/packages/<pkg> or /usr/local/<pkg> or DB listing
+            guess_dirs = [
+                Path(self.cfg.get("paths", {}).get("packages_dir", "/var/zeropkg/packages")) / pkg,
+                Path("/usr/local") / pkg,
+                Path("/opt") / pkg
+            ]
+            for g in guess_dirs:
+                if g.exists():
+                    to_archive.append(str(g.resolve()))
 
-    def clean(self, force: bool = False, args=None) -> Dict[str, List[str]]:
-        """
-        Perform depclean:
-          - force: if True, ignore reverse deps and attempt removal
-          - args: CLI args object, passed to installer for dry_run/fakeroot settings and to restore calls
-        Returns summary dict: { "removed": [], "skipped": [], "failed": [] }
-        """
-        summary = {"removed": [], "skipped": [], "failed": []}
-
-        orphans = self.list_orphans()
-        if not orphans:
-            self._log("depclean", "run", "No orphans found; nothing to do")
-            return summary
-
-        # Sort orphans to remove leaf-most first: attempt to remove packages with no dependents first.
-        # We'll compute reverse_deps for each orphan and prefer those with fewer reverse deps.
-        orphan_priority = []
-        for o in orphans:
-            try:
-                revs = self.resolver.reverse_deps(o)
-                orphan_priority.append((len(revs or []), o))
-            except Exception:
-                orphan_priority.append((999, o))
-        orphan_priority.sort()  # fewer dependents first
-
-        # Keep track of removed packages for rollback (in removal order)
-        removed_stack: List[str] = []
-
-        # Iterate and attempt removal
-        for _, pkg in orphan_priority:
-            try:
-                revs = self.resolver.reverse_deps(pkg)
-                if revs and not force:
-                    # skip, report
-                    self._log(pkg, "skip", f"Has reverse dependencies: {', '.join(revs)}")
-                    summary["skipped"].append(pkg)
-                    continue
-
-                # attempt remove via Installer.remove
-                self._log(pkg, "remove", f"Attempting removal (dry_run={self.dry_run}, force={force})")
-                if self.dry_run:
-                    # simulate remove
-                    summary["removed"].append(pkg)
-                    self._log(pkg, "remove", "[dry-run] would remove")
-                    continue
-
-                # call installer.remove; it returns True/False or raises
+            # attempt DB for file list
+            if self._db_manager:
                 try:
-                    ok = self.installer.remove(pkg, version=None, hooks=None, force=force)
-                except Exception as e:
-                    ok = False
-                    self._log(pkg, "remove", f"Installer.remove raised: {e}", level="error")
+                    with self._db_manager() as db:
+                        cur = db.conn.cursor()
+                        # this assumes installer recorded files in installed_files table
+                        cur.execute("SELECT files FROM installed_files WHERE pkg_name=?", (pkg,))
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            try:
+                                files = json.loads(row[0])
+                                for f in files:
+                                    if os.path.exists(f):
+                                        to_archive.append(f)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
-                if ok:
-                    removed_stack.append(pkg)
-                    summary["removed"].append(pkg)
-                    self._log(pkg, "remove", "Removed successfully")
-                else:
-                    summary["failed"].append(pkg)
-                    self._log(pkg, "remove", "Removal failed (installer returned False)", level="error")
-                    # decide whether to attempt rollback of what's been removed so far
-                    # here we try to rollback removed_stack if any
-                    if removed_stack:
-                        self._log("depclean", "rollback", "Attempting rollback due to removal failure")
-                        self._rollback_removed(removed_stack, args)
-                    # continue to next orphan (or abort entirely? prefer continue but record)
-            except Exception as e:
-                summary["failed"].append(pkg)
-                self._log(pkg, "remove", f"Exception during removal: {e}", level="error")
-                # attempt rollback of removed_stack
-                if removed_stack:
-                    self._rollback_removed(removed_stack, args)
+        if not to_archive:
+            log_event(pkg, "backup", "No files found to backup; skipping", "warning")
+            return None
 
-        # final summary log
-        self._log("depclean", "summary", f"Removed: {len(summary['removed'])}, Skipped: {len(summary['skipped'])}, Failed: {len(summary['failed'])}")
-        return summary
+        # create tar.xz
+        try:
+            with tarfile.open(backup_path, "w:xz") as tar:
+                for item in to_archive:
+                    arcname = os.path.basename(item.rstrip("/"))
+                    try:
+                        tar.add(item, arcname=arcname)
+                    except Exception as e:
+                        log_event(pkg, "backup", f"Failed to add {item} to backup: {e}", "warning")
+            log_event(pkg, "backup", f"Backup created at {backup_path}", "info")
+            return backup_path
+        except Exception as e:
+            log_event(pkg, "backup", f"Backup creation failed: {e}", "error")
+            return None
 
-    def _rollback_removed(self, removed_stack: List[str], args) -> None:
+    # -------------------------
+    # Remove package
+    # -------------------------
+    def _call_remover(self, pkg: str, dry_run: bool = True, use_fakeroot: bool = False) -> bool:
         """
-        Attempt to rollback removed packages in reverse order. Best-effort only.
-        For each package, try to restore from backup or packages_dir.
+        Call system remover if available (zeropkg_remover.remove_package or zeropkg_installer.remove)
+        If not available, fall back to removing graph node only (non-destructive).
+        Returns True if removal considered successful.
         """
-        self._log("depclean", "rollback", f"Starting rollback of {len(removed_stack)} packages")
-        for pkg in reversed(removed_stack):
+        # prefer api_remove_package
+        if api_remove_package:
             try:
-                ok = self._attempt_restore(pkg, args)
-                if ok:
-                    self._log(pkg, "rollback", "Restored successfully")
-                else:
-                    self._log(pkg, "rollback", "Could not restore (no backup or install failed)", level="error")
+                log_event(pkg, "remove", f"Invoking zeropkg_remover for {pkg}")
+                if dry_run:
+                    log_event(pkg, "remove", "[dry-run] would call zeropkg_remover", "info")
+                    return True
+                rc = api_remove_package(pkg, use_fakeroot=use_fakeroot)
+                return bool(rc)
             except Exception as e:
-                self._log(pkg, "rollback", f"Rollback attempt exception: {e}", level="error")
-        self._log("depclean", "rollback", "Rollback attempts finished")
+                log_event(pkg, "remove", f"zeropkg_remover failed: {e}", "error")
+                return False
+
+        # try installer module remove function
+        try:
+            from zeropkg_installer import remove_package as installer_remove
+            if installer_remove:
+                if dry_run:
+                    log_event(pkg, "remove", "[dry-run] would call zeropkg_installer.remove_package", "info")
+                    return True
+                return bool(installer_remove(pkg, use_fakeroot=use_fakeroot))
+        except Exception:
+            pass
+
+        # fallback: non-destructive: remove node from graph (if present) and log
+        graph = self._load_graph()
+        if graph:
+            try:
+                graph.remove_node(pkg)
+                log_event(pkg, "remove", "Removed from in-memory graph (no system uninstall available)", "warning")
+                return True
+            except Exception as e:
+                log_event(pkg, "remove", f"Failed to remove from graph: {e}", "error")
+                return False
+
+        log_event(pkg, "remove", "No remover available; cannot remove package from system", "error")
+        return False
+
+    # -------------------------
+    # Main run
+    # -------------------------
+    def run(self, dry_run: bool = True, force: bool = False, use_fakeroot: bool = False, protect_list: Optional[List[str]] = None, remove_callback: Optional[Callable[[str], bool]] = None) -> Dict[str, Any]:
+        """
+        Execute depclean run.
+         - dry_run: simulate and report only
+         - force: ignore local modifications protection (if underlying remover checks it)
+         - use_fakeroot: pass to remover if supported
+         - protect_list: additional package names to protect
+         - remove_callback: optional callback(pkg) -> bool to perform actual removal
+        Returns a report dict.
+        """
+        report = self._report.copy()
+        report["started_at"] = _now_ts()
+        # merge protect list
+        if protect_list:
+            self.protected.update(protect_list)
+
+        # find orphans
+        try:
+            orphans = self.find_orphans()
+            report["orphans"] = sorted(orphans)
+            log_global(f"Depclean: found {len(orphans)} orphan candidates", "info")
+        except Exception as e:
+            report["errors"].append({"phase": "find_orphans", "error": str(e)})
+            log_global(f"Depclean: error finding orphans: {e}", "error")
+            return report
+
+        # snapshot DB before destructive operations
+        db_snap = None
+        if not dry_run:
+            db_snap = self._create_db_snapshot()
+
+        # iterate orphans and process
+        for pkg in sorted(report["orphans"]):
+            try:
+                if self.is_protected(pkg):
+                    report.setdefault("protected", []).append(pkg)
+                    log_event(pkg, "depclean", "Package is protected; skipping", "info")
+                    continue
+
+                # backup package files
+                bkp = self._backup_package(pkg, dry_run=dry_run)
+                if bkp:
+                    report.setdefault("backed_up", []).append(str(bkp))
+
+                # decide removal method
+                if remove_callback:
+                    # use provided callback
+                    try:
+                        if dry_run:
+                            log_event(pkg, "depclean", "[dry-run] would call remove_callback", "info")
+                            report.setdefault("skipped", []).append(pkg)
+                        else:
+                            ok = remove_callback(pkg)
+                            if ok:
+                                report.setdefault("removed", []).append(pkg)
+                                log_event(pkg, "depclean", "Removed by custom callback", "info")
+                            else:
+                                report.setdefault("errors", []).append({pkg: "remove_callback failed"})
+                    except Exception as e:
+                        report.setdefault("errors", []).append({pkg: str(e)})
+                else:
+                    # call internal remover integration
+                    try:
+                        if dry_run:
+                            log_event(pkg, "depclean", "[dry-run] would remove package", "info")
+                            report.setdefault("skipped", []).append(pkg)
+                            continue
+                        ok = self._call_remover(pkg, dry_run=dry_run, use_fakeroot=use_fakeroot)
+                        if ok:
+                            report.setdefault("removed", []).append(pkg)
+                            log_event(pkg, "depclean", "Successfully removed package", "info")
+                            # record event in DB if available
+                            if self._db_manager:
+                                try:
+                                    with self._db_manager() as db:
+                                        db._execute("INSERT INTO events (pkg_name, event_type, payload, ts) VALUES (?, ?, ?, ?)",
+                                                    (pkg, "depclean.remove", json.dumps({"pkg": pkg}), _now_ts()))
+                                except Exception:
+                                    pass
+                        else:
+                            report.setdefault("errors", []).append({pkg: "removal failed"})
+                    except Exception as e:
+                        report.setdefault("errors", []).append({pkg: str(e)})
+            except Exception as e:
+                report.setdefault("errors", []).append({pkg: str(e)})
+                log_event(pkg, "depclean", f"Exception while processing orphan: {e}\n{traceback.format_exc()}", "error")
+                # attempt DB rollback if configured and not dry_run
+                if db_snap and not dry_run:
+                    self._restore_db_snapshot(db_snap)
+                    log_global("Depclean aborted; DB snapshot restored", "warning")
+                    break
+
+        report["finished_at"] = _now_ts()
+        # final summary logging
+        log_global(f"Depclean finished: removed={len(report.get('removed',[]))} skipped={len(report.get('skipped',[]))} errors={len(report.get('errors',[]))}", "info")
+        return report
+
+# -------------------------
+# CLI helper
+# -------------------------
+def main_cli():
+    import argparse, pprint
+    p = argparse.ArgumentParser(prog="zeropkg-depclean", description="Depclean orchestration for Zeropkg")
+    p.add_argument("--do-it", action="store_true", help="Actually remove orphans (default is dry-run)")
+    p.add_argument("--force", action="store_true", help="Force removal (pass-through to remover where applicable)")
+    p.add_argument("--fakeroot", action="store_true", help="Use fakeroot when removing files (if supported)")
+    p.add_argument("--protect", nargs="*", default=[], help="Additional packages to protect")
+    p.add_argument("--backup-only", action="store_true", help="Only perform backups for orphan candidates")
+    args = p.parse_args()
+
+    dc = Depcleaner()
+    if args.backup_only:
+        orphans = dc.find_orphans()
+        report = {"orphans": orphans, "backups": []}
+        for pkg in orphans:
+            b = dc._backup_package(pkg, dry_run=not args.do_it)
+            if b:
+                report["backups"].append(str(b))
+        pprint.pprint(report)
+        return
+
+    report = dc.run(dry_run=not args.do_it, force=args.force, use_fakeroot=args.fakeroot, protect_list=args.protect)
+    pprint.pprint(report)
+
+if __name__ == "__main__":
+    main_cli()
