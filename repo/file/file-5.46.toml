@@ -1,0 +1,54 @@
+[package]
+name = "file"
+version = "5.46"
+category = "lfs"
+description = "file — identifica tipo de arquivo (LFS capítulo 6.7)"
+homepage = "https://darwinsys.com/file/"
+license = "BSD"  # ou licença conforme versão do file
+maintainer = "zeropkg"
+
+[sources]
+urls = [
+  "https://astron.com/pub/file/file-5.46.tar.gz",
+  "https://mirrors.kernel.org/gnu/file/file-5.46.tar.gz"
+]
+checksum = "sha256:<COLOQUE_SHA256_REAL_DE_file-5.46>"
+extract_to = "file-5.46"
+
+[environment]
+LFS = "/mnt/lfs"
+LFS_TGT = "x86_64-lfs-linux-gnu"
+PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
+DESTDIR = "@DESTDIR@"
+
+[build]
+chroot = true
+fakeroot = false
+cleanup_sources = true
+commands = [
+  # 1) construir versão temporária para gerar arquivo signature (modo host)
+  "mkdir -v build",
+  "cd build",
+  "../configure --disable-bzlib --disable-libseccomp --disable-xzlib --disable-zlib",
+  "make",
+  "cd ..",
+
+  # 2) configuração final cross-compile para LFS
+  "./configure --prefix=/usr --host=$LFS_TGT --build=$(./config.guess)",
+  # especificar comando FILE_COMPILE apontando para binário gerado no build temporal
+  "make FILE_COMPILE=$(pwd)/build/src/file",
+  "make DESTDIR=${DESTDIR} install"
+]
+
+[hooks]
+pre_build = "echo '==> Preparando file-5.46 (LFS)'"
+post_install = "echo '==> file instalado no destino'"
+
+[dependencies]
+build = []
+runtime = []
+
+[lfs]
+stage = "toolchain"
+bootstrap = true
+chroot_required = true
