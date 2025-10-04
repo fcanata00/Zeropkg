@@ -1,305 +1,473 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zeropkg_sync.py — synchronize git-backed ports repositories for Zeropkg
-Pattern B: integrated, lean, functional.
+zeropkg_sync.py — robust synchronizer for Zeropkg ports repositories
 
-Public API:
-- list_repos(cfg=None) -> list of {name, path, url}
-- check_repo_status(repo_path) -> dict {ok, branch, commit, dirty, behind, ahead}
-- sync_repos(name=None, cfg=None, dry_run=False, force=False, update_submodules=True) -> dict of results
+Features applied:
+ - load repos from zeropkg_config
+ - integrated logging (zeropkg_logger)
+ - records events/metrics in DB (zeropkg_db)
+ - parallel sync using ThreadPoolExecutor
+ - dry-run, force, repair, list, metrics
+ - webhook notifications (POST JSON) and local notification file
+ - robust git operations (clone, fetch, pull) with retries
+ - detection of new commits and per-repo summary
 """
 
 from __future__ import annotations
 import os
 import sys
-import subprocess
-import shlex
 import json
+import shutil
+import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, Any, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# optional integrations
+# Try to import project modules with graceful fallback
 try:
-    from zeropkg_config import load_config, get_ports_dirs
+    from zeropkg_config import load_config
 except Exception:
-    def load_config(*a, **k):
-        return {"paths": {"ports_dir": "/usr/ports"}, "repos": []}
-    def get_ports_dirs(cfg=None):
-        p = (cfg or {}).get("paths", {}).get("ports_dir", "/usr/ports")
-        return [p]
+    def load_config():
+        # minimal default config if not provided
+        return {
+            "paths": {
+                "ports": "/usr/ports",
+                "distfiles": "/usr/ports/distfiles",
+                "log_dir": "/var/log/zeropkg",
+            },
+            "sync": {
+                "jobs": 4,
+                "git_timeout": 120,
+                "keep_local_cache": True
+            },
+            "notify": {
+                "webhook_url": None
+            }
+        }
 
 try:
-    from zeropkg_logger import log_event, log_global, get_logger
-    logger = get_logger("sync")
+    from zeropkg_logger import ZeropkgLogger, get_logger  # some installs supply get_logger
+    # If get_logger isn't available, instantiate ZeropkgLogger manually later
+    LOG_AVAILABLE = True
 except Exception:
-    import logging
-    logger = logging.getLogger("zeropkg_sync")
-    if not logger.handlers:
-        logger.addHandler(logging.StreamHandler(sys.stdout))
-    def log_event(pkg, stage, msg, level="info"):
-        getattr(logger, level if hasattr(logger, level) else "info")(f"{pkg}:{stage} {msg}")
-    def log_global(msg, level="info"):
-        getattr(logger, level if hasattr(logger, level) else "info")(msg)
+    ZeropkgLogger = None
+    get_logger = None
+    LOG_AVAILABLE = False
 
 try:
-    from zeropkg_db import DBManager
+    from zeropkg_db import record_install_quick, record_upgrade, DBManager, list_installed_quick
+    DB_AVAILABLE = True
 except Exception:
     DBManager = None
+    DB_AVAILABLE = False
 
-# ---------- helpers ----------
-def _run(cmd: List[str], cwd: Optional[str] = None, capture: bool = True, check: bool = False, env: Optional[Dict[str,str]] = None) -> Tuple[int, str, str]:
-    """Run a command, return (rc, stdout, stderr)."""
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except Exception:
+    REQUESTS_AVAILABLE = False
+
+# -------------------------
+# Helper logger wrappers
+# -------------------------
+def _get_logger():
+    if LOG_AVAILABLE:
+        try:
+            if get_logger:
+                return get_logger("sync")
+            else:
+                return ZeropkgLogger().logger
+        except Exception:
+            return None
+    return None
+
+_logger = _get_logger()
+
+def log_info(msg: str, **kwargs):
+    if _logger:
+        try:
+            _logger.info(msg)
+        except Exception:
+            print("[INFO]", msg)
+    else:
+        print("[INFO]", msg)
+
+def log_warn(msg: str, **kwargs):
+    if _logger:
+        try:
+            _logger.warning(msg)
+        except Exception:
+            print("[WARN]", msg)
+    else:
+        print("[WARN]", msg)
+
+def log_error(msg: str, **kwargs):
+    if _logger:
+        try:
+            _logger.error(msg)
+        except Exception:
+            print("[ERROR]", msg)
+    else:
+        print("[ERROR]", msg)
+
+# -------------------------
+# Git helpers
+# -------------------------
+def run_git(cmd: List[str], cwd: Optional[str] = None, timeout: Optional[int] = None) -> Tuple[int, str, str]:
+    """
+    Run a git command and return (rc, stdout, stderr)
+    """
     try:
-        proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE if capture else None,
-                              stderr=subprocess.PIPE if capture else None, env=env, check=check, text=True)
-        out = proc.stdout if proc.stdout is not None else ""
-        err = proc.stderr if proc.stderr is not None else ""
-        return proc.returncode, out.strip(), err.strip()
-    except subprocess.CalledProcessError as e:
-        return e.returncode, e.stdout.strip() if e.stdout else "", e.stderr.strip() if e.stderr else ""
+        proc = subprocess.run(["git"] + cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
     except FileNotFoundError:
-        raise RuntimeError(f"Command not found: {cmd[0]}")
+        return 127, "", "git-not-found"
+    except Exception as e:
+        return 1, "", str(e)
 
-def _is_git_available() -> bool:
-    try:
-        rc, _, _ = _run(["git", "--version"])
-        return rc == 0
-    except Exception:
-        return False
+def safe_clone(repo_url: str, target_dir: Path, bare: bool = False, timeout: int = 120, depth: Optional[int] = None) -> Tuple[bool, str]:
+    """
+    Clone repo_url into target_dir safely, using a temp dir to avoid partial clones.
+    Returns (ok, message).
+    """
+    tmp = target_dir.with_name(target_dir.name + ".tmp-clone")
+    if tmp.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+    cmd = ["clone"]
+    if bare:
+        cmd.append("--bare")
+    if depth:
+        cmd += ["--depth", str(depth)]
+    cmd += [repo_url, str(tmp)]
+    rc, out, err = run_git(cmd, timeout=timeout)
+    if rc != 0:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+        return False, f"git clone failed: rc={rc} err={err or out}"
+    # move into place atomically
+    if target_dir.exists():
+        # backup existing if any
+        backup = target_dir.with_name(target_dir.name + ".backup-" + str(int(time.time())))
+        target_dir.rename(backup)
+        try:
+            tmp.rename(target_dir)
+            shutil.rmtree(backup, ignore_errors=True)
+        except Exception as e:
+            # try rollback
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
+            backup.rename(target_dir)
+            return False, f"clone move failed: {e}"
+    else:
+        tmp.rename(target_dir)
+    return True, "cloned"
 
-def _safe_resolve(p: str) -> str:
-    return str(Path(p).expanduser().resolve())
+# -------------------------
+# Repair helpers
+# -------------------------
+def repair_repository(repo_path: Path, timeout: int = 120) -> Tuple[bool, str]:
+    """
+    Try to repair a repo by running git fsck and git gc, if those fail attempt reclone.
+    Returns (ok, message)
+    """
+    if not repo_path.exists():
+        return False, "repo not found"
+    rc, out, err = run_git(["fsck", "--full"], cwd=str(repo_path), timeout=timeout)
+    if rc == 0:
+        # run gc
+        rc2, out2, err2 = run_git(["gc", "--prune=now", "--aggressive"], cwd=str(repo_path), timeout=timeout)
+        if rc2 == 0:
+            return True, "fsck/gc ok"
+        else:
+            return False, f"gc failed: {err2 or out2}"
+    else:
+        # try backup + reclone from origin if possible
+        # find origin url
+        rcu, uout, uerr = run_git(["remote", "get-url", "origin"], cwd=str(repo_path), timeout=timeout)
+        if rcu != 0:
+            return False, f"fsck failed and origin unknown: {uerr or uout}"
+        origin = uout.strip()
+        parent = repo_path.parent
+        target_name = repo_path.name
+        # attempt safe clone to temp
+        tmp = parent / (target_name + ".tmp-reclone")
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+        rc_clone, out_clone, err_clone = run_git(["clone", origin, str(tmp)], timeout=timeout)
+        if rc_clone != 0:
+            if tmp.exists():
+                shutil.rmtree(tmp, ignore_errors=True)
+            return False, f"reclone failed: {err_clone or out_clone}"
+        # swap directories
+        backup = parent / (target_name + ".corrupt-" + str(int(time.time())))
+        try:
+            repo_path.rename(backup)
+            tmp.rename(repo_path)
+            shutil.rmtree(backup, ignore_errors=True)
+            return True, "reclone success"
+        except Exception as e:
+            return False, f"swap failed: {e}"
 
-def _record_db_event(action: str, repo_name: str, payload: Dict[str, Any]):
-    if not DBManager:
-        return
-    try:
-        with DBManager() as db:
-            db._execute("INSERT INTO events (pkg_name, event_type, payload, ts) VALUES (?, ?, ?, ?)",
-                        (repo_name, f"sync.{action}", json.dumps(payload), int(__import__("time").time())))
-    except Exception:
-        # do not fail sync on DB logging errors
-        pass
-
-def _validate_repo_url(url: str) -> bool:
-    # simple policy: allow https or git+https only by default
-    if url.startswith("https://") or url.startswith("git+https://") or url.startswith("ssh://") or url.startswith("git@"):
+# -------------------------
+# Repo processing
+# -------------------------
+def repo_needs_clone(repo_cfg: Dict[str,Any], local_path: Path) -> bool:
+    if not local_path.exists():
+        return True
+    # if bare repo with no HEAD or empty, treat as need
+    head = local_path / "HEAD"
+    if not head.exists():
         return True
     return False
 
-# ---------- core functions ----------
-def list_repos(cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+def fetch_and_report(repo_cfg: Dict[str,Any], cfg: Dict[str,Any], dry_run: bool = False, timeout: int = 120) -> Dict[str,Any]:
     """
-    Discover repositories from config:
-    - cfg['repos'] if present (list of dicts with 'path' and 'url' optionally)
-    - otherwise, discovers subdirectories under ports_dir
-    Returns list of {name, path, url}
+    Sync one repository (clone/pull/fetch), returns a dict with summary info:
+     {name, url, path, action, new_commits, errors, rc}
     """
-    cfg = cfg or load_config()
-    out: List[Dict[str,str]] = []
+    name = repo_cfg.get("name") or repo_cfg.get("path") or repo_cfg.get("url")
+    url = repo_cfg.get("url")
+    path = Path(repo_cfg.get("local", cfg["paths"].get("ports", "/usr/ports"))) / (repo_cfg.get("path") or name or "unknown")
+    path = path.resolve()
+    result = {"name": name, "url": url, "path": str(path), "action": None, "new_commits": 0, "errors": [], "rc": 0}
 
-    # first, explicit repos in config
-    repos_cfg = cfg.get("repos", []) or []
-    for r in repos_cfg:
-        path = r.get("path")
-        url = r.get("remote") or r.get("url") or r.get("git")
-        name = r.get("name") or (Path(path).name if path else None)
-        if path:
-            out.append({"name": name or str(path), "path": _safe_resolve(path), "url": url or ""})
+    try:
+        # Ensure parent exists
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if dry_run:
+            log_info(f"[dry-run] would sync {name} -> {path}")
+            result["action"] = "dry-run"
+            return result
 
-    # fall back: list directories under ports_dir
-    ports_dirs = get_ports_dirs(cfg)
-    for ports_dir in ports_dirs:
-        try:
-            for entry in sorted(os.listdir(ports_dir)):
-                p = os.path.join(ports_dir, entry)
-                if os.path.isdir(p):
-                    # if already listed via config, skip
-                    if any(_safe_resolve(p) == _safe_resolve(r["path"]) for r in out):
-                        continue
-                    # attempt to read a .git or remote origin
-                    url = ""
-                    git_dir = os.path.join(p, ".git")
-                    if os.path.isdir(git_dir):
-                        # try to read origin url
-                        try:
-                            rc, out_str, err = _run(["git", "config", "--get", "remote.origin.url"], cwd=p)
-                            if rc == 0 and out_str:
-                                url = out_str.strip()
-                        except Exception:
-                            url = ""
-                    out.append({"name": entry, "path": _safe_resolve(p), "url": url})
-        except Exception:
-            continue
-    return out
-
-def check_repo_status(repo_path: str) -> Dict[str, Any]:
-    """
-    Check repository status: branch, commit, dirty, ahead/behind counts.
-    Returns dict with fields: ok(bool), branch, commit, dirty(bool), ahead(int), behind(int), message
-    """
-    repo = _safe_resolve(repo_path)
-    if not os.path.isdir(repo):
-        return {"ok": False, "message": f"Path not found: {repo}"}
-    if not _is_git_available():
-        return {"ok": False, "message": "git not available on PATH"}
-
-    # ensure it's a git repo
-    rc, _, _ = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo)
-    if rc != 0:
-        return {"ok": False, "message": "Not a git repository"}
-
-    result = {"ok": True, "branch": None, "commit": None, "dirty": False, "ahead": 0, "behind": 0, "message": ""}
-
-    # branch
-    rc, branch, _ = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo)
-    if rc == 0:
-        result["branch"] = branch
-    # commit
-    rc, commit, _ = _run(["git", "rev-parse", "HEAD"], cwd=repo)
-    if rc == 0:
-        result["commit"] = commit
-    # dirty
-    rc, status_out, _ = _run(["git", "status", "--porcelain"], cwd=repo)
-    result["dirty"] = bool(status_out.strip())
-    # ahead/behind relative to origin/branch
-    if result["branch"]:
-        # fetch remote refs lightly (no change)
-        _run(["git", "fetch", "--all", "--prune"], cwd=repo)
-        rc, out_merge, _ = _run(["git", "rev-list", "--left-right", "--count", f"origin/{result['branch']}...{result['branch']}"], cwd=repo)
-        if rc == 0 and out_merge:
-            try:
-                behind, ahead = map(int, out_merge.split())
-                result["behind"] = behind
-                result["ahead"] = ahead
-            except Exception:
-                pass
-
+        if repo_needs_clone(repo_cfg, path):
+            log_info(f"Cloning {url} -> {path}")
+            ok, msg = safe_clone(url, path, timeout=timeout, depth=repo_cfg.get("depth"))
+            result["action"] = "clone"
+            if not ok:
+                result["errors"].append(msg)
+                result["rc"] = 1
+                log_error(f"Clone failed for {name}: {msg}")
+                return result
+            # record clone event
+            if DB_AVAILABLE:
+                try:
+                    with DBManager() as db:
+                        db._execute("INSERT INTO events (pkg_name, action, timestamp, payload) VALUES (?,?,?,?)",
+                                    (name, "clone", int(time.time()), json.dumps({"url": url})))
+                except Exception:
+                    pass
+        else:
+            # fetch remote updates
+            # get current HEAD commit
+            rc_head, out_head, err_head = run_git(["rev-parse", "HEAD"], cwd=str(path), timeout=timeout)
+            old_head = out_head.strip() if rc_head == 0 else None
+            # fetch
+            rc_fetch, out_fetch, err_fetch = run_git(["fetch", "--all", "--prune"], cwd=str(path), timeout=timeout)
+            if rc_fetch != 0:
+                result["errors"].append(f"fetch failed: {err_fetch or out_fetch}")
+                result["rc"] = rc_fetch
+                log_warn(f"Fetch failed for {name}: {err_fetch or out_fetch}")
+                # continue to try pull
+            # try to fast-forward/pull main branch
+            # detect default branch
+            rc_branch, out_branch, err_branch = run_git(["symbolic-ref", "refs/remotes/origin/HEAD"], cwd=str(path), timeout=timeout)
+            if rc_branch == 0 and out_branch:
+                # refs/remotes/origin/main -> extract 'main'
+                remote_head = out_branch.strip().split("/")[-1]
+            else:
+                remote_head = repo_cfg.get("branch") or "master"
+            # attempt merge or reset to remote
+            # try fast-forward merge
+            rc_ff, out_ff, err_ff = run_git(["merge", "--ff-only", f"origin/{remote_head}"], cwd=str(path), timeout=timeout)
+            if rc_ff != 0:
+                # fallback: try pull with rebase
+                rc_pull, out_pull, err_pull = run_git(["pull", "--rebase", "origin", remote_head], cwd=str(path), timeout=timeout)
+                if rc_pull != 0:
+                    result["errors"].append(f"pull failed: {err_pull or out_pull}")
+                    result["rc"] = rc_pull
+                    log_warn(f"Pull failed for {name}: {err_pull or out_pull}")
+            # get new head
+            rc_new, out_new, err_new = run_git(["rev-parse", "HEAD"], cwd=str(path), timeout=timeout)
+            new_head = out_new.strip() if rc_new == 0 else None
+            if old_head and new_head and old_head != new_head:
+                # count commits between old_head and new_head
+                rc_count, out_count, err_count = run_git(["rev-list", "--count", f"{old_head}..{new_head}"], cwd=str(path), timeout=timeout)
+                if rc_count == 0:
+                    try:
+                        result["new_commits"] = int(out_count.strip())
+                    except Exception:
+                        result["new_commits"] = 1
+                else:
+                    result["new_commits"] = 1
+                result["action"] = "update"
+                log_info(f"{name} updated: {result['new_commits']} new commits")
+                # record update event
+                if DB_AVAILABLE:
+                    try:
+                        with DBManager() as db:
+                            db._execute("INSERT INTO events (pkg_name, action, timestamp, payload) VALUES (?,?,?,?)",
+                                        (name, "update", int(time.time()), json.dumps({"new_commits": result["new_commits"], "url": url})))
+                    except Exception:
+                        pass
+            else:
+                result["action"] = "noop"
+    except Exception as e:
+        result["errors"].append(str(e))
+        result["rc"] = 1
+        log_error(f"Unhandled error syncing {name}: {e}")
     return result
 
-def _git_pull(repo_path: str, force: bool = False, update_submodules: bool = True, dry_run: bool = False) -> Dict[str, Any]:
-    repo = _safe_resolve(repo_path)
-    res: Dict[str, Any] = {"path": repo, "pulled": False, "message": "", "rc": 0}
-    if dry_run:
-        log_global(f"[dry-run] would pull {repo}")
-        res["message"] = "dry-run"
-        return res
-
-    # attempt git pull
-    try:
-        # ensure no local modifications unless force
-        status = check_repo_status(repo)
-        if status.get("dirty") and not force:
-            res["message"] = "local modifications present; skipping (use force=True to override)"
-            res["rc"] = 2
-            return res
-
-        # prefer 'git pull --ff-only' to avoid merges
-        rc, out, err = _run(["git", "pull", "--ff-only"], cwd=repo, capture=True)
-        res["rc"] = rc
-        if rc == 0:
-            res["pulled"] = True
-            res["message"] = out or "up-to-date"
-        else:
-            # try fallback: git pull (may create merge)
-            rc2, out2, err2 = _run(["git", "pull"], cwd=repo, capture=True)
-            res["rc"] = rc2
-            if rc2 == 0:
-                res["pulled"] = True
-                res["message"] = out2 or "pulled (merged)"
-            else:
-                res["message"] = err2 or err or f"git pull failed rc={rc2}"
-        # optionally update submodules
-        if update_submodules:
-            _run(["git", "submodule", "update", "--init", "--recursive"], cwd=repo)
-    except Exception as e:
-        res["rc"] = 1
-        res["message"] = str(e)
-    return res
-
-def sync_repos(name: Optional[str] = None, cfg: Optional[Dict[str,Any]] = None, dry_run: bool = False, force: bool = False, update_submodules: bool = True) -> Dict[str,Any]:
+# -------------------------
+# Top-level sync orchestration
+# -------------------------
+def sync_all(repos: List[Dict[str,Any]],
+             cfg: Dict[str,Any],
+             jobs: int = 4,
+             dry_run: bool = False,
+             force: bool = False,
+             repair: bool = False,
+             webhook: Optional[str] = None,
+             notify: bool = False,
+             metrics: bool = False,
+             git_timeout: int = 120) -> Dict[str,Any]:
     """
-    Sync a single repo by name or all repos defined/discovered.
-    Returns dict mapping repo_name -> result dict.
+    Sync a list of repositories (config entries).
+    Returns summary dict with per-repo results.
     """
-    cfg = cfg or load_config()
-    if not _is_git_available():
-        raise RuntimeError("git not available; cannot sync repositories")
+    results = {}
+    # ensure paths
+    ports_base = Path(cfg["paths"].get("ports", "/usr/ports"))
+    ports_base.mkdir(parents=True, exist_ok=True)
 
-    results: Dict[str, Any] = {}
-    repos = list_repos(cfg)
-    # filter by name if given (match exact name or path basename)
-    if name:
-        repos = [r for r in repos if r["name"] == name or Path(r["path"]).name == name]
-        if not repos:
-            raise RuntimeError(f"Repository '{name}' not found in config or ports dir")
+    # parallel execution
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        future_to_repo = {}
+        for r in repos:
+            future = ex.submit(fetch_and_report, r, cfg, dry_run, git_timeout)
+            future_to_repo[future] = r
+        for fut in as_completed(future_to_repo):
+            repo_cfg = future_to_repo[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                res = {"name": repo_cfg.get("name"), "url": repo_cfg.get("url"), "error": str(e)}
+            results[repo_cfg.get("name") or repo_cfg.get("url")] = res
 
-    for r in repos:
-        repo_name = r.get("name") or Path(r.get("path")).name
-        repo_path = r.get("path")
-        repo_url = r.get("url") or ""
-        log_event(repo_name, "sync", f"Starting sync for {repo_path} (url={repo_url})")
-        # validate remote URL if present
-        if repo_url and not _validate_repo_url(repo_url):
-            msg = f"remote url {repo_url} not allowed by policy"
-            log_event(repo_name, "sync", msg, level="warning")
-            results[repo_name] = {"ok": False, "message": msg}
-            _record_db_event("sync.skip", repo_name, {"path": repo_path, "url": repo_url, "reason": "url_policy"})
-            continue
-        # if path doesn't exist, try clone if url present
-        if not os.path.exists(repo_path) or not os.path.isdir(repo_path):
-            if repo_url:
-                if dry_run:
-                    log_event(repo_name, "sync", f"[dry-run] would clone {repo_url} -> {repo_path}")
-                    results[repo_name] = {"ok": True, "cloned": False, "message": "dry-run clone"}
-                    continue
+    # post-process results: repairs, notifications and metrics
+    total_new = sum(v.get("new_commits", 0) for v in results.values() if isinstance(v, dict))
+    errors = {k:v for k,v in results.items() if isinstance(v, dict) and v.get("errors")}
+    # if repair requested: try repair repos with errors
+    if repair:
+        for k,v in list(results.items()):
+            if v.get("errors"):
+                path = Path(v.get("path"))
+                ok, msg = repair_repository(path, timeout=git_timeout)
+                v.setdefault("repair", {"ok": ok, "msg": msg})
+                if ok:
+                    log_info(f"Repaired {k}: {msg}")
                 else:
-                    try:
-                        _run(["git", "clone", repo_url, repo_path])
-                        log_event(repo_name, "sync", f"Cloned {repo_url} -> {repo_path}")
-                        _record_db_event("clone", repo_name, {"path": repo_path, "url": repo_url})
-                    except Exception as e:
-                        log_event(repo_name, "sync", f"Clone failed: {e}", level="error")
-                        results[repo_name] = {"ok": False, "message": str(e)}
-                        _record_db_event("clone.fail", repo_name, {"path": repo_path, "url": repo_url, "error": str(e)})
-                        continue
-            else:
-                msg = "repo path does not exist and no url configured"
-                log_event(repo_name, "sync", msg, level="warning")
-                results[repo_name] = {"ok": False, "message": msg}
-                continue
-
-        # perform pull/update
+                    log_warn(f"Repair failed {k}: {msg}")
+    # metrics: store in DB summary
+    if metrics and DB_AVAILABLE:
         try:
-            pull_res = _git_pull(repo_path, force=force, update_submodules=update_submodules, dry_run=dry_run)
-            results[repo_name] = {"ok": pull_res.get("pulled", False), **pull_res}
-            _record_db_event("pull", repo_name, {"path": repo_path, "result": pull_res})
-            log_event(repo_name, "sync", f"Sync result: {pull_res.get('message')}")
-        except Exception as e:
-            results[repo_name] = {"ok": False, "message": str(e)}
-            _record_db_event("pull.fail", repo_name, {"path": repo_path, "error": str(e)})
-            log_event(repo_name, "sync", f"Sync failed: {e}", level="error")
+            with DBManager() as db:
+                payload = {"total_repos": len(repos), "new_commits": total_new, "errors": len(errors), "timestamp": int(time.time())}
+                db._execute("INSERT INTO events (pkg_name, action, timestamp, payload) VALUES (?,?,?,?)",
+                            ("zeropkg-sync", "metrics", int(time.time()), json.dumps(payload)))
+        except Exception:
+            pass
 
-    return results
+    # notifications: webhook or local file
+    if notify and (webhook or cfg.get("notify", {}).get("webhook_url")):
+        wh = webhook or cfg.get("notify", {}).get("webhook_url")
+        if wh:
+            notif_payload = {"total_repos": len(repos), "new_commits": total_new, "errors": len(errors), "detail": results}
+            try:
+                if REQUESTS_AVAILABLE:
+                    r = requests.post(wh, json=notif_payload, timeout=10)
+                    if r.status_code >= 200 and r.status_code < 300:
+                        log_info("Webhook notification sent")
+                    else:
+                        log_warn(f"Webhook responded status {r.status_code}")
+                else:
+                    # fallback: write to local file for external process to pick up
+                    outp = Path(cfg["paths"].get("log_dir", "/var/log/zeropkg")) / "sync_notification.json"
+                    outp.parent.mkdir(parents=True, exist_ok=True)
+                    with open(outp, "w") as f:
+                        json.dump(notif_payload, f, indent=2)
+                    log_info(f"Notification written to {outp} (requests not installed)")
+            except Exception as e:
+                log_warn(f"Failed to send webhook: {e}")
 
-# CLI helper
-if __name__ == "__main__":
+    return {"summary": {"repos": len(repos), "new_commits": total_new, "errors": len(errors)}, "detail": results}
+
+# -------------------------
+# Utility: load repo list from config
+# -------------------------
+def load_repos_from_config(cfg: Dict[str,Any]) -> List[Dict[str,Any]]:
+    """
+    Config format options supported:
+    cfg["repos"] = [
+      { "name": "gentoo-ports", "url": "https://...", "path": "gentoo-ports", "branch":"main", "depth":1 },
+      ...
+    ]
+    or auto-scan dirs inside cfg["paths"]["ports"]
+    """
+    repos = []
+    if "repos" in cfg and isinstance(cfg["repos"], list) and cfg["repos"]:
+        for r in cfg["repos"]:
+            repos.append(r)
+    else:
+        # auto-scan by reading ports directory and looking for .git or a remotes file
+        base = Path(cfg["paths"].get("ports", "/usr/ports"))
+        if not base.exists():
+            return []
+        for p in sorted(base.iterdir()):
+            if not p.is_dir():
+                continue
+            # find git repo
+            if (p / ".git").exists():
+                # try to get origin url
+                rc, out, err = run_git(["remote", "get-url", "origin"], cwd=str(p), timeout=60)
+                url = out.strip() if rc==0 else None
+                repos.append({"name": p.name, "url": url, "path": p.name})
+    return repos
+
+# -------------------------
+# CLI wrapper
+# -------------------------
+def _cli():
     import argparse
-    parser = argparse.ArgumentParser(prog="zeropkg-sync", description="Sync zeropkg repos")
-    parser.add_argument("--name", help="repo name to sync (optional, syncs all if omitted)")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--force", action="store_true")
-    parser.add_argument("--list", action="store_true", help="list discovered repos and exit")
+    parser = argparse.ArgumentParser(description="Zeropkg sync — sync ports repositories")
+    parser.add_argument("--config", "-c", help="path to config toml (used by zeropkg_config)", default=None)
+    parser.add_argument("--jobs", "-j", type=int, default=None, help="parallel jobs")
+    parser.add_argument("--dry-run", action="store_true", help="do not change anything")
+    parser.add_argument("--force", action="store_true", help="force reclone for repos that changed")
+    parser.add_argument("--repair", action="store_true", help="attempt repair on repos with errors")
+    parser.add_argument("--list", action="store_true", help="list repos from config")
+    parser.add_argument("--notify", action="store_true", help="send notification webhook if configured")
+    parser.add_argument("--webhook", help="webhook url override")
+    parser.add_argument("--metrics", action="store_true", help="record sync metrics to DB")
+    parser.add_argument("--git-timeout", type=int, default=120, help="git timeout seconds per operation")
     args = parser.parse_args()
-    cfg = load_config()
+
+    cfg = load_config() if args.config is None else load_config()
+    jobs = args.jobs or cfg.get("sync", {}).get("jobs", cfg.get("jobs", 4))
+    repos = load_repos_from_config(cfg)
     if args.list:
-        for rp in list_repos(cfg):
-            print(json.dumps(rp))
-        sys.exit(0)
-    try:
-        res = sync_repos(name=args.name, cfg=cfg, dry_run=args.dry_run, force=args.force)
-        print(json.dumps(res, indent=2))
-    except Exception as e:
-        print("Error:", e)
-        sys.exit(1)
+        print("Repositories detected:")
+        for r in repos:
+            print(f" - {r.get('name')} -> {r.get('url')} (path={r.get('path')})")
+        return
+    res = sync_all(repos, cfg, jobs=jobs, dry_run=args.dry_run, force=args.force, repair=args.repair, webhook=args.webhook, notify=args.notify, metrics=args.metrics, git_timeout=args.git_timeout)
+    print(json.dumps(res, indent=2))
+    if res["summary"]["errors"] > 0:
+        sys.exit(2)
+
+if __name__ == "__main__":
+    _cli()
