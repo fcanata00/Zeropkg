@@ -1,221 +1,267 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zeropkg TOML Parser
--------------------
-Responsável por carregar, validar, normalizar e expandir receitas (.toml)
-utilizadas em todos os estágios do Zeropkg — desde LFS até BLFS e beyond.
+zeropkg_toml.py — Parser e validador de receitas TOML para o Zeropkg
 
-Suporta includes, overlays, múltiplos sources, hooks, environment, etc.
+Suporte:
+- Includes e overlays
+- Variantes de build (static, minimal, debug)
+- Macros de ambiente
+- Cache incremental baseado em hash
+- Validação de hooks e patches
+- Compatibilidade com YAML (fallback)
 """
 
 import os
+import re
 import tomllib
 import hashlib
 import json
-import re
+import yaml
 from pathlib import Path
-from packaging import version
-from zeropkg_logger import log
+from typing import Any, Dict, Optional, List, Union
+from copy import deepcopy
+
+# --------------------------------------------------------
+# Imports internos (com fallback para execução isolada)
+# --------------------------------------------------------
+try:
+    from zeropkg_logger import log_event, log_global
+except Exception:
+    def log_event(pkg, stage, msg, level="info"):
+        print(f"[{level}] {pkg}:{stage} - {msg}")
+    def log_global(msg, level="info"):
+        print(f"[{level}] {msg}")
+
+try:
+    from zeropkg_config import load_config
+except Exception:
+    def load_config():
+        return {"paths": {"cache_dir": "/var/cache/zeropkg"}}
 
 
-CACHE_DIR = Path("/var/cache/zeropkg")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_FILE = CACHE_DIR / "recipes.json"
+# ========================================================
+# Funções auxiliares
+# ========================================================
+def _ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
+def _hash_file(path: Path) -> str:
+    """Calcula o hash SHA1 de um arquivo."""
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _expand_macros(data: Any, env: Dict[str, str]) -> Any:
+    """Expande macros ${VAR} e @VAR@ recursivamente em dicionários, listas e strings."""
+    if isinstance(data, dict):
+        return {k: _expand_macros(v, env) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [_expand_macros(i, env) for i in data]
+    elif isinstance(data, str):
+        for k, v in env.items():
+            data = data.replace(f"${{{k}}}", v).replace(f"@{k}@", v)
+        return data
+    else:
+        return data
+
+
+def _load_yaml(path: Path) -> Dict[str, Any]:
+    """Fallback para YAML se o TOML não existir."""
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _validate_hook(path: str) -> bool:
+    """Confirma se o hook existe e é executável."""
+    if not path:
+        return False
+    hook_path = Path(path)
+    return hook_path.exists() and os.access(hook_path, os.X_OK)
+
+
+# ========================================================
+# Classe principal
+# ========================================================
 class ZeropkgTOML:
-    def __init__(self, config=None):
-        self.config = config
-        self.cache = self._load_cache()
+    def __init__(self, cache_dir: Optional[Path] = None):
+        cfg = load_config()
+        self.cache_dir = _ensure_dir(Path(cfg["paths"]["cache_dir"]) / "recipes")
+        self._cache_path = self.cache_dir / "recipes_cache.json"
+        self._cache = self._load_cache()
 
-    # ===============================================================
-    # Cache de receitas normalizadas
-    # ===============================================================
-    def _load_cache(self):
-        if CACHE_FILE.exists():
+    # ----------------------------------------------------
+    # Cache incremental baseado em hash
+    # ----------------------------------------------------
+    def _load_cache(self) -> Dict[str, str]:
+        if self._cache_path.exists():
             try:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                with open(self._cache_path, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception:
                 return {}
         return {}
 
     def _save_cache(self):
-        try:
-            with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.cache, f, indent=2)
-        except Exception as e:
-            log(f"⚠️ Falha ao salvar cache de receitas: {e}")
+        with open(self._cache_path, "w", encoding="utf-8") as f:
+            json.dump(self._cache, f, indent=2)
 
-    # ===============================================================
-    # Carregar e normalizar uma receita TOML
-    # ===============================================================
-    def load(self, toml_path: str | Path):
-        toml_path = Path(toml_path)
-        if not toml_path.exists():
-            raise FileNotFoundError(f"Receita TOML não encontrada: {toml_path}")
+    # ----------------------------------------------------
+    # Carregamento de receita
+    # ----------------------------------------------------
+    def load(self, path: Union[str, Path]) -> Dict[str, Any]:
+        """Carrega uma receita TOML (ou YAML fallback) com cache e overlays."""
+        path = Path(path)
+        if not path.exists():
+            alt = path.with_suffix(".yaml")
+            if alt.exists():
+                path = alt
+            else:
+                raise FileNotFoundError(f"Recipe not found: {path}")
 
-        mtime = os.path.getmtime(toml_path)
-        cache_key = str(toml_path)
-        if cache_key in self.cache and self.cache[cache_key].get("mtime") == mtime:
-            return self.cache[cache_key]["data"]
+        file_hash = _hash_file(path)
+        if self._cache.get(str(path)) == file_hash:
+            log_event(path.name, "toml", "Cache hit")
+            with open(self.cache_dir / f"{path.stem}.json", "r", encoding="utf-8") as f:
+                return json.load(f)
 
-        with open(toml_path, "rb") as f:
-            data = tomllib.load(f)
-
-        recipe = self._process_includes(data, toml_path.parent)
-        recipe = self._apply_overlays(recipe)
+        log_event(path.name, "toml", "Parsing recipe...")
+        recipe = self._parse_file(path)
+        recipe = self._apply_includes(recipe, path.parent)
+        recipe = self._apply_overlay(recipe)
         recipe = self._normalize(recipe)
+        recipe = self._expand_env(recipe)
 
-        self.cache[cache_key] = {"mtime": mtime, "data": recipe}
+        # Salvar cache
+        with open(self.cache_dir / f"{path.stem}.json", "w", encoding="utf-8") as f:
+            json.dump(recipe, f, indent=2)
+        self._cache[str(path)] = file_hash
         self._save_cache()
+
         return recipe
 
-    # ===============================================================
-    # Includes (permite receitas modulares)
-    # ===============================================================
-    def _process_includes(self, data, base_dir):
-        includes = data.get("includes", [])
+    # ----------------------------------------------------
+    # Parsing
+    # ----------------------------------------------------
+    def _parse_file(self, path: Path) -> Dict[str, Any]:
+        try:
+            if path.suffix in (".yaml", ".yml"):
+                return _load_yaml(path)
+            with open(path, "rb") as f:
+                return tomllib.load(f)
+        except Exception as e:
+            log_global(f"Error parsing {path}: {e}", "error")
+            raise
+
+    # ----------------------------------------------------
+    # Includes
+    # ----------------------------------------------------
+    def _apply_includes(self, recipe: Dict[str, Any], base_dir: Path) -> Dict[str, Any]:
+        includes = recipe.get("includes", [])
         for inc in includes:
-            inc_path = Path(base_dir) / inc
+            inc_path = (base_dir / inc).resolve()
             if inc_path.exists():
-                with open(inc_path, "rb") as f:
-                    inc_data = tomllib.load(f)
-                data.update(inc_data)
-        return data
-
-    # ===============================================================
-    # Overlay (permite camadas locais sobre receitas base)
-    # ===============================================================
-    def _apply_overlays(self, recipe):
-        overlay_dir = Path("/etc/zeropkg/overlays")
-        overlay_file = overlay_dir / f"{recipe.get('package', {}).get('name', '')}.toml"
-        if overlay_file.exists():
-            log(f"🧩 Aplicando overlay local: {overlay_file}")
-            with open(overlay_file, "rb") as f:
-                overlay_data = tomllib.load(f)
-            recipe.update(overlay_data)
+                sub = self._parse_file(inc_path)
+                recipe = self._merge(recipe, sub)
         return recipe
 
-    # ===============================================================
-    # Normalização de estrutura
-    # ===============================================================
-    def _normalize(self, recipe):
-        pkg = recipe.get("package", {})
-        recipe["package"] = {
-            "name": pkg.get("name"),
-            "version": pkg.get("version"),
-            "description": pkg.get("description", ""),
+    # ----------------------------------------------------
+    # Overlay
+    # ----------------------------------------------------
+    def _apply_overlay(self, recipe: Dict[str, Any]) -> Dict[str, Any]:
+        pkg_name = recipe.get("package", {}).get("name")
+        overlay_dir = Path("/etc/zeropkg/overlays")
+        overlay_file = overlay_dir / f"{pkg_name}.toml"
+        if overlay_file.exists():
+            log_event(pkg_name, "toml", "Applying overlay")
+            overlay = self._parse_file(overlay_file)
+            recipe = self._merge(recipe, overlay)
+        return recipe
+
+    # ----------------------------------------------------
+    # Normalização e Validação
+    # ----------------------------------------------------
+    def _normalize(self, recipe: Dict[str, Any]) -> Dict[str, Any]:
+        defaults = {
+            "package": {"name": "unknown", "version": "0.0", "meta": {}},
+            "sources": [],
+            "patches": [],
+            "build": {"commands": [], "environment": {}, "variant": "default"},
+            "dependencies": [],
+            "hooks": {"pre_build": "", "post_build": "", "pre_install": "", "post_install": ""},
         }
 
-        if "sources" in recipe:
-            recipe["sources"] = [self._normalize_source(s) for s in recipe["sources"]]
+        merged = deepcopy(defaults)
+        merged = self._merge(merged, recipe)
 
-        if "patches" in recipe:
-            recipe["patches"] = [self._normalize_patch(p) for p in recipe["patches"]]
+        # Hooks
+        for hook_name, hook_path in merged["hooks"].items():
+            if hook_path and not _validate_hook(hook_path):
+                log_event(merged["package"]["name"], "validate", f"Invalid hook: {hook_path}", "warning")
 
-        if "build" in recipe:
-            recipe["build"]["commands"] = recipe["build"].get("commands", [])
-            recipe["build"]["environment"] = recipe["build"].get("environment", {})
+        # Variantes
+        variant = merged["build"].get("variant", "default")
+        if variant not in ["default", "minimal", "static", "debug"]:
+            log_event(merged["package"]["name"], "validate", f"Unknown variant '{variant}'", "warning")
 
-        if "hooks" in recipe:
-            for stage, cmds in recipe["hooks"].items():
-                if not isinstance(cmds, list):
-                    recipe["hooks"][stage] = [cmds]
+        # Patches
+        for patch in merged["patches"]:
+            if isinstance(patch, dict) and "url" in patch:
+                patch_path = Path(patch.get("file", ""))
+                if patch_path.exists() and "checksum" in patch:
+                    chksum = hashlib.sha256(patch_path.read_bytes()).hexdigest()
+                    if chksum != patch["checksum"]:
+                        log_event(merged["package"]["name"], "patch", f"Checksum mismatch: {patch_path}", "error")
 
-        if "dependencies" in recipe:
-            recipe["dependencies"] = self._normalize_deps(recipe["dependencies"])
+        return merged
 
-        self._validate(recipe)
-        return recipe
+    # ----------------------------------------------------
+    # Expansão de ambiente
+    # ----------------------------------------------------
+    def _expand_env(self, recipe: Dict[str, Any]) -> Dict[str, Any]:
+        env = os.environ.copy()
+        env.update(recipe.get("build", {}).get("environment", {}))
+        env.update({
+            "LFS": env.get("LFS", "/mnt/lfs"),
+            "SRC_DIR": "/usr/ports/distfiles",
+            "BUILD_DIR": "/usr/ports/build",
+            "PKG_NAME": recipe["package"]["name"],
+            "PKG_VERSION": recipe["package"]["version"],
+        })
+        return _expand_macros(recipe, env)
 
-    # ===============================================================
-    # Normalização individual de seções
-    # ===============================================================
-    def _normalize_source(self, source):
-        if isinstance(source, str):
-            source = {"url": source}
-        source.setdefault("method", self._infer_method(source.get("url", "")))
-        source.setdefault("extract_to", None)
-        return source
-
-    def _normalize_patch(self, patch):
-        if isinstance(patch, str):
-            patch = {"url": patch}
-        if "url" in patch and patch["url"].startswith(("http://", "https://")):
-            patch.setdefault("sha256", None)
-        return patch
-
-    def _normalize_deps(self, deps):
-        result = []
-        for d in deps:
-            if isinstance(d, str):
-                name, _, ver = d.partition(">=")
-                result.append({"name": name.strip(), "version": ver.strip() or None})
-            elif isinstance(d, dict):
-                result.append(d)
-        return result
-
-    def _infer_method(self, url):
-        if url.endswith(".git"):
-            return "git"
-        elif any(url.endswith(ext) for ext in [".tar.gz", ".tar.xz", ".zip", ".bz2"]):
-            return "archive"
-        elif url.startswith("file://"):
-            return "file"
-        return "unknown"
-
-    # ===============================================================
-    # Validação completa da receita
-    # ===============================================================
-    def _validate(self, recipe):
-        pkg = recipe.get("package", {})
-        if not pkg.get("name") or not pkg.get("version"):
-            raise ValueError("Campo obrigatório ausente: package.name ou package.version")
-
-        if not re.match(r"^[a-zA-Z0-9._+-]+$", pkg["name"]):
-            raise ValueError(f"Nome de pacote inválido: {pkg['name']}")
-
-        try:
-            version.Version(pkg["version"])
-        except Exception:
-            log(f"⚠️ Versão não semântica detectada em {pkg['name']}: {pkg['version']}")
-
-        if "sources" in recipe:
-            for s in recipe["sources"]:
-                if "url" not in s:
-                    raise ValueError(f"Fonte sem URL definida em {pkg['name']}")
-
-        if "dependencies" in recipe:
-            for dep in recipe["dependencies"]:
-                if not dep.get("name"):
-                    raise ValueError(f"Dependência sem nome em {pkg['name']}")
-
-    # ===============================================================
-    # Substituição de variáveis / macros
-    # ===============================================================
-    @staticmethod
-    def resolve_macros(value, env=None):
-        if not isinstance(value, str):
-            return value
-        env = env or os.environ
-        for k, v in env.items():
-            value = value.replace(f"${{{k}}}", v).replace(f"@{k}@", v)
-        return value
+    # ----------------------------------------------------
+    # Merge utilitário
+    # ----------------------------------------------------
+    def _merge(self, base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+        merged = deepcopy(base)
+        for k, v in overlay.items():
+            if isinstance(v, dict) and k in merged:
+                merged[k] = self._merge(merged[k], v)
+            else:
+                merged[k] = deepcopy(v)
+        return merged
 
 
-# ===============================================================
-# Função utilitária global (para compatibilidade com módulos antigos)
-# ===============================================================
-def resolve_macros(value, env=None):
-    return ZeropkgTOML.resolve_macros(value, env)
+# ========================================================
+# API pública
+# ========================================================
+_toml_loader = ZeropkgTOML()
+
+def load_recipe(path: Union[str, Path]) -> Dict[str, Any]:
+    return _toml_loader.load(path)
 
 
-# ===============================================================
-# Execução direta
-# ===============================================================
+# CLI simples para debug
 if __name__ == "__main__":
-    parser = ZeropkgTOML()
-    example = parser.load("/usr/ports/gcc/gcc-13.2.0.toml")
-    print(json.dumps(example, indent=2))
+    import sys, json
+    if len(sys.argv) < 2:
+        print("Usage: zeropkg_toml.py <recipe.toml>")
+        sys.exit(1)
+    data = load_recipe(sys.argv[1])
+    print(json.dumps(data, indent=2))
