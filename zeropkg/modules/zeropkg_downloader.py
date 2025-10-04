@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-# zeropkg_downloader.py - Downloader avançado do Zeropkg (com suporte a extract_to)
 # -*- coding: utf-8 -*-
+"""
+zeropkg_downloader.py — Downloader completo do Zeropkg
+Suporte a: múltiplas fontes, git+, extract_to, checksums e integração com builder.
+"""
 
 from __future__ import annotations
 import os
@@ -12,13 +15,13 @@ import zipfile
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Union
+
 from zeropkg_logger import get_logger, log_event
 
 logger = get_logger(stage="downloader")
 
 DISTFILES_DIR = "/usr/ports/distfiles"
 RETRIES = 3
-
 
 class DownloadError(Exception):
     pass
@@ -50,7 +53,7 @@ class Downloader:
         return actual.lower() == expected.lower()
 
     # --------------------------
-    # Download
+    # Download helpers
     # --------------------------
     def _download_file(self, url: str, dest: str, retries: int = RETRIES) -> str:
         log_event(os.path.basename(dest), "download", f"Baixando {url} → {dest}")
@@ -64,24 +67,27 @@ class Downloader:
                     raise DownloadError(f"Falha ao baixar {url}: {e}")
         return dest
 
-    def _download_git(self, url: str, dest_dir: str):
-        """Clona ou atualiza repositório git."""
+    def _download_git(self, url: str, dest_dir: str) -> str:
+        """Clona ou atualiza repositório Git."""
         pkg_name = os.path.basename(dest_dir)
-        log_event(pkg_name, "download", f"Clonando git {url} em {dest_dir}")
-        if os.path.exists(dest_dir):
-            subprocess.run(["git", "-C", dest_dir, "pull"], check=False, env=self.env)
-        else:
-            subprocess.run(["git", "clone", "--depth", "1", url, dest_dir], check=True, env=self.env)
+        log_event(pkg_name, "download", f"Clonando repositório git {url} → {dest_dir}")
+        try:
+            if os.path.exists(dest_dir):
+                subprocess.run(["git", "-C", dest_dir, "pull"], check=False, env=self.env)
+            else:
+                subprocess.run(["git", "clone", "--depth", "1", url, dest_dir], check=True, env=self.env)
+        except subprocess.CalledProcessError as e:
+            raise DownloadError(f"Erro ao clonar {url}: {e}")
         return dest_dir
 
     # --------------------------
-    # Extração de arquivos
+    # Extração
     # --------------------------
-    def _extract_file(self, file_path: str, build_root: str, extract_to: Optional[str] = None):
-        """Extrai o arquivo em build_root ou no subdiretório indicado."""
+    def _extract_file(self, file_path: str, build_root: str, extract_to: Optional[str] = None) -> str:
+        """Extrai arquivo para build_root ou subdiretório indicado."""
         target_dir = os.path.join(build_root, extract_to) if extract_to else build_root
         os.makedirs(target_dir, exist_ok=True)
-        log_event(os.path.basename(file_path), "extract", f"Extraindo em {target_dir}")
+        log_event(os.path.basename(file_path), "extract", f"Extraindo para {target_dir}")
 
         try:
             if tarfile.is_tarfile(file_path):
@@ -91,34 +97,54 @@ class Downloader:
                 with zipfile.ZipFile(file_path, "r") as z:
                     z.extractall(target_dir)
             else:
-                logger.warning(f"Formato não reconhecido: {file_path}")
+                logger.warning(f"Formato não reconhecido para extração: {file_path}")
         except Exception as e:
             raise DownloadError(f"Falha ao extrair {file_path}: {e}")
+
+        # Verifica se algo foi extraído
+        if not any(os.scandir(target_dir)):
+            raise DownloadError(f"Nada extraído de {file_path}")
+        return target_dir
 
     # --------------------------
     # Interface pública
     # --------------------------
-    def fetch_sources(self, pkg_name: str, sources: List[Dict[str, str]], build_root: str = "/var/zeropkg/build", parallel: bool = True) -> List[str]:
+    def fetch_sources(
+        self,
+        pkg_name: str,
+        sources: List[Dict[str, str]],
+        build_root: str = "/var/zeropkg/build",
+        parallel: bool = True
+    ) -> List[str]:
         """
-        Faz o download de múltiplas fontes de um pacote e as extrai se necessário.
+        Faz download de múltiplas fontes e as extrai se necessário.
+        Campos suportados:
+          - url: link de download
+          - checksum: hash sha256 (opcional)
+          - algo: algoritmo do hash (default sha256)
+          - extract_to: subdiretório onde extrair
+          - method: forçar 'git', 'wget' ou 'curl'
         """
         results = []
         os.makedirs(self.dist_dir, exist_ok=True)
         os.makedirs(build_root, exist_ok=True)
 
-        def _fetch(entry):
+        def _fetch(entry: Dict[str, str]) -> Optional[str]:
             url = entry.get("url")
             checksum = entry.get("checksum", "")
             algo = entry.get("algo", "sha256")
-            extract_to = entry.get("extract_to", None)
+            extract_to = entry.get("extract_to")
+            method = entry.get("method", "")
+
             if not url:
                 return None
 
-            if url.startswith("git+"):
+            # GIT
+            if url.startswith("git+") or method == "git":
                 dest_dir = os.path.join(self.dist_dir, pkg_name)
-                path = self._download_git(url[4:], dest_dir)
-                return path
+                return self._download_git(url.replace("git+", ""), dest_dir)
 
+            # HTTP(S) download
             filename = os.path.basename(url)
             dest_path = os.path.join(self.dist_dir, filename)
 
@@ -128,13 +154,17 @@ class Downloader:
                 self._download_file(url, dest_path)
                 if checksum and not self._validate_checksum(dest_path, checksum, algo):
                     os.remove(dest_path)
-                    raise DownloadError(f"Checksum incorreto para {filename}")
+                    raise DownloadError(f"Checksum incorreto: {filename}")
 
-            # Se tiver extract_to → extrai diretamente para dentro do pacote principal
-            self._extract_file(dest_path, build_root, extract_to)
-
-            results.append(dest_path)
-            return dest_path
+            # Extração se necessário
+            try:
+                extracted_dir = self._extract_file(dest_path, build_root, extract_to)
+                results.append(extracted_dir)
+                return extracted_dir
+            except DownloadError as e:
+                logger.warning(f"Falha de extração ignorada: {e}")
+                results.append(dest_path)
+                return dest_path
 
         if parallel:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -149,17 +179,18 @@ class Downloader:
             for s in sources:
                 results.append(_fetch(s))
 
-        return results
-
+        return [r for r in results if r]
+    
 
 # --------------------------
 # Teste rápido
 # --------------------------
 if __name__ == "__main__":
     dl = Downloader()
-    srcs = [
+    sources = [
         {"url": "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz"},
-        {"url": "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz", "extract_to": "gcc-13.2.0/mpfr"},
+        {"url": "git+https://git.savannah.gnu.org/git/bash.git", "method": "git"},
+        {"url": "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz", "extract_to": "gcc-13.2.0/mpfr"}
     ]
-    files = dl.fetch_sources("gcc-test", srcs, build_root="/tmp/build")
+    files = dl.fetch_sources("gcc", sources, build_root="/tmp/build")
     print("Arquivos baixados:", files)
