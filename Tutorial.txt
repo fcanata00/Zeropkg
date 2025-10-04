@@ -1,152 +1,366 @@
-# Zeropkg — Tutorial Completo (v2.0)
+Zeropkg - Gerenciador de Pacotes Source-Based
+=============================================
 
-## 1. Introdução
-Zeropkg é um gerenciador de pacotes source-based escrito em Python 3, projetado para construir, instalar e manter sistemas Linux From Scratch (LFS) ou distribuições baseadas em código-fonte.
-Ele faz o download, aplica patches, compila, instala e registra pacotes diretamente do código-fonte, com total rastreabilidade e controle.
-
-------------------------------------------------------------
-## 2. Estrutura de Diretórios
-/usr/lib/zeropkg/modules  -> Módulos principais (builder, installer, deps, etc.)
-/usr/bin/zeropkg          -> Executável principal
-/usr/ports                -> Repositório de receitas
-/usr/ports/distfiles      -> Cache de downloads
-/var/zeropkg/build        -> Diretório temporário de build
-/var/lib/zeropkg          -> Banco de dados SQLite
-/var/zeropkg/packages     -> Cache de binários
-/var/log/zeropkg          -> Logs detalhados
-/etc/zeropkg/config.toml  -> Configuração global
-/mnt/lfs                  -> Diretório LFS (opcional)
+Versão: 1.0
+Licença: GPLv3
+Autor: Projeto Zeropkg
+Executável: /usr/bin/zeropkg
+Módulos: /usr/lib/zeropkg/modules/
 
 ------------------------------------------------------------
-## 3. Instalação
-Dependências do sistema:
-sudo apt install python3 python3-pip git wget tar patch fakeroot sqlite3
+1. DESCRIÇÃO
+------------------------------------------------------------
+Zeropkg é um gerenciador de pacotes baseado em código-fonte (source-based)
+escrito em Python 3, projetado para construir e manter sistemas Linux From Scratch (LFS)
+e Beyond LFS (BLFS).
 
-Bibliotecas Python:
-sudo pip3 install requests beautifulsoup4 tomli
-
-Instalação automática:
-sudo bash install_zeropkg.sh
-
-Esse script:
-- Cria diretórios e instala módulos
-- Instala /usr/bin/zeropkg
-- Gera /etc/zeropkg/config.toml
-- Clona automaticamente o repositório de ports em /usr/ports
+Ele compila pacotes a partir de receitas (.toml), resolve dependências, instala em chroot seguro,
+gera logs, e mantém um banco de dados completo de pacotes instalados.
 
 ------------------------------------------------------------
-## 4. Arquivo de Configuração (/etc/zeropkg/config.toml)
+2. DEPENDÊNCIAS DO SISTEMA
+------------------------------------------------------------
+Necessárias:
+  Python 3.10+
+  fakeroot
+  git
+  rsync
+  wget ou curl
+  tar, xz, gzip, bzip2
+  make, gcc, g++
+  coreutils, findutils
+  diffutils, file, patch
+  sqlite3
+
+Recomendadas:
+  graphviz (para grafo de dependências)
+  bison, flex (para compilações avançadas)
+  sudo (para integração com sistema host)
+
+------------------------------------------------------------
+3. ESTRUTURA DE DIRETÓRIOS
+------------------------------------------------------------
+/usr/lib/zeropkg/modules/        -> Módulos Python
+/usr/ports/                      -> Repositório de receitas
+/usr/ports/distfiles/            -> Fontes baixadas (.tar.xz)
+/var/lib/zeropkg/                -> Dados e estado
+/var/lib/zeropkg/logs/           -> Logs de instalação/construção
+/var/lib/zeropkg/build-logs/     -> Logs detalhados de build
+/etc/zeropkg/config.toml         -> Configuração global
+/usr/bin/zeropkg                 -> Executável CLI principal
+
+------------------------------------------------------------
+4. CONFIGURAÇÃO PADRÃO (/etc/zeropkg/config.toml)
+------------------------------------------------------------
 [paths]
+state_dir = "/var/lib/zeropkg"
+build_dir = "/var/zeropkg/build"
+backup_dir = "/var/lib/zeropkg/backups"
 db_path = "/var/lib/zeropkg/installed.sqlite3"
-ports_dir = "/usr/ports"
-build_root = "/var/zeropkg/build"
-cache_dir = "/usr/ports/distfiles"
-packages_dir = "/var/zeropkg/packages"
+log_dir = "/var/lib/zeropkg/logs"
+repo_dir = "/usr/ports"
 
-[options]
-jobs = 4
+[install]
 fakeroot = true
-chroot_enabled = true
-auto_clean = true
-log_level = "INFO"
+safe_chroot = true
 
 [repos]
-main = "https://github.com/fcanata00/Zeropkg-Ports.git"
-testing = "https://github.com/fcanata00/Zeropkg-Testing.git"
-local = "/mnt/repos/zeropkg-local"
-
-[network]
-proxy = ""
-verify_ssl = true
-retries = 3
-timeout = 30
-
-[lfs]
-root = "/mnt/lfs"
-chroot_shell = "/bin/bash"
-user = "lfs"
-group = "lfs"
+core = "https://github.com/fcanata00/Zeropkg-core.git"
+extra = "https://github.com/fcanata00/Zeropkg-extra.git"
 
 ------------------------------------------------------------
-## 5. Comandos Principais (CLI)
-zeropkg --help                     -> Exibe ajuda
-zeropkg --sync                     -> Atualiza repositórios
-zeropkg --update                   -> Verifica novas versões
-zeropkg --upgrade                  -> Atualiza pacotes instalados
-zeropkg -b, --build <pacote>       -> Compila um pacote
-zeropkg -i, --install <pacote>     -> Instala um pacote e dependências
-zeropkg -r, --remove <pacote>      -> Remove um pacote com hooks
-zeropkg --depclean                 -> Remove dependências órfãs
-zeropkg --revdep                   -> Repara dependências quebradas
-zeropkg --info <pacote>            -> Mostra informações
-zeropkg --search <nome>            -> Pesquisa pacotes
-zeropkg --lfs-bootstrap --root /mnt/lfs -> Constrói toolchain LFS
-zeropkg --lfs-bootstrap --root /mnt/lfs -b binutils-2.43.1-pass1
-zeropkg -b binutils --variant pass1 --root /mnt/lfs
-zeropkg --root /mnt/lfs --chroot -b binutils-2.43.1
-zeropkg lfs-bootstrap binutils-pass1 gcc-pass1 linux-headers glibc binutils gcc
+5. COMANDOS DO ZEROPKG
+------------------------------------------------------------
 
-Todos os comandos aceitam --dry-run e abreviações (-b, -i, -r).
+Zeropkg suporta tanto subcomandos quanto abreviações curtas (-x)
+e longas (--xxx). Todos os comandos aceitam --dry-run (-n).
 
 ------------------------------------------------------------
-## 6. Estrutura de Receitas (TOML)
-[source]
-urls = [
-    "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz",
-    "https://mirror.kernel.org/gnu/binutils/binutils-2.43.1.tar.xz"
-]
-sha256 = "abc123..."
-format = "tar.xz"
+5.1 Construção de pacotes
+------------------------------------------------------------
+Subcomando:
+  zeropkg build <pacote>
+Abreviações:
+  zeropkg -b <pacote>
 
-[build]
-dependencies = ["gcc", "glibc"]
-commands = [
-    "./configure --prefix=/usr",
-    "make -j4",
-    "make check",
-    "make install"
-]
-env = { "CFLAGS" = "-O2 -pipe" }
+Opções:
+  --dry-run, -n    -> Simula construção
+  --full-build, -f -> Constrói com dependências recursivas
 
-[hooks]
-pre_configure = "scripts/pre.sh"
-post_install  = "scripts/post.sh"
+Exemplos:
+  zeropkg build bash
+  zeropkg -b gcc
+  zeropkg -b glibc -n
+  zeropkg build gcc --full-build
+
+------------------------------------------------------------
+5.2 Instalação de pacotes
+------------------------------------------------------------
+Subcomando:
+  zeropkg install <pacote>
+Abreviações:
+  zeropkg -i <pacote>
+
+Opções:
+  --dry-run, -n    -> Simula instalação
+  --parallel, -p   -> Instala múltiplos pacotes em paralelo
+
+Exemplos:
+  zeropkg install bash
+  zeropkg -i coreutils gcc
+  zeropkg -i vim -n
+  zeropkg install bash coreutils --parallel
+
+------------------------------------------------------------
+5.3 Remoção de pacotes
+------------------------------------------------------------
+Subcomando:
+  zeropkg remove <pacote>
+Abreviações:
+  zeropkg -r <pacote>
+
+Opções:
+  --dry-run, -n
+
+Exemplos:
+  zeropkg remove nano
+  zeropkg -r make -n
+
+------------------------------------------------------------
+5.4 Atualização de pacotes
+------------------------------------------------------------
+Subcomando:
+  zeropkg upgrade [<pacote>]
+Abreviações:
+  zeropkg -u [<pacote>]
+
+Opções:
+  --dry-run, -n
+  --force, -F
+
+Exemplos:
+  zeropkg upgrade
+  zeropkg -u
+  zeropkg -u bash glibc
+  zeropkg upgrade gcc --dry-run
+  zeropkg -u bash -F
+
+------------------------------------------------------------
+5.5 Atualização de metadados (upstream)
+------------------------------------------------------------
+Subcomando:
+  zeropkg update
+Abreviações:
+  zeropkg -U
+
+Exemplo:
+  zeropkg update
+  zeropkg -U -n
+
+------------------------------------------------------------
+5.6 Sincronização de repositórios
+------------------------------------------------------------
+Subcomando:
+  zeropkg sync
+Abreviações:
+  zeropkg -s
+
+Exemplo:
+  zeropkg sync
+  zeropkg -s
+
+------------------------------------------------------------
+5.7 Limpeza de dependências órfãs
+------------------------------------------------------------
+Subcomando:
+  zeropkg depclean
+Abreviações:
+  zeropkg -c
+
+Opções:
+  --dry-run, -n
+  --parallel, -p
+
+Exemplo:
+  zeropkg depclean
+  zeropkg -c -n
+
+------------------------------------------------------------
+5.8 Dependências reversas
+------------------------------------------------------------
+Subcomando:
+  zeropkg revdep <pacote>
+Abreviações:
+  zeropkg -R <pacote>
+
+Exemplo:
+  zeropkg revdep glibc
+  zeropkg -R bash
+
+------------------------------------------------------------
+5.9 Informações de pacotes
+------------------------------------------------------------
+Subcomando:
+  zeropkg info <pacote>
+Abreviações:
+  zeropkg -I <pacote>
+
+Exemplo:
+  zeropkg info coreutils
+  zeropkg -I gcc
+
+------------------------------------------------------------
+5.10 Grafo de dependências
+------------------------------------------------------------
+Subcomando:
+  zeropkg graph-deps [--output arquivo.dot]
+Abreviações:
+  zeropkg -g [arquivo.dot]
+
+Exemplo:
+  zeropkg graph-deps
+  zeropkg -g /tmp/deps.dot
+  dot -Tpng /tmp/deps.dot -o deps.png
+
+------------------------------------------------------------
+5.11 Construção completa (full-build)
+------------------------------------------------------------
+Subcomando:
+  zeropkg full-build [<pacote>]
+Abreviações:
+  zeropkg -f [<pacote>]
+
+Opções:
+  --dry-run, -n
+
+Exemplos:
+  zeropkg full-build world
+  zeropkg -f bash
+  zeropkg -f gcc -n
+
+------------------------------------------------------------
+5.12 Rollback automático
+------------------------------------------------------------
+Subcomando:
+  zeropkg rollback <pacote>
+Sem abreviação curta (ainda).
+
+Exemplo:
+  zeropkg rollback bash
+
+------------------------------------------------------------
+6. RECEITAS (.toml)
+------------------------------------------------------------
+Exemplo completo:
 
 [package]
-description = "GNU Binutils — ferramentas de montagem e linkagem"
-category = "devel"
-license = "GPL-3.0"
-maintainer = "Você <email@dominio>"
+name = "binutils"
+version = "2.43.1"
+description = "GNU assembler, linker, binary utilities"
+
+[source]
+urls = [
+  "https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz"
+]
+sha256 = "d5b7b1b2a..."
+extract_to = "binutils-2.43.1"
+
+[build]
+depends = ["gcc", "glibc"]
+configure = ["./configure --prefix=/usr --enable-gold --enable-ld=default"]
+compile = ["make -j$(nproc)"]
+install = ["make install"]
+
+[hooks]
+pre_install = ["echo 'Installing binutils'"]
+post_install = ["ldconfig"]
+
+[environment]
+CC = "gcc"
+CXX = "g++"
+CFLAGS = "-O2 -pipe"
 
 ------------------------------------------------------------
-## 7. Exemplo: Construção LFS Toolchain
-1. Crie o diretório:
-   sudo mkdir -pv /mnt/lfs
-2. Monte as partições e defina LFS:
+7. CONSTRUINDO O LFS COM ZEROPKG
+------------------------------------------------------------
+1. Monte o ambiente LFS:
    export LFS=/mnt/lfs
+   mkdir -pv $LFS/{sources,tools,etc}
+   mount -v --bind /dev $LFS/dev
+   mount -v --bind /proc $LFS/proc
+   mount -v --bind /sys $LFS/sys
+   cp -v /etc/resolv.conf $LFS/etc/
+
+2. Configure o Zeropkg:
+   vim /etc/zeropkg/config.toml
+   [paths]
+   build_dir = "/mnt/lfs/var/zeropkg/build"
+   state_dir = "/mnt/lfs/var/lib/zeropkg"
+
 3. Sincronize o repositório:
-   zeropkg --sync
-4. Construa a toolchain:
-   zeropkg --lfs-bootstrap --root /mnt/lfs
+   zeropkg sync
 
-O Zeropkg montará o chroot, configurará o ambiente seguro e construirá as fases:
-   binutils-pass1 → gcc-pass1 → glibc → binutils-final → gcc-final ...
+4. Construa o toolchain:
+   zeropkg -f binutils-pass1 --dry-run
+   zeropkg -f gcc-pass1
+   zeropkg -f glibc
 
-------------------------------------------------------------
-## 8. Logs e Banco de Dados
-Logs detalhados: /var/log/zeropkg/
-Banco de dados SQLite: /var/lib/zeropkg/installed.sqlite3
-
-Use:
-sqlite3 /var/lib/zeropkg/installed.sqlite3
-.tables
+5. Continue o sistema base:
+   zeropkg -f bash
+   zeropkg -f coreutils
+   zeropkg -f findutils
 
 ------------------------------------------------------------
-## 9. Desinstalação
-Para remover completamente o Zeropkg (opcional):
-sudo rm -rf /usr/lib/zeropkg /usr/bin/zeropkg /etc/zeropkg /var/lib/zeropkg /var/zeropkg
+8. LOGS E AUDITORIA
+------------------------------------------------------------
+Logs de texto:
+  /var/lib/zeropkg/logs/zeropkg.log
+
+Logs JSON:
+  /var/lib/zeropkg/logs/<pacote>-install.json
+
+Build logs:
+  /var/lib/zeropkg/build-logs/<pacote>.log
 
 ------------------------------------------------------------
-## 10. Conclusão
-O Zeropkg é uma ferramenta poderosa e modular que oferece controle total sobre o sistema e a construção de pacotes a partir do código-fonte.
-Totalmente integrado com LFS e repositórios Git, é ideal para aprendizado, automação e desenvolvimento de distribuições personalizadas.
+9. COMANDOS RESUMIDOS
+------------------------------------------------------------
+-b / --build          Construir pacotes
+-i / --install        Instalar pacotes
+-r / --remove         Remover pacotes
+-u / --upgrade        Atualizar pacotes
+-U / --update         Verificar atualizações upstream
+-s / --sync           Sincronizar repositórios
+-c / --depclean       Limpar dependências órfãs
+-R / --revdep         Mostrar dependências reversas
+-I / --info           Mostrar info do pacote
+-g / --graph-deps     Gerar grafo de dependências
+-f / --full-build     Construção completa
+-n / --dry-run        Simular execução
+-p / --parallel       Paralelizar instalação
+-F / --force          Forçar operação
+
+------------------------------------------------------------
+10. EXEMPLOS RÁPIDOS
+------------------------------------------------------------
+zeropkg -b bash
+zeropkg -i bash
+zeropkg -r bash
+zeropkg -u
+zeropkg -U
+zeropkg -s
+zeropkg -c
+zeropkg -R glibc
+zeropkg -I gcc
+zeropkg -g /tmp/graph.dot
+zeropkg -f world
+zeropkg -b bash -n
+zeropkg -i coreutils -p
+zeropkg upgrade gcc --force
+
+------------------------------------------------------------
+11. SUPORTE E CONTATO
+------------------------------------------------------------
+Repositório oficial: https://github.com/fcanata00/Zeropkg
+Autor: Francisco Canata
+Licença: GPLv3
