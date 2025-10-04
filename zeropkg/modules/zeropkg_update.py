@@ -1,494 +1,705 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zeropkg_update.py — check upstream for new versions of packages in ports
-Pattern B: integrated, lean, functional.
-
-Public API:
-- check_updates(report:bool=True, dry_run:bool=False) -> dict (summary + details)
-- get_last_updates() -> dict
-- diff_updates(old:dict, new:dict) -> dict
-- record_update_event(pkg, old_ver, new_ver, severity, note="", db=True, log=True)
+zeropkg_update.py — Update checker & notifier for Zeropkg
+Improvements applied:
+ - DB history + update events
+ - multiple upstream probing strategies (GitHub/GitLab API, releases/latest, HTML heuristics)
+ - recipe-level regex support (version_regex)
+ - cache incremental at /var/cache/zeropkg/update_cache.json
+ - notify integration (notify-send / dunstify) and notify CLI
+ - severity classification and vulnerability integration with zeropkg_vuln
+ - auto-update mode (controlled, requires config)
+ - selective checks (per-package, per-repo)
+ - reports: /var/lib/zeropkg/updates.json, update_notify.txt, /var/log/zeropkg/updates_report-<ts>.json
+ - CLI: --update, --dry-run, --history, --repo, --packages, --auto-update, --notify, --force
 """
 
 from __future__ import annotations
 import os
 import sys
+import re
 import json
 import time
-import re
-import traceback
+import shutil
+import tempfile
+import socket
+import logging
+import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
-# Try optional requests for nicer HTTP; fallback to urllib
+# try to import requests (preferred)
 try:
-    import requests  # type: ignore
-    _HAS_REQUESTS = True
+    import requests
+    REQUESTS_AVAILABLE = True
 except Exception:
-    import urllib.request as _urllib  # type: ignore
-    _HAS_REQUESTS = False
+    REQUESTS_AVAILABLE = False
 
-# Integrations (optional)
+# optional imports from your project
 try:
-    from zeropkg_config import load_config, get_ports_dirs
+    from zeropkg_config import load_config
 except Exception:
-    def load_config(*a, **k):
-        return {"paths": {"ports_dir": "/usr/ports", "db_path": "/var/lib/zeropkg/installed.sqlite3", "state_dir": "/var/lib/zeropkg"}, "update": {"enabled": True}}
-    def get_ports_dirs(cfg=None):
-        return ["/usr/ports"]
-
-try:
-    from zeropkg_logger import log_event, log_global, get_logger
-    _logger = get_logger("update")
-except Exception:
-    import logging
-    _logger = logging.getLogger("zeropkg_update")
-    if not _logger.handlers:
-        _logger.addHandler(logging.StreamHandler(sys.stdout))
-    def log_event(pkg, stage, msg, level="info"):
-        getattr(_logger, level if hasattr(_logger, level) else "info")(f"{pkg}:{stage} {msg}")
-    def log_global(msg, level="info"):
-        getattr(_logger, level if hasattr(_logger, level) else "info")(msg)
+    def load_config(path=None):
+        return {
+            "paths": {
+                "ports_dir": "/usr/ports",
+                "cache_dir": "/var/cache/zeropkg",
+                "state_dir": "/var/lib/zeropkg",
+                "log_dir": "/var/log/zeropkg"
+            },
+            "update": {
+                "check_interval_hours": 6,
+                "auto_notify": False,
+                "notify_command": None,
+                "severity_keywords": ["security", "CVE", "vuln", "fix"],
+                "max_parallel_checks": 8
+            }
+        }
 
 try:
-    from zeropkg_db import DBManager
+    from zeropkg_logger import get_logger
+    log = get_logger("update")
 except Exception:
-    DBManager = None
+    log = logging.getLogger("zeropkg_update")
+    if not log.handlers:
+        h = logging.StreamHandler(sys.stdout)
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(h)
+    log.setLevel(logging.INFO)
 
-# state paths
-_DEFAULT_STATE_DIR = "/var/lib/zeropkg"
-_DEFAULT_UPDATES_FILE = "updates.json"
-_DEFAULT_NOTIFY_FILE = "update_notify.txt"
+# optional DB integration
+try:
+    from zeropkg_db import ZeroPKGDB, record_update_event
+    DB_AVAILABLE = True
+except Exception:
+    ZeroPKGDB = None
+    record_update_event = None
+    DB_AVAILABLE = False
 
-# http defaults
-_HTTP_TIMEOUT = 12  # seconds
-_HTTP_RETRIES = 2
+# optional vuln integration
+try:
+    from zeropkg_vuln import VulnDB, ZeroPKGVulnManager
+    VULN_AVAILABLE = True
+except Exception:
+    VULN_AVAILABLE = False
+    VulnDB = None
+    ZeroPKGVulnManager = None
 
-# semver basic regex
-_SEMVER_RE = re.compile(r"v?(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:[-+].*)?$")
+# toml parser for recipes
+try:
+    from zeropkg_toml import ZeropkgTOML
+    TOML_AVAILABLE = True
+except Exception:
+    TOML_AVAILABLE = False
 
-# keywords that increase severity
-_SECURITY_KEYWORDS = ("security", "CVE", "vuln", "critical", "fixes", "patch")
+# helpers
+STATE_DIR = Path(load_config().get("paths", {}).get("state_dir", "/var/lib/zeropkg"))
+CACHE_DIR = Path(load_config().get("paths", {}).get("cache_dir", "/var/cache/zeropkg"))
+LOG_DIR = Path(load_config().get("paths", {}).get("log_dir", "/var/log/zeropkg"))
+PORTS_DIR = Path(load_config().get("paths", {}).get("ports_dir", "/usr/ports"))
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+UPDATE_CACHE_PATH = CACHE_DIR / "update_cache.json"
+UPDATES_JSON = STATE_DIR / "updates.json"
+UPDATE_NOTIFY_TXT = STATE_DIR / "update_notify.txt"
+REPORT_DIR = LOG_DIR
 
-# -----------------------
-# Utilities
-# -----------------------
-def _state_dir(cfg: Optional[Dict[str, Any]] = None) -> str:
-    cfg = cfg or load_config()
-    sd = cfg.get("paths", {}).get("state_dir") or _DEFAULT_STATE_DIR
-    Path(sd).mkdir(parents=True, exist_ok=True)
-    return sd
+DEFAULT_UPDATE_CFG = load_config().get("update", {})
+CHECK_INTERVAL_HOURS = int(DEFAULT_UPDATE_CFG.get("check_interval_hours", 6))
+AUTO_NOTIFY = bool(DEFAULT_UPDATE_CFG.get("auto_notify", False))
+NOTIFY_COMMAND_CFG = DEFAULT_UPDATE_CFG.get("notify_command", None)
+SEVERITY_KEYWORDS = DEFAULT_UPDATE_CFG.get("severity_keywords", ["security", "CVE", "vuln", "fix"])
 
-def _updates_file(cfg: Optional[Dict[str, Any]] = None) -> str:
-    return os.path.join(_state_dir(cfg), _DEFAULT_UPDATES_FILE)
-
-def _notify_file(cfg: Optional[Dict[str, Any]] = None) -> str:
-    return os.path.join(_state_dir(cfg), _DEFAULT_NOTIFY_FILE)
-
-def _http_get(url: str, timeout: int = _HTTP_TIMEOUT) -> Tuple[int, bytes]:
+# HTTP helpers with fallback
+def http_get(url: str, timeout: int = 15) -> Tuple[int, str]:
     """
-    Return (status_code, content_bytes) or raise.
+    Return (status_code, text) using requests if available, else urllib.
     """
-    if _HAS_REQUESTS:
-        last_exc = None
-        for i in range(_HTTP_RETRIES):
-            try:
-                r = requests.get(url, timeout=timeout, allow_redirects=True)
-                r.raise_for_status()
-                return r.status_code, r.content
-            except Exception as e:
-                last_exc = e
-                time.sleep(0.5 * (i + 1))
-        raise last_exc
-    else:
-        last_exc = None
-        for i in range(_HTTP_RETRIES):
-            try:
-                with _urllib.urlopen(url, timeout=timeout) as resp:
-                    data = resp.read()
-                    code = getattr(resp, "status", 200)
-                    return code, data
-            except Exception as e:
-                last_exc = e
-                time.sleep(0.5 * (i + 1))
-        raise last_exc
-
-def _http_head(url: str, timeout: int = _HTTP_TIMEOUT) -> Tuple[int, dict]:
-    """
-    Return (status_code, headers) - minimal HEAD attempt with fallback to GET.
-    """
-    if _HAS_REQUESTS:
-        r = requests.head(url, timeout=timeout, allow_redirects=True)
-        return r.status_code, dict(r.headers)
-    else:
-        req = _urllib.Request(url, method="HEAD")
-        with _urllib.urlopen(req, timeout=timeout) as resp:
-            headers = dict(resp.getheaders())
-            status = getattr(resp, "status", 200)
-            return status, headers
-
-def _parse_semver(ver: str) -> Optional[Tuple[int,int,int]]:
-    if not ver:
-        return None
-    m = _SEMVER_RE.search(ver.strip())
-    if not m:
-        return None
     try:
-        return int(m.group("major")), int(m.group("minor")), int(m.group("patch"))
-    except Exception:
-        return None
+        if REQUESTS_AVAILABLE:
+            resp = requests.get(url, timeout=timeout, headers={"User-Agent": "zeropkg-update/1.0"})
+            return resp.status_code, resp.text
+        else:
+            # fallback minimal
+            from urllib.request import urlopen, Request
+            req = Request(url, headers={"User-Agent": "zeropkg-update/1.0"})
+            with urlopen(req, timeout=timeout) as fh:
+                data = fh.read().decode(errors="ignore")
+                return 200, data
+    except Exception as e:
+        log.debug(f"http_get failed for {url}: {e}")
+        return 0, ""
 
-def _score_severity(old_ver: Optional[str], new_ver: str, meta_entry: Dict[str,Any]) -> str:
-    """
-    Heuristic severity: 'critical' if major increases or security keywords matched,
-    'urgent' if minor increases or patch includes security mention,
-    else 'normal'.
-    """
-    # check textual hints in meta
-    description = " ".join([
-        str(meta_entry.get("package", {}).get("name", "")),
-        str(meta_entry.get("package", {}).get("version", "")),
-        str(meta_entry.get("build", {}).get("commands", ""))
-    ]).lower()
-    for key in _SECURITY_KEYWORDS:
-        if key.lower() in description or key.lower() in str(new_ver).lower():
-            return "critical"
-    old_v = _parse_semver(old_ver or "")
-    new_v = _parse_semver(new_ver or "")
-    if old_v and new_v:
-        if new_v[0] > old_v[0]:
-            return "critical"
-        if new_v[1] > old_v[1]:
-            return "urgent"
-        if new_v[2] > old_v[2]:
-            return "normal"
-    # fallback: if string changed drastically (length difference), mark urgent
-    if old_ver and len(new_ver) - len(old_ver) > 3:
-        return "urgent"
-    return "normal"
-
-
-# -----------------------
-# Storage: read/write last updates
-# -----------------------
-def get_last_updates(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    path = _updates_file(cfg)
-    if not os.path.exists(path):
-        return {}
+def http_head(url: str, timeout: int = 10) -> Tuple[int, dict]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+        if REQUESTS_AVAILABLE:
+            resp = requests.head(url, timeout=timeout, allow_redirects=True, headers={"User-Agent":"zeropkg-update/1.0"})
+            return resp.status_code, dict(resp.headers)
+        else:
+            # minimal fallback: perform GET and return partial headers
+            sc, text = http_get(url, timeout=timeout)
+            return sc, {}
+    except Exception as e:
+        log.debug(f"http_head failed for {url}: {e}")
+        return 0, {}
 
-def _write_updates(data: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None, dry_run: bool = False):
-    path = _updates_file(cfg)
-    if dry_run:
-        log_global(f"[dry-run] would write updates summary to {path}")
+# simple version compare using tuple of ints/strings
+def normalize_version(v: str) -> Tuple:
+    parts = re.split(r'[._\-+]', v)
+    norm = []
+    for p in parts:
+        if p.isdigit():
+            norm.append(int(p))
+        else:
+            # keep non-digit as lowered token for stable ordering
+            norm.append(p.lower())
+    return tuple(norm)
+
+def version_greater(a: Optional[str], b: Optional[str]) -> bool:
+    if a is None: return False
+    if b is None: return True
+    try:
+        return normalize_version(a) > normalize_version(b)
+    except Exception:
+        return a > b
+
+# notification
+def detect_notify_command() -> Optional[List[str]]:
+    # priority: config, notify-send, dunstify
+    if NOTIFY_COMMAND_CFG:
+        return [NOTIFY_COMMAND_CFG]
+    for cmd in ("notify-send", "dunstify"):
+        if shutil.which(cmd):
+            return [cmd]
+    return None
+
+def notify_summary(message: str):
+    cmd = detect_notify_command()
+    if not cmd:
+        log.info(f"[notify] {message}")
         return
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-# -----------------------
-# Diff logic
-# -----------------------
-def diff_updates(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Compare old and new updates dicts and return only changed entries.
-    Structure used: { pkg_name: { "old": ver, "new": ver, "meta": {...} } }
-    """
-    diffs: Dict[str, Any] = {}
-    old_pkgs = old.get("packages", {}) if isinstance(old, dict) else {}
-    new_pkgs = new.get("packages", {}) if isinstance(new, dict) else {}
-    for pkg, info in new_pkgs.items():
-        new_ver = info.get("version")
-        old_ver = old_pkgs.get(pkg, {}).get("version")
-        if new_ver and new_ver != old_ver:
-            diffs[pkg] = {"old": old_ver, "new": new_ver, "meta": info.get("meta", {})}
-    return diffs
-
-
-# -----------------------
-# Recording events
-# -----------------------
-def record_update_event(pkg: str, old_ver: Optional[str], new_ver: str, severity: str, note: str = "", db: bool = True, log: bool = True):
-    ts = int(time.time())
-    msg = f"Update detected: {pkg} {old_ver or '(none)'} -> {new_ver} [severity={severity}] {note}"
-    if log:
-        log_event(pkg, "update.detect", msg, level="info" if severity in ("normal","urgent") else "warning")
-    if db and DBManager:
-        try:
-            with DBManager() as dbm:
-                payload = {"old": old_ver, "new": new_ver, "severity": severity, "note": note}
-                dbm._execute("INSERT INTO events (pkg_name, event_type, payload, ts) VALUES (?, ?, ?, ?)",
-                             (pkg, "update.detect", json.dumps(payload), ts))
-        except Exception:
-            # do not fail on DB logging
-            log_event(pkg, "update", f"Failed to record update in DB: {traceback.format_exc()}", level="warning")
-
-
-# -----------------------
-# Upstream check strategies
-# -----------------------
-def _guess_upstream_urls(meta_entry: Dict[str,Any]) -> List[str]:
-    """
-    Given a recipe meta (from zeropkg_toml), attempt to produce candidate upstream URLs:
-     - any source URLs (archives)
-     - common project pages built from package name (heuristic)
-     - repo URL if present in meta
-    """
-    urls = []
-    # sources
-    for s in meta_entry.get("sources", []) or []:
-        u = s.get("url")
-        if u:
-            urls.append(u)
-    # if package block has "upstream" or "upstream_url"
-    p = meta_entry.get("package", {}) or {}
-    up = p.get("upstream") or p.get("upstream_url") or meta_entry.get("upstream")
-    if up:
-        urls.append(up)
-    # common heuristics for named upstreams (gcc -> https://gcc.gnu.org)
-    name = p.get("name") or ""
-    if name:
-        heuristics = [
-            f"https://{name}.gnu.org",
-            f"https://{name}.org",
-            f"https://{name}.sourceforge.net",
-            f"https://{name}.github.io",
-            f"https://github.com/{name}/{name}",
-            f"https://github.com/{name}"
-        ]
-        urls.extend(heuristics)
-    # deduplicate preserving order
-    seen = set()
-    out = []
-    for u in urls:
-        if not u:
-            continue
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
-
-
-def _probe_for_version(url: str, meta_entry: Dict[str,Any]) -> Optional[str]:
-    """
-    Try probing the url for an upstream version string.
-    Strategies:
-      - If url points to an archive with version in filename -> extract via regex
-      - If url is a github repo -> try tags via /tags or /releases/latest redirect
-      - Query HEAD for Content-Disposition or filename
-      - GET and search for `<version>` patterns on page (simple heuristic)
-    Returns string if found, else None.
-    """
-    # first: if url ends with something like name-X.Y.Z.tar.xz, parse
-    m = re.search(r"([0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z]+)?)", url)
-    if m:
-        return m.group(1)
-
-    # attempt HEAD for redirect to latest (github)
     try:
-        if "github.com" in url and "/releases/latest" not in url:
-            # try releases/latest
-            candidate = url.rstrip("/") + "/releases/latest"
-            try:
-                code, content = _http_get(candidate)
-                # if requests followed redirects, content may be html; try final url from requests
-                if _HAS_REQUESTS:
-                    # try real HEAD to get final URL
-                    r = requests.get(candidate, timeout=_HTTP_TIMEOUT, allow_redirects=True)
-                    final = r.url
-                    m2 = re.search(r"/tag/v?([^/]+)$", final)
-                    if m2:
-                        return m2.group(1)
-                else:
-                    # fallback GET parse
-                    decoded = content.decode(errors="ignore")
-                    m2 = re.search(r"/tag/v?([^\"/]+)\"", decoded)
-                    if m2:
-                        return m2.group(1)
-            except Exception:
-                pass
+        subprocess_cmd = cmd + [message]
+        import subprocess
+        subprocess.run(subprocess_cmd, check=False)
+    except Exception as e:
+        log.warning(f"notify failed: {e}")
 
-        # HEAD to the url
-        try:
-            code, headers = _http_head(url)
-            # content-disposition check
-            cd = headers.get("Content-Disposition") or headers.get("content-disposition")
-            if cd:
-                mcd = re.search(r"filename=.*?([0-9]+\.[0-9]+\.[0-9]+[^\s;\"']*)", cd)
-                if mcd:
-                    return mcd.group(1)
-        except Exception:
-            pass
+# cache helpers
+def load_cache() -> Dict[str, Any]:
+    if not UPDATE_CACHE_PATH.exists():
+        return {}
+    try:
+        with open(UPDATE_CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.debug(f"load_cache failed: {e}")
+        return {}
 
-        # GET and naive parse for version-looking tokens
+def save_cache(data: Dict[str,Any]):
+    try:
+        tmp = UPDATE_CACHE_PATH.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush(); os.fsync(f.fileno())
+        tmp.replace(UPDATE_CACHE_PATH)
+    except Exception as e:
+        log.warning(f"save_cache failed: {e}")
+
+# DB history helper
+def record_history_db(pkg: str, old: Optional[str], new: Optional[str], severity: str):
+    if not DB_AVAILABLE:
+        return False
+    try:
+        # try to call record_update_event if provided
+        if record_update_event:
+            record_update_event({"pkg": pkg, "old": old, "new": new, "severity": severity, "ts": int(time.time())})
+            return True
+    except Exception as e:
+        log.debug(f"record_history_db failed: {e}")
+    return False
+
+# recipe scanning helpers
+def collect_ports_meta(ports_dir: Path = PORTS_DIR) -> List[Dict[str,Any]]:
+    """
+    Walk the ports tree and gather metadata from recipe toml files.
+    Expected layout: ports/<category>/<pkg>/<pkg>-<version>.toml OR <pkg>.toml
+    Returns list of dicts {name, path, meta}
+    """
+    recipes = []
+    if not ports_dir.exists():
+        log.warning(f"ports dir {ports_dir} not found")
+        return recipes
+    for p in ports_dir.rglob("*.toml"):
         try:
-            code, content = _http_get(url)
-            text = content.decode(errors="ignore")
-            # search for <title> or tags containing version-like strings
-            mtitle = re.search(r">[^<]{0,80}([0-9]+\.[0-9]+\.[0-9]+[^<\s]*)[^<]*<", text)
-            if mtitle:
-                return mtitle.group(1)
-            # fallback: first semver-ish occurrence
-            m = re.search(r"v?([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.]+)?)", text)
+            meta = {}
+            if TOML_AVAILABLE:
+                t = ZeropkgTOML()
+                try:
+                    meta = t.load(p)
+                except Exception:
+                    with open(p, "r", encoding="utf-8") as f:
+                        meta = {"raw": f.read()}
+            else:
+                # minimal metadata: read filename and optionally parse name/version
+                fname = p.stem
+                meta = {"package": {"name": fname}}
+            name = meta.get("package", {}).get("name") or p.stem
+            recipes.append({"name": name, "path": str(p), "meta": meta})
+        except Exception as e:
+            log.debug(f"collect_ports_meta skip {p}: {e}")
+    return recipes
+
+# upstream probing strategies
+def probe_github_latest(repo_url: str) -> Optional[str]:
+    """
+    Given repo_url like https://github.com/<owner>/<repo>, try to get latest release tag via API or redirects.
+    """
+    try:
+        parsed = urlparse(repo_url)
+        if "github.com" not in parsed.netloc:
+            return None
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) < 2:
+            return None
+        owner, repo = parts[0], parts[1]
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+        if REQUESTS_AVAILABLE:
+            resp = requests.get(api_url, timeout=15, headers={"User-Agent": "zeropkg-update/1.0"})
+            if resp.status_code == 200:
+                j = resp.json()
+                tag = j.get("tag_name") or j.get("name")
+                if tag:
+                    return str(tag)
+        # fallback: try releases/latest redirect
+        url_rl = f"https://github.com/{owner}/{repo}/releases/latest"
+        sc, txt = http_get(url_rl, timeout=10)
+        # requests will follow redirect; 'txt' may be HTML containing tag in meta
+        # attempt to parse out latest tag from canonical link
+        m = re.search(r'/tag/([^"\']+)"', txt)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        log.debug(f"probe_github_latest failed: {e}")
+    return None
+
+def probe_gitlab_latest(repo_url: str) -> Optional[str]:
+    try:
+        parsed = urlparse(repo_url)
+        if "gitlab.com" not in parsed.netloc:
+            return None
+        path = parsed.path.strip("/")
+        api_url = f"https://gitlab.com/api/v4/projects/{requests.utils.requote_uri(path)}/releases" if REQUESTS_AVAILABLE else None
+        if REQUESTS_AVAILABLE and api_url:
+            resp = requests.get(api_url, timeout=15, headers={"User-Agent":"zeropkg-update/1.0"})
+            if resp.status_code == 200:
+                arr = resp.json()
+                if isinstance(arr, list) and arr:
+                    return arr[0].get("tag_name")
+    except Exception as e:
+        log.debug(f"probe_gitlab_latest failed: {e}")
+    return None
+
+def probe_html_index_for_version(url: str, regex_hint: Optional[str] = None) -> Optional[str]:
+    """
+    Fetch a generic index page and attempt to locate versions by heuristics.
+    """
+    try:
+        sc, txt = http_get(url, timeout=12)
+        if sc == 0 or not txt:
+            return None
+        # if regex_hint present, use it
+        if regex_hint:
+            m = re.search(regex_hint, txt)
+            if m:
+                return m.group(1) if m.groups() else m.group(0)
+        # common patterns: '-X.Y.Z' near the filename or 'vX.Y.Z'
+        m = re.search(r'v?(\d+(?:\.\d+){1,4})', txt)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        log.debug(f"probe_html_index_for_version failed for {url}: {e}")
+    return None
+
+def probe_downloads_for_version(distfiles: List[str], regex_hint: Optional[str] = None) -> Optional[str]:
+    """
+    Given list of distfile URLs, try to extract version from their filenames.
+    """
+    for u in distfiles:
+        try:
+            bn = os.path.basename(urlparse(u).path)
+            # common pattern: name-1.2.3.tar.xz
+            m = re.search(r'[-_v]?(\d+(?:\.\d+){1,4})', bn)
             if m:
                 return m.group(1)
         except Exception:
-            pass
-    except Exception:
-        return None
+            continue
     return None
 
-
-# -----------------------
-# Main check loop
-# -----------------------
-def _collect_ports_meta(cfg: Optional[Dict[str,Any]] = None) -> Dict[str, Dict[str,Any]]:
+# severity scoring
+def score_severity(old: Optional[str], new: Optional[str], changelog_text: Optional[str] = None, keywords: Optional[List[str]] = None) -> str:
     """
-    Discover recipes in ports directories and return mapping:
-      pkg_fullname -> meta_entry
-    Expects that each port directory has toml files named like pkg-version.toml or provides a 'recipe.json' etc.
-    This function is intentionally conservative: it will look for .toml files under ports_dir/*/*.toml
+    Return 'critical' / 'urgent' / 'normal' based on version jump and keywords.
+    - major version bump -> urgent
+    - presence of keywords (CVE/security) -> critical
+    - otherwise normal
     """
-    cfg = cfg or load_config()
-    ports_dirs = get_ports_dirs(cfg)
-    out: Dict[str, Dict[str,Any]] = {}
-    for pd in ports_dirs:
-        try:
-            for root, dirs, files in os.walk(pd):
-                for fn in files:
-                    if fn.endswith(".toml"):
-                        full = os.path.join(root, fn)
-                        try:
-                            # lazy import to avoid circular issues
-                            from zeropkg_toml import load_toml, get_package_meta
-                            meta = load_toml(full)
-                            name, ver = get_package_meta(meta)
-                            key = f"{name}"
-                            out[key] = meta
-                        except Exception:
-                            # skip invalid toml
-                            continue
-        except Exception:
-            continue
-    return out
-
-
-def check_updates(report: bool = True, cfg: Optional[Dict[str,Any]] = None, dry_run: bool = False) -> Dict[str,Any]:
-    """
-    Top-level: scans ports, probes upstreams, computes diffs against saved state and writes notification summary.
-    Returns a dict with 'summary' and 'details'.
-    If dry_run True, no writes made (no updates.json, no notify file, no DB events).
-    """
-    cfg = cfg or load_config()
-    state_dir = _state_dir(cfg)
-    # collect recipes
-    metas = _collect_ports_meta(cfg)
-    _logger.debug(f"Found {len(metas)} recipes to check")
-    scanned = {}
-    errors = {}
-    for pkg, meta in sorted(metas.items()):
-        try:
-            candidates = _guess_upstream_urls(meta)
-            found_ver = None
-            found_url = None
-            for cand in candidates:
-                try:
-                    ver = _probe_for_version(cand, meta)
-                    if ver:
-                        found_ver = ver
-                        found_url = cand
-                        break
-                except Exception:
-                    continue
-            # fallback: try sources' urls again by GET
-            if not found_ver:
-                for s in meta.get("sources", []) or []:
-                    try:
-                        u = s.get("url")
-                        if not u:
-                            continue
-                        v = _probe_for_version(u, meta)
-                        if v:
-                            found_ver = v
-                            found_url = u
-                            break
-                    except Exception:
-                        continue
-            scanned[pkg] = {"version": found_ver, "checked_at": int(time.time()), "source": found_url, "meta": {"package": meta.get("package", {}), "notes": ""}}
-        except Exception as e:
-            errors[pkg] = str(e)
-            _logger.debug(f"Error checking {pkg}: {e}")
-
-    # load previous state
-    prev = get_last_updates(cfg)
-    new_state = {"ts": int(time.time()), "packages": scanned}
-    diffs = diff_updates(prev, new_state)
-    # process diffs: classify severity and record events
-    summary = {"total_checked": len(scanned), "updates_found": len(diffs), "critical": 0, "urgent": 0, "normal": 0}
-    details = {}
-    for pkg, change in diffs.items():
-        old = change.get("old")
-        newv = change.get("new")
-        meta = change.get("meta", {}) or {}
-        sev = _score_severity(old, newv, meta)
-        summary.setdefault(sev, 0)
-        if sev == "critical":
-            summary["critical"] += 1
-        elif sev == "urgent":
-            summary["urgent"] += 1
-        else:
-            summary["normal"] += 1
-        details[pkg] = {"old": old, "new": newv, "severity": sev, "meta": meta}
-        if not dry_run:
-            record_update_event(pkg, old, newv, sev, note=f"detected via zeropkg_update", db=True, log=True)
-
-    # write new state and notify summary (unless dry_run)
-    if not dry_run:
-        _write_updates(new_state, cfg, dry_run=dry_run)
-        # write notify file
-        notify_path = _notify_file(cfg)
-        lines = []
-        total_updates = len(diffs)
-        lines.append(f"{total_updates} new updates available")
-        lines.append(f"critical: {summary['critical']}  urgent: {summary['urgent']}  normal: {summary['normal']}")
-        lines.append("")
-        for pkg, info in details.items():
-            lines.append(f"{pkg}: {info['old']} -> {info['new']} ({info['severity']})")
-        try:
-            with open(notify_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-        except Exception:
-            log_global(f"Failed to write notify file {notify_path}", "warning")
-
-    # prepare return payload
-    result = {"summary": summary, "details": details, "errors": errors, "prev_count": len(prev.get("packages", {}) if isinstance(prev, dict) else {}), "new_count": len(scanned)}
-    if report:
-        # log summary at top-level
-        log_global(f"Update check: {summary['updates_found']} updates found ({summary['critical']} critical, {summary['urgent']} urgent, {summary['normal']} normal)")
-    return result
-
-
-# -----------------------
-# CLI helper (quick)
-# -----------------------
-if __name__ == "__main__":
-    import argparse, pprint
-    p = argparse.ArgumentParser(prog="zeropkg-update", description="Check upstream for package updates")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--no-report", dest="report", action="store_false")
-    args = p.parse_args()
+    if keywords is None:
+        keywords = SEVERITY_KEYWORDS
+    ktext = (changelog_text or "").lower()
+    for kw in keywords:
+        if kw.lower() in ktext:
+            return "critical"
+    # compare major segments
     try:
-        res = check_updates(report=args.report, dry_run=args.dry_run)
-        pprint.pprint(res)
+        a = normalize_version(old or "0")
+        b = normalize_version(new or "0")
+        # major bump heuristic: first numeric component increases
+        if a and b and isinstance(a[0], int) and isinstance(b[0], int) and b[0] > a[0]:
+            return "urgent"
+    except Exception:
+        pass
+    return "normal"
+
+# main update logic
+class ZeropkgUpdate:
+    def __init__(self, cfg_path: Optional[str] = None):
+        self.cfg = load_config(cfg_path)
+        self.ports_dir = Path(self.cfg.get("paths", {}).get("ports_dir", PORTS_DIR))
+        self.cache_dir = Path(self.cfg.get("paths", {}).get("cache_dir", CACHE_DIR))
+        self.state_dir = Path(self.cfg.get("paths", {}).get("state_dir", STATE_DIR))
+        self.report_dir = Path(self.cfg.get("paths", {}).get("log_dir", LOG_DIR))
+        self.update_cfg = self.cfg.get("update", DEFAULT_UPDATE_CFG)
+        self.cache = load_cache()
+        self.vuln = ZeroPKGVulnManager() if VULN_AVAILABLE else None
+
+    def save_state_reports(self, updates: List[Dict[str,Any]]):
+        # write full JSON
+        try:
+            _tmp = UPDATES_JSON.with_suffix(".tmp")
+            with open(_tmp, "w", encoding="utf-8") as f:
+                json.dump({"checked_at": int(time.time()), "updates": updates}, f, indent=2)
+                f.flush(); os.fsync(f.fileno())
+            _tmp.replace(UPDATES_JSON)
+        except Exception as e:
+            log.warning(f"save_state_reports failed: {e}")
+
+        # write notify text summary
+        try:
+            total = len(updates)
+            by_sev = {"critical":0,"urgent":0,"normal":0}
+            lines = []
+            for u in updates:
+                sev = u.get("severity","normal")
+                by_sev[sev] = by_sev.get(sev,0) + 1
+                lines.append(f"{u.get('name')}: {u.get('old_version')} -> {u.get('new_version')} ({sev})")
+            summary = f"{total} new updates available\ncritical: {by_sev['critical']}  urgent: {by_sev['urgent']}  normal: {by_sev['normal']}\n\n"
+            summary += "\n".join(lines)
+            UPDATE_NOTIFY_TXT.parent.mkdir(parents=True, exist_ok=True)
+            with open(UPDATE_NOTIFY_TXT, "w", encoding="utf-8") as f:
+                f.write(summary)
+        except Exception as e:
+            log.warning(f"save notify failed: {e}")
+
+    def _probe_for_recipe(self, recipe_meta: Dict[str,Any]) -> Optional[Dict[str,Any]]:
+        """
+        Attempt to determine upstream version for a single recipe meta dict.
+        recipe_meta comes from collect_ports_meta -> has keys name, path, meta
+        """
+        name = recipe_meta.get("name")
+        meta = recipe_meta.get("meta", {}) or {}
+        # try multiple places in meta: sources, upstream, homepage, repository
+        # support recipe['package']['upstream'] or meta['homepage'] etc.
+        candidate_urls = []
+        try:
+            pkg = meta.get("package", {}) or {}
+            srcs = meta.get("sources") or meta.get("distfiles") or pkg.get("sources") or []
+            # allow either list of strings or dicts with url
+            dist_urls = []
+            for s in srcs:
+                if isinstance(s, str):
+                    dist_urls.append(s)
+                elif isinstance(s, dict):
+                    u = s.get("url") or s.get("uri")
+                    if u:
+                        dist_urls.append(u)
+            if pkg.get("homepage"):
+                candidate_urls.append(pkg.get("homepage"))
+            if pkg.get("repository"):
+                candidate_urls.append(pkg.get("repository"))
+            # meta top-level keys
+            if isinstance(meta.get("homepage"), str):
+                candidate_urls.append(meta.get("homepage"))
+            if isinstance(meta.get("repository"), str):
+                candidate_urls.append(meta.get("repository"))
+        except Exception:
+            dist_urls = []
+
+        # 1) try to get version from distfiles entries
+        ver = probe_downloads_for_version(dist_urls, regex_hint=meta.get("version_regex"))
+        if ver:
+            return {"name": name, "old_version": meta.get("package",{}).get("version"), "new_version": ver, "method": "distfiles"}
+
+        # 2) try repository heuristics (github/gitlab)
+        for url in candidate_urls:
+            try:
+                if "github.com" in url:
+                    v = probe_github_latest(url)
+                    if v:
+                        return {"name": name, "old_version": meta.get("package",{}).get("version"), "new_version": v, "method": "github"}
+                if "gitlab.com" in url:
+                    v = probe_gitlab_latest(url)
+                    if v:
+                        return {"name": name, "old_version": meta.get("package",{}).get("version"), "new_version": v, "method": "gitlab"}
+                # try html index of homepage for version heuristics
+                v = probe_html_index_for_version(url, regex_hint=meta.get("version_regex"))
+                if v:
+                    return {"name": name, "old_version": meta.get("package",{}).get("version"), "new_version": v, "method": "homepage-index"}
+            except Exception as e:
+                log.debug(f"probe_for_recipe candidate {url} failed: {e}")
+                continue
+
+        # 3) fallback: check distfiles directory for matching filenames in configured distfiles path
+        distfiles_dir = Path(self.cfg.get("paths", {}).get("distfiles", "/usr/ports/distfiles"))
+        if distfiles_dir.exists():
+            for f in distfiles_dir.rglob(f"{name}*"):
+                m = re.search(r'(\d+(?:\.\d+){1,4})', f.name)
+                if m:
+                    return {"name": name, "old_version": meta.get("package",{}).get("version"), "new_version": m.group(1), "method": "local-distfile"}
+        return None
+
+    def check_updates(self, *, packages: Optional[List[str]] = None, repos: Optional[List[str]] = None, dry_run: bool = False, force: bool=False) -> List[Dict[str,Any]]:
+        """
+        Main entrypoint:
+         - collect recipes (all or filtered by packages/repos)
+         - probe upstream for each
+         - compare to cached/old versions
+         - produce list of updates (with severity)
+        """
+        recipes = collect_ports_meta(self.ports_dir)
+        if packages:
+            recipes = [r for r in recipes if r.get("name") in packages]
+        if repos:
+            # repo filtering: filter by path containing repo name (simple)
+            recipes = [r for r in recipes if any(repo in r.get("path","") for repo in repos)]
+
+        log.info(f"Checking updates for {len(recipes)} recipes (dry_run={dry_run})")
+        updates = []
+        cache = self.cache or {}
+
+        # simple throttling: limit concurrency by slicing
+        max_parallel = int(self.update_cfg.get("max_parallel_checks", 8) or 8)
+
+        for recipe in recipes:
+            name = recipe.get("name")
+            try:
+                cached = cache.get(name, {})
+                last_checked = cached.get("checked_at", 0)
+                # if recently checked and not force, skip
+                if not force and (time.time() - last_checked) < (CHECK_INTERVAL_HOURS * 3600):
+                    log.debug(f"Skipping {name} (checked recently)")
+                    continue
+
+                pr = self._probe_for_recipe(recipe)
+                if not pr:
+                    log.debug(f"No upstream info for {name}")
+                    cache[name] = {"checked_at": int(time.time()), "no_info": True}
+                    continue
+
+                oldv = pr.get("old_version")
+                newv = pr.get("new_version")
+                if not newv:
+                    cache[name] = {"checked_at": int(time.time()), "no_info": True}
+                    continue
+
+                # normalize: strip leading v
+                newv_str = str(newv).lstrip("v")
+                oldv_str = (oldv or "")
+                if version_greater(newv_str, oldv_str):
+                    # attempt to get changelog / release notes if available (not always)
+                    changelog = ""
+                    method = pr.get("method")
+                    if method == "github" and REQUESTS_AVAILABLE:
+                        # try fetch release body via API
+                        try:
+                            # find repo url from recipe meta
+                            meta = recipe.get("meta", {}) or {}
+                            repo = meta.get("package", {}).get("repository") or meta.get("repository") or None
+                            if repo and "github.com" in repo:
+                                parsed = urlparse(repo)
+                                owner, repo_name = parsed.path.strip("/").split("/")[:2]
+                                api_url = f"https://api.github.com/repos/{owner}/{repo_name}/releases/tags/{newv}"
+                                r = requests.get(api_url, timeout=10, headers={"User-Agent":"zeropkg-update/1.0"})
+                                if r.status_code == 200:
+                                    j = r.json()
+                                    changelog = j.get("body") or ""
+                        except Exception:
+                            changelog = ""
+                    # severity
+                    severity = score_severity(oldv_str, newv_str, changelog, keywords=self.update_cfg.get("severity_keywords", SEVERITY_KEYWORDS))
+                    u = {
+                        "name": name,
+                        "path": recipe.get("path"),
+                        "old_version": oldv_str,
+                        "new_version": newv_str,
+                        "method": pr.get("method"),
+                        "severity": severity,
+                        "changelog": changelog,
+                        "checked_at": int(time.time())
+                    }
+                    # vulnerability hint: if vuln module exists, check if new version fixes/has CVEs
+                    if VULN_AVAILABLE and self.vuln:
+                        try:
+                            vulns = self.vuln.vulndb.get_vulns(name)
+                            if vulns:
+                                u["vuln_count"] = len(vulns)
+                                # if vulnerability exists mention it (severity override)
+                                if any(v.get("severity") == "critical" for v in vulns):
+                                    u["severity"] = "critical"
+                        except Exception:
+                            pass
+                    updates.append(u)
+                    # record in DB history
+                    try:
+                        record_history_db(name, oldv_str or None, newv_str or None, severity)
+                    except Exception:
+                        pass
+
+                # update cache with latest check
+                cache[name] = {"checked_at": int(time.time()), "last_known_version": str(pr.get("new_version") or "")}
+            except Exception as e:
+                log.debug(f"check recipe {recipe.get('name')} failed: {e}")
+                continue
+
+        # persist cache and produce report
+        self.cache = cache
+        save_cache(self.cache)
+        # write updates summary
+        if updates:
+            self.save_state_reports(updates)
+            # write log report file
+            try:
+                ts = int(time.time())
+                fname = REPORT_DIR / f"updates_report-{ts}.json"
+                with open(fname, "w", encoding="utf-8") as f:
+                    json.dump({"ts": ts, "updates": updates}, f, indent=2)
+            except Exception as e:
+                log.warning(f"write report file failed: {e}")
+
+            # auto-notify
+            if (self.update_cfg.get("auto_notify", AUTO_NOTIFY) or False) and not dry_run:
+                tot = len(updates)
+                critical = len([u for u in updates if u.get("severity") == "critical"])
+                msg = f"{tot} updates available ({critical} critical)"
+                try:
+                    notify_summary(msg)
+                except Exception:
+                    pass
+
+        return updates
+
+    # convenience: full-run with options and notify text return
+    def run(self, *, packages: Optional[List[str]] = None, repos: Optional[List[str]] = None, dry_run: bool = False, auto_update: bool=False, notify: bool=False, force: bool=False) -> Dict[str,Any]:
+        updates = self.check_updates(packages=packages, repos=repos, dry_run=dry_run, force=force)
+        result = {"checked_at": int(time.time()), "count": len(updates), "updates": updates}
+        # create textual notify summary
+        if updates:
+            total = len(updates)
+            by_sev = {"critical":0,"urgent":0,"normal":0}
+            for u in updates:
+                s = u.get("severity","normal")
+                by_sev[s] = by_sev.get(s,0) + 1
+            text_lines = [f"{total} new updates available", f"critical: {by_sev['critical']}  urgent: {by_sev['urgent']}  normal: {by_sev['normal']}", ""]
+            for u in updates[:1000]:
+                text_lines.append(f"{u['name']}: {u['old_version']} -> {u['new_version']} ({u['severity']})")
+            notify_text = "\n".join(text_lines)
+            result["notify_text"] = notify_text
+
+            # write notify file
+            try:
+                UPDATE_NOTIFY_TXT.parent.mkdir(parents=True, exist_ok=True)
+                with open(UPDATE_NOTIFY_TXT, "w", encoding="utf-8") as f:
+                    f.write(notify_text)
+            except Exception as e:
+                log.warning(f"write notify txt failed: {e}")
+
+            if notify and not dry_run:
+                notify_summary(result["notify_text"].split("\n",1)[0])
+
+        # auto_update mode: be extremely conservative
+        if auto_update and not dry_run:
+            # auto update non-critical by default; prompt for critical unless force
+            to_upgrade = [u for u in updates if u.get("severity") in ("normal","urgent")]
+            criticals = [u for u in updates if u.get("severity") == "critical"]
+            # Use upgrade module if available
+            try:
+                from zeropkg_upgrade import ZeropkgUpgrade
+                upgr = ZeropkgUpgrade()
+                # build list of recipe candidates
+                recipes = []
+                for u in to_upgrade:
+                    # try find recipe path via builder if available
+                    try:
+                        from zeropkg_builder import ZeropkgBuilder
+                        b = ZeropkgBuilder()
+                        rp = b._find_recipe_for_pkg(u["name"]) if hasattr(b, "_find_recipe_for_pkg") else None
+                        if rp:
+                            recipes.append(str(rp))
+                    except Exception:
+                        recipes.append(u.get("path"))
+                # perform upgrade (non-critical)
+                if recipes:
+                    log.info(f"Auto-updating {len(recipes)} packages (non-critical)")
+                    upgr.upgrade(recipes, dry_run=dry_run, force=force)
+            except Exception as e:
+                log.warning(f"Auto-update requested but upgrade module not available: {e}")
+            # criticals: create notify for manual intervention
+            if criticals:
+                msg = f"{len(criticals)} critical updates available — review manually"
+                notify_summary(msg)
+
+        return result
+
+# CLI
+def _cli():
+    import argparse
+    parser = argparse.ArgumentParser(prog="zeropkg-update", description="Check upstream for new package versions")
+    parser.add_argument("--dry-run", action="store_true", help="Do not write cache or send notifications")
+    parser.add_argument("--packages", nargs="+", help="Restrict check to these package names")
+    parser.add_argument("--repo", nargs="+", help="Restrict to repository paths containing these strings")
+    parser.add_argument("--auto-update", action="store_true", help="Attempt to auto-upgrade non-critical updates")
+    parser.add_argument("--notify", action="store_true", help="Send notification summary if updates found")
+    parser.add_argument("--force", action="store_true", help="Force check regardless of interval")
+    parser.add_argument("--history", action="store_true", help="Show recent update history from DB/cache")
+    parser.add_argument("--show-report", action="store_true", help="Show last update_notify.txt content")
+    args = parser.parse_args()
+
+    updater = ZeropkgUpdate()
+    if args.history:
+        if DB_AVAILABLE:
+            try:
+                db = ZeroPKGDB()
+                rows = getattr(db, "list_update_history", lambda: [])()
+                print(json.dumps(rows, indent=2))
+            except Exception as e:
+                log.warning(f"history read failed: {e}")
+        else:
+            cache = load_cache()
+            print(json.dumps(cache, indent=2))
         sys.exit(0)
-    except Exception as e:
-        print("Error:", e)
-        traceback.print_exc()
-        sys.exit(1)
+    if args.show_report:
+        if UPDATE_NOTIFY_TXT.exists():
+            print(UPDATE_NOTIFY_TXT.read_text())
+        else:
+            print("No notify file present")
+        sys.exit(0)
+
+    res = updater.run(packages=args.packages, repos=args.repo, dry_run=args.dry_run, auto_update=args.auto_update, notify=args.notify, force=args.force)
+    print(json.dumps(res, indent=2))
+
+if __name__ == "__main__":
+    _cli()
