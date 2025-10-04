@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zeropkg_chroot.py — chroot / mount manager for Zeropkg (Pattern B: integrated, lean, functional)
+zeropkg_chroot.py — Chroot manager for Zeropkg
 
-Provides:
-  - prepare_chroot(root, copy_resolv=True, dry_run=False)
-  - cleanup_chroot(root, force_lazy=False, dry_run=False)
-  - auto_prepare(meta, root=None, copy_resolv=True, dry_run=False)
-  - exec_in_chroot(root, cmd, env=None, use_fakeroot=False, dry_run=False)
-  - run_in_chroot(root, cmd, cwd=None, env=None, use_shell=False, dry_run=False)
-  - get_active_chroots() -> list
-  - force_cleanup_all(dry_run=False)
-  - ensure_network(root, dry_run=False)
-  - is_chroot_ready(root) -> bool
-
-Persists active chroots info in /var/lib/zeropkg/chroots.json
-Integrates with zeropkg_config, zeropkg_logger and zeropkg_db when available.
+Features included:
+ - prepare_chroot(root, profile="lfs", bind_dirs=[...], overlay=False, dry_run=False)
+ - cleanup_chroot(root, mounts, lazy=False, dry_run=False)
+ - run_in_chroot(cfg_or_root, command, env=None, fakeroot=False, dry_run=False)
+ - exec_in_chroot(root, argv, env=None, fakeroot=False, dry_run=False)
+ - is_chroot_ready(root)
+ - ensure_network(root)
+ - verify_chroot(root) -> diagnostic report
+ - force_cleanup_all(dry_run=False)
+ - persistent state stored in /var/lib/zeropkg/chroots.json (atomic writes)
+ - profiles: "lfs", "blfs", "x11", "minimal" (customizable)
+ - monitoring helpers: list_chroots(), cleanup_stale(threshold_secs)
 """
 
 from __future__ import annotations
@@ -24,419 +23,517 @@ import sys
 import json
 import time
 import shutil
+import errno
+import tempfile
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, List, Tuple, Optional, Any
 
-# Optional integrations
+# Try import logger
 try:
-    from zeropkg_config import load_config, get_build_root, ensure_dirs
-except Exception:
-    def load_config(*a, **k): return {"paths": {"db_path": "/var/lib/zeropkg/installed.sqlite3", "build_root": "/var/zeropkg/build", "log_dir": "/var/log/zeropkg", "packages_dir": "/var/zeropkg/packages"}, "options": {"chroot_enabled": True}}
-    def get_build_root(cfg=None): return "/var/zeropkg/build"
-    def ensure_dirs(cfg=None): pass
-
-try:
-    from zeropkg_logger import log_event, log_global, get_logger
-    _logger = get_logger("chroot")
+    from zeropkg_logger import get_logger
+    logger = get_logger("chroot")
 except Exception:
     import logging
-    _logger = logging.getLogger("zeropkg_chroot")
-    if not _logger.handlers:
-        _logger.addHandler(logging.StreamHandler(sys.stdout))
-    def log_event(pkg, stage, msg, level="info"):
-        getattr(_logger, level if hasattr(_logger, level) else "info")(f"{pkg}:{stage} {msg}")
-    def log_global(msg, level="info"):
-        getattr(_logger, level if hasattr(_logger, level) else "info")(msg)
+    logger = logging.getLogger("zeropkg_chroot")
+    if not logger.handlers:
+        h = logging.StreamHandler(sys.stdout)
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(h)
+    logger.setLevel(logging.INFO)
 
-# DB optional
-try:
-    from zeropkg_db import DBManager
-except Exception:
-    DBManager = None
+STATE_PATH = Path("/var/lib/zeropkg/chroots.json")
+STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+DEFAULT_TIMEOUT = 5  # seconds for mount operations retry
+SAFE_BIND_DIRS = ["/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf"]
 
-# Constants
-_CHROOT_STATE = Path("/var/lib/zeropkg/chroots.json")
-_DEFAULT_MOUNTS = [
-    ("/proc", "proc", None),
-    ("/sys", "sysfs", None),
-    ("/dev", "bind", None),
-    ("/dev/pts", "devpts", None),
-    ("/run", "bind", None),
-]
-# overlay support: create work/upper if requested
-_OVERLAY_META = ("overlay",)  # marker if overlay requested in meta
-
-# Helpers for safe operations
-def _atomic_write(path: Path, data: str):
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    os.replace(str(tmp), str(path))
+# ---- Utilities -----------------------------------------------------------
+def _atomic_write(p: Path, data: Any):
+    tmp = p.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(p)
 
 def _load_state() -> Dict[str, Any]:
+    if not STATE_PATH.exists():
+        return {"chroots": {}}
     try:
-        if not _CHROOT_STATE.exists():
-            return {}
-        return json.loads(_CHROOT_STATE.read_text(encoding="utf-8"))
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception as e:
-        log_global(f"Failed to load chroot state: {e}", "warning")
-        return {}
+        logger.warning(f"Failed to load chroot state: {e}")
+        return {"chroots": {}}
 
 def _save_state(state: Dict[str, Any]):
     try:
-        _CHROOT_STATE.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write(_CHROOT_STATE, json.dumps(state, indent=2))
+        _atomic_write(STATE_PATH, state)
     except Exception as e:
-        log_global(f"Failed to save chroot state: {e}", "warning")
+        logger.error(f"Failed to save chroot state: {e}")
 
-def _record_chroot_active(root: str, mounts: List[Dict[str, Any]]):
-    state = _load_state()
-    key = str(root)
-    state[key] = {"root": key, "mounts": mounts, "ts": int(time.time())}
-    _save_state(state)
-
-def _remove_chroot_record(root: str):
-    state = _load_state()
-    key = str(root)
-    if key in state:
-        del state[key]
-        _save_state(state)
-
-def get_active_chroots() -> List[Dict[str, Any]]:
-    s = _load_state()
-    return list(s.values())
-
-# Low-level shell helpers
-def _run(cmd: Union[str, List[str]], check: bool = True, dry_run: bool = False, env: Optional[Dict[str, str]] = None):
-    if dry_run:
-        log_global(f"[dry-run] would run: {cmd}")
-        return 0
-    if isinstance(cmd, list):
-        proc = subprocess.run(cmd, check=check, env=env)
-        return proc.returncode
-    proc = subprocess.run(cmd, shell=True, check=check, env=env)
-    return proc.returncode
-
-def _is_mount_point(path: str) -> bool:
+def _is_mounted(path: Path) -> bool:
     try:
-        return os.path.ismount(path)
-    except Exception:
-        return False
-
-def _safe_ensure_dir(path: str, mode: int = 0o755):
-    p = Path(path)
-    if not p.exists():
-        p.mkdir(parents=True, exist_ok=True)
-        try:
-            p.chmod(mode)
-        except Exception:
-            pass
-
-# Security checks
-def _ensure_root_user():
-    if os.geteuid() != 0:
-        raise PermissionError("Operation requires root privileges")
-
-def _same_device(path1: str, path2: str) -> bool:
-    try:
-        return os.stat(path1).st_dev == os.stat(path2).st_dev
-    except Exception:
-        return False
-
-# Public API
-def prepare_chroot(root: str, copy_resolv: bool = True, overlay: bool = False, dry_run: bool = False, ensure_dirs_flag: bool = True) -> Dict[str, Any]:
-    """
-    Prepare a chroot at `root`:
-      - create standard mountpoints
-      - mount /proc, /sys, bind /dev and /run
-      - optionally create overlay dirs (work/upper)
-      - optionally copy /etc/resolv.conf to root/etc/resolv.conf for network
-    Returns a dict with details (mounts list).
-    Raises on error (unless dry_run).
-    """
-    cfg = load_config()
-    if not cfg.get("options", {}).get("chroot_enabled", True):
-        log_global("Chroot support disabled in config", "warning")
-        return {}
-
-    root = str(Path(root).resolve())
-    if not dry_run:
-        _ensure_root_user()
-
-    # Basic safety: if root is "/" and not explicitly allowed, reject
-    if root == "/":
-        allow = cfg.get("options", {}).get("allow_root_install", False)
-        if not allow:
-            raise PermissionError("Refusing to prepare chroot for root '/' (enable options.allow_root_install to override)")
-
-    # ensure directories
-    if ensure_dirs_flag:
-        ensure_dirs(cfg)
-
-    # ensure root exists
-    Path(root).mkdir(parents=True, exist_ok=True)
-
-    mounts = []
-    try:
-        # validate device for safety: recommend same device as root parent (avoid cross-device complexities)
-        host_root_dev = os.stat("/").st_dev
-        try:
-            target_dev = os.stat(root).st_dev
-            if target_dev != host_root_dev:
-                log_global(f"Warning: chroot root {root} is on a different device — overlay/mount behaviour may vary", "warning")
-        except Exception:
-            pass
-
-        # Standard mounts
-        for rel, fstype, extra in _DEFAULT_MOUNTS:
-            dest = os.path.join(root, rel.lstrip("/"))
-            _safe_ensure_dir(dest)
-            if _is_mount_point(dest):
-                log_global(f"{dest} already mounted; skipping", "debug")
-                mounts.append({"src": rel, "dst": dest, "type": "existing"})
-                continue
-            # choose mount command
-            if fstype == "bind":
-                cmd = ["mount", "--bind", rel, dest]
-            else:
-                cmd = ["mount", "-t", fstype, fstype if fstype in ("proc", "sysfs") else rel, dest] if fstype in ("proc", "sysfs") else ["mount", "-t", fstype, rel, dest]
-            log_global(f"Mounting {rel} -> {dest}")
-            _run(cmd, dry_run=dry_run)
-            mounts.append({"src": rel, "dst": dest, "type": fstype})
-
-        # dev/pts might need special mount options
-        # overlay support: create upper/work if requested
-        if overlay:
-            upper = os.path.join(root, "var", "lib", "zeropkg", "overlay", "upper")
-            work = os.path.join(root, "var", "lib", "zeropkg", "overlay", "work")
-            merged = os.path.join(root, "merged")
-            _safe_ensure_dir(upper)
-            _safe_ensure_dir(work)
-            _safe_ensure_dir(merged)
-            overlay_cmd = f"mount -t overlay overlay -o lowerdir={root},upperdir={upper},workdir={work} {merged}"
-            log_global(f"Mounting overlay (lower={root}) -> {merged}")
-            _run(overlay_cmd, dry_run=dry_run)
-            mounts.append({"src": "overlay", "dst": merged, "type": "overlay", "upper": upper, "work": work})
-
-        # copy resolv.conf for DNS if requested
-        if copy_resolv:
-            host_resolv = "/etc/resolv.conf"
-            dest_etc = os.path.join(root, "etc")
-            Path(dest_etc).mkdir(parents=True, exist_ok=True)
-            dest_resolv = os.path.join(dest_etc, "resolv.conf")
-            if os.path.exists(dest_resolv):
-                log_global(f"{dest_resolv} already exists; not overwriting", "debug")
-            else:
-                if os.path.exists(host_resolv):
-                    log_global(f"Copying {host_resolv} -> {dest_resolv}")
-                    if dry_run:
-                        pass
-                    else:
-                        shutil.copy2(host_resolv, dest_resolv)
-                else:
-                    log_global("Host resolv.conf not found; network inside chroot may not work", "warning")
-
-        # persistence record
-        _record_chroot_active(root, mounts)
-        log_global(f"Chroot prepared at {root} with mounts: {mounts}", "info")
-        return {"root": root, "mounts": mounts, "ts": int(time.time())}
-    except Exception as e:
-        log_global(f"Failed to prepare chroot {root}: {e}", "error")
-        # attempt best-effort cleanup
-        try:
-            cleanup_chroot(root, force_lazy=True, dry_run=dry_run)
-        except Exception:
-            pass
-        raise
-
-def cleanup_chroot(root: str, force_lazy: bool = False, dry_run: bool = False) -> None:
-    """
-    Cleanup mounted filesystems under root. If force_lazy True, use lazy unmount for stubborn mounts.
-    """
-    root = str(Path(root).resolve())
-    if dry_run:
-        log_global(f"[dry-run] would cleanup chroot at {root}")
-        return
-
-    _ensure_root_user()
-    # attempt to unmount in reverse order of mount points recorded
-    state = _load_state()
-    entry = state.get(root) or state.get(str(Path(root)))
-    if not entry:
-        # attempt to detect and unmount common points anyway
-        candidates = [os.path.join(root, p.lstrip("/")) for p, _, _ in _DEFAULT_MOUNTS]
-    else:
-        candidates = [m.get("dst") for m in entry.get("mounts", []) if m.get("dst")]
-    # reverse sort by path length to unmount children first
-    candidates = sorted([c for c in candidates if c], key=lambda x: len(x), reverse=True)
-    errors = []
-    for mnt in candidates:
-        try:
-            if _is_mount_point(mnt):
-                if force_lazy:
-                    cmd = ["umount", "-l", mnt]
-                else:
-                    cmd = ["umount", mnt]
-                log_global(f"Unmounting {mnt}")
-                _run(cmd)
-            else:
-                log_global(f"{mnt} not mounted; skipping", "debug")
-        except Exception as e:
-            errors.append((mnt, str(e)))
-            log_global(f"Failed to unmount {mnt}: {e}", "warning")
-    # remove record if all good
-    _remove_chroot_record(root)
-    if errors:
-        raise RuntimeError(f"Errors while cleaning chroot {root}: {errors}")
-    log_global(f"Chroot at {root} cleaned", "info")
-
-def auto_prepare(meta: Dict[str, Any], root: Optional[str] = None, copy_resolv: bool = True, dry_run: bool = False):
-    """
-    High-level convenience: if meta["build"]["chroot"] is True, prepare chroot automatically.
-    Returns the prepare_chroot() result or {} if not required.
-    """
-    root = root or meta.get("build", {}).get("root") or "/mnt/lfs"
-    build_cfg = meta.get("build", {}) or {}
-    if not build_cfg.get("chroot", False):
-        log_global("auto_prepare: meta does not request chroot; skipping", "debug")
-        return {}
-    overlay = bool(build_cfg.get("overlay", False))
-    return prepare_chroot(root, copy_resolv=copy_resolv, overlay=overlay, dry_run=dry_run)
-
-def exec_in_chroot(root: str, cmd: Union[str, List[str]], env: Optional[Dict[str, str]] = None, use_fakeroot: bool = False, dry_run: bool = False):
-    """
-    Execute a command inside chroot using chroot(8). cmd can be string or list.
-    If use_fakeroot True, wraps with fakeroot.
-    """
-    root = str(Path(root).resolve())
-    if dry_run:
-        log_global(f"[dry-run] exec_in_chroot {root}: {cmd}")
-        return 0
-    _ensure_root_user()
-    # build chroot command
-    if isinstance(cmd, list):
-        cmdline = subprocess.list2cmdline(cmd)
-    else:
-        cmdline = cmd
-    # wrap with fakeroot if requested
-    if use_fakeroot:
-        inner = f"fakeroot bash -lc {shlex_quote(cmdline)}"
-    else:
-        inner = f"bash -lc {shlex_quote(cmdline)}"
-    full = ["chroot", root, "/bin/bash", "-lc", inner]
-    log_global(f"Running in chroot {root}: {cmdline}")
-    return _run(full)
-
-def run_in_chroot(root: str, cmd: str, cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None, use_shell: bool = False, dry_run: bool = False, use_fakeroot: bool = False):
-    """
-    More flexible runner: uses chroot then executes the command. If use_shell True, cmd passed to shell.
-    cwd is relative to chroot root.
-    """
-    root = str(Path(root).resolve())
-    if dry_run:
-        log_global(f"[dry-run] run_in_chroot {root}: {cmd}")
-        return 0
-    _ensure_root_user()
-    chroot_cmd = []
-    # if cwd is specified, prefix with cd
-    if cwd:
-        cmd = f"cd {shlex_quote(cwd)} && {cmd}"
-    if use_fakeroot:
-        cmd = f"fakeroot bash -lc {shlex_quote(cmd)}"
-    if use_shell:
-        chroot_cmd = ["chroot", root, "/bin/bash", "-lc", cmd]
-    else:
-        chroot_cmd = ["chroot", root, "/bin/bash", "-lc", cmd]
-    log_global(f"run_in_chroot {root} -> {cmd}")
-    return _run(chroot_cmd)
-
-def is_chroot_ready(root: str) -> bool:
-    """
-    Simple readiness check: minimal mounts present and /etc/resolv.conf exists inside root.
-    """
-    root = str(Path(root).resolve())
-    try:
-        checks = []
-        for rel, fstype, _ in _DEFAULT_MOUNTS:
-            path = os.path.join(root, rel.lstrip("/"))
-            checks.append(_is_mount_point(path))
-        resolv = os.path.exists(os.path.join(root, "etc", "resolv.conf"))
-        return all(checks) and resolv
-    except Exception:
-        return False
-
-def ensure_network(root: str, dry_run: bool = False):
-    """
-    Ensure network inside chroot by copying resolver and optionally /etc/hosts.
-    """
-    root = str(Path(root).resolve())
-    dest_resolv = os.path.join(root, "etc", "resolv.conf")
-    if dry_run:
-        log_global(f"[dry-run] would ensure network by copying /etc/resolv.conf to {dest_resolv}")
-        return
-    if not os.path.exists(dest_resolv):
-        if os.path.exists("/etc/resolv.conf"):
-            shutil.copy2("/etc/resolv.conf", dest_resolv)
-            log_global(f"Copied /etc/resolv.conf -> {dest_resolv}")
-        else:
-            log_global("Host /etc/resolv.conf not found; cannot provide DNS to chroot", "warning")
-    else:
-        log_global(f"{dest_resolv} exists; not overwriting", "debug")
-
-def force_cleanup_all(dry_run: bool = False):
-    """
-    Force cleanup of all recorded chroots (best-effort).
-    """
-    _ensure_root_user()
-    state = _load_state()
-    roots = list(state.keys())
-    errors = []
-    for r in roots:
-        try:
-            cleanup_chroot(r, force_lazy=True, dry_run=dry_run)
-        except Exception as e:
-            errors.append((r, str(e)))
-            log_global(f"force_cleanup_all: failed for {r}: {e}", "warning")
-    # clear state file
-    try:
-        _save_state({})
+        with open("/proc/mounts", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and os.path.realpath(parts[1]) == str(path):
+                    return True
     except Exception:
         pass
-    if errors:
-        raise RuntimeError(f"Errors cleaning chroots: {errors}")
-    log_global("force_cleanup_all: all chroots cleaned", "info")
+    return False
 
-# small utility
-def shlex_quote(s: str) -> str:
-    # basic wrapper to avoid importing shlex at top-level heavy in some contexts
-    import shlex
-    return shlex.quote(s)
+def _run(cmd: List[str], check=True, capture=False, timeout=None):
+    logger.debug(f"shell: {' '.join(cmd)}")
+    try:
+        if capture:
+            res = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+            return res.returncode, res.stdout.strip(), res.stderr.strip()
+        else:
+            subprocess.run(cmd, check=check, timeout=timeout)
+            return 0, "", ""
+    except subprocess.CalledProcessError as e:
+        logger.debug(f"Command failed: {e}")
+        return e.returncode, "", str(e)
+    except Exception as e:
+        logger.debug(f"Command exception: {e}")
+        return 1, "", str(e)
 
-# CLI debug helper
-if __name__ == "__main__":
-    import argparse, json
-    p = argparse.ArgumentParser(prog="zeropkg-chroot", description="Manage chroot mounts for Zeropkg (debug CLI)")
-    sp = p.add_subparsers(dest="cmd")
-    sp_p = sp.add_parser("prepare")
-    sp_p.add_argument("root")
-    sp_p.add_argument("--dry-run", action="store_true")
-    sp_c = sp.add_parser("cleanup")
-    sp_c.add_argument("root")
-    sp_c.add_argument("--force-lazy", action="store_true")
-    sp_c.add_argument("--dry-run", action="store_true")
-    sp_ls = sp.add_parser("list")
-    sp_force = sp.add_parser("force-clean")
-    sp_force.add_argument("--dry-run", action="store_true")
-    args = p.parse_args()
-    if args.cmd == "prepare":
-        print(json.dumps(prepare_chroot(args.root, dry_run=args.dry_run), indent=2))
-    elif args.cmd == "cleanup":
-        cleanup_chroot(args.root, force_lazy=args.force_lazy, dry_run=args.dry_run)
-        print("cleanup done")
-    elif args.cmd == "list":
-        print(json.dumps(get_active_chroots(), indent=2))
-    elif args.cmd == "force-clean":
-        force_cleanup_all(dry_run=args.dry_run)
-        print("force cleanup attempted")
+# ---- Profiles ------------------------------------------------------------
+DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
+    "lfs": {
+        "binds": ["/dev", "/dev/pts", "/proc", "/sys", "/run"],
+        "mount_proc": True,
+        "overlay": False,
+        "extra_binds": SAFE_BIND_DIRS
+    },
+    "minimal": {
+        "binds": ["/dev", "/proc"],
+        "mount_proc": True,
+        "overlay": False,
+        "extra_binds": ["/etc/resolv.conf"]
+    },
+    "blfs": {
+        "binds": ["/dev", "/dev/pts", "/proc", "/sys", "/run"],
+        "mount_proc": True,
+        "overlay": True,
+        "extra_binds": SAFE_BIND_DIRS
+    },
+    "x11": {
+        "binds": ["/dev", "/dev/pts", "/proc", "/sys", "/run", "/tmp"],
+        "mount_proc": True,
+        "overlay": True,
+        "extra_binds": SAFE_BIND_DIRS + ["/tmp/.X11-unix"]
+    }
+}
+
+# ---- Core functions -----------------------------------------------------
+def prepare_chroot(root: Path, profile: str = "lfs", bind_dirs: Optional[List[str]] = None,
+                   overlay: Optional[bool] = None, copy_resolv: bool = True,
+                   dry_run: bool = False, force: bool = False) -> List[Dict[str, Any]]:
+    """
+    Prepare a chroot at 'root' according to profile.
+    Returns a list of mount records: [{type, src, dst, opts}, ...]
+    """
+    root = Path(root).resolve()
+    if str(root) == "/":
+        if not force:
+            raise ValueError("Refusing to prepare chroot on '/' without force=True")
+    profile_cfg = DEFAULT_PROFILES.get(profile, {})
+    binds = list(profile_cfg.get("binds", []))
+    if bind_dirs:
+        binds += bind_dirs
+    extra_binds = list(profile_cfg.get("extra_binds", []))
+    mount_proc = profile_cfg.get("mount_proc", True)
+    if overlay is None:
+        overlay = profile_cfg.get("overlay", False)
+
+    logger.info(f"Preparing chroot {root} profile={profile} overlay={overlay} dry_run={dry_run}")
+    mounts = []
+    if dry_run:
+        logger.info(f"[dry-run] Would create {root} and perform mounts: {binds + extra_binds}")
+        return [{"type": "dry-run", "dst": str(root), "binds": binds + extra_binds, "overlay": overlay}]
+
+    root.mkdir(parents=True, exist_ok=True)
+
+    # If overlay requested, create lower/upper/work and mount a tmpfs or use overlay mount
+    if overlay:
+        upper = root / "upper"
+        work = root / "work"
+        merged = root / "merged"
+        for p in (upper, work, merged):
+            p.mkdir(parents=True, exist_ok=True)
+        # mount overlay: lower is root (original), upper/work new dirs, merged is final
+        # We'll perform a bind of root to lower and mount overlay over merged
+        lower = root / "lower"
+        if not lower.exists():
+            lower.mkdir(parents=True, exist_ok=True)
+            # bind mount current root into lower
+            rc, out, err = _run(["mount", "--bind", str(root), str(lower)], check=False)
+            if rc != 0:
+                logger.warning(f"bind lower failed: {err or out}")
+        # mount overlay
+        opts = f"lowerdir={lower},upperdir={upper},workdir={work}"
+        rc, out, err = _run(["mount", "-t", "overlay", "overlay", "-o", opts, str(merged)], check=False)
+        if rc != 0:
+            logger.warning(f"overlay mount failed: {err or out}; continuing without overlay")
+            overlay = False
+        else:
+            mounts.append({"type": "overlay", "src": "overlay", "dst": str(merged), "opts": opts})
+            # set root to merged for further binds
+            root = merged
+
+    # Bind mounts for essential dirs
+    for d in binds:
+        src = Path(d)
+        dst = root / src.relative_to("/")  # e.g. root/dev
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            rc, out, err = _run(["mount", "--bind", str(src), str(dst)], check=False)
+            if rc != 0:
+                logger.warning(f"bind {src} -> {dst} failed: {err or out}")
+            else:
+                mounts.append({"type": "bind", "src": str(src), "dst": str(dst)})
+        except Exception as e:
+            logger.error(f"Exception binding {src}: {e}")
+
+    # mount proc/sys if requested via explicit mount types (prefer proper vfstype)
+    if mount_proc:
+        proc_dst = root / "proc"
+        proc_dst.mkdir(parents=True, exist_ok=True)
+        rc, out, err = _run(["mount", "-t", "proc", "proc", str(proc_dst)], check=False)
+        if rc != 0:
+            logger.warning(f"mount proc failed: {err or out}")
+        else:
+            mounts.append({"type": "proc", "src": "proc", "dst": str(proc_dst)})
+
+    sys_dst = root / "sys"
+    sys_dst.mkdir(parents=True, exist_ok=True)
+    rc, out, err = _run(["mount", "-t", "sysfs", "sys", str(sys_dst)], check=False)
+    if rc == 0:
+        mounts.append({"type": "sysfs", "src": "sys", "dst": str(sys_dst)})
     else:
-        p.print_help()
+        logger.warning(f"mount sysfs failed: {err or out}")
+
+    # extra safe binds (hosts/resolv)
+    for extra in extra_binds:
+        src = Path(extra)
+        if not src.exists():
+            continue
+        dst = root / src.relative_to("/")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        rc, out, err = _run(["mount", "--bind", str(src), str(dst)], check=False)
+        if rc == 0:
+            mounts.append({"type": "bind", "src": str(src), "dst": str(dst)})
+        else:
+            logger.warning(f"bind extra {src} -> {dst} failed: {err or out}")
+
+    # copy resolv.conf if requested (fallback if bind didn't work)
+    if copy_resolv:
+        try:
+            dst = root / "etc" / "resolv.conf"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not (root / "etc" / "resolv.conf").exists():
+                shutil.copy2("/etc/resolv.conf", dst)
+                mounts.append({"type": "copy", "src": "/etc/resolv.conf", "dst": str(dst)})
+        except Exception as e:
+            logger.warning(f"Failed to copy resolv.conf: {e}")
+
+    # record state
+    state = _load_state()
+    state["chroots"].setdefault(str(root), {})
+    state["chroots"][str(root)].update({
+        "root": str(root),
+        "profile": profile,
+        "overlay": overlay,
+        "mounts": mounts,
+        "prepared_at": int(time.time())
+    })
+    _save_state(state)
+    logger.info(f"Chroot prepared at {root}; mounts={len(mounts)}")
+    return mounts
+
+def cleanup_chroot(root: Path, mounts: Optional[List[Dict[str,Any]]] = None, lazy: bool = True, dry_run: bool = False) -> List[Dict[str,Any]]:
+    """
+    Unmount mounts created by prepare_chroot. If mounts is None, check state file to determine mounts.
+    Returns list of unmounted records.
+    """
+    root = Path(root).resolve()
+    logger.info(f"Cleaning up chroot {root} lazy={lazy} dry_run={dry_run}")
+    if dry_run:
+        logger.info(f"[dry-run] Would cleanup chroot {root}")
+        return []
+
+    state = _load_state()
+    rec = state.get("chroots", {}).get(str(root))
+    if not rec and not mounts:
+        logger.warning("No record of mounts; attempting autodetect and best-effort unmount")
+        mounts = _detect_mounts_under(root)
+
+    if rec and not mounts:
+        mounts = rec.get("mounts", [])
+
+    # Unmount in reverse order for safety
+    unmounted = []
+    for m in reversed(mounts):
+        dst = Path(m.get("dst"))
+        if not dst.exists():
+            continue
+        try:
+            if _is_mounted(dst):
+                cmd = ["umount", "-l" if lazy else "", str(dst)]
+                # remove empty strings
+                cmd = [c for c in cmd if c]
+                rc, out, err = _run(cmd, check=False)
+                if rc == 0:
+                    unmounted.append(m)
+                    logger.debug(f"Unmounted {dst}")
+                else:
+                    logger.warning(f"Failed to unmount {dst}: {err or out}")
+            else:
+                logger.debug(f"Not mounted: {dst}")
+        except Exception as e:
+            logger.warning(f"Exception unmounting {dst}: {e}")
+
+    # remove overlay tmp dirs if present (upper/work/merged)
+    # best-effort: if merged exists and is dir, try to remove it if empty
+    try:
+        # remove record
+        if str(root) in state.get("chroots", {}):
+            del state["chroots"][str(root)]
+            _save_state(state)
+    except Exception:
+        pass
+
+    logger.info(f"Cleanup finished for {root}; unmounted={len(unmounted)}")
+    return unmounted
+
+def _detect_mounts_under(root: Path) -> List[Dict[str,Any]]:
+    """Scan /proc/mounts for entries under root"""
+    mounts = []
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                mpoint = os.path.realpath(parts[1])
+                if mpoint.startswith(str(root)):
+                    mounts.append({"src": parts[0], "dst": mpoint, "type": parts[2]})
+    except Exception:
+        pass
+    return mounts
+
+def list_chroots() -> Dict[str, Any]:
+    state = _load_state()
+    return state.get("chroots", {})
+
+def is_chroot_ready(root: Path) -> bool:
+    root = Path(root).resolve()
+    rec = _load_state().get("chroots", {}).get(str(root))
+    if not rec:
+        # quick auto check
+        mounts = _detect_mounts_under(root)
+        return any(mounts)
+    # verify mounts exist and are mounted
+    for m in rec.get("mounts", []):
+        dst = Path(m.get("dst"))
+        if not _is_mounted(dst):
+            return False
+    return True
+
+def ensure_network(root: Path, timeout: int = 10) -> bool:
+    """
+    Ensure DNS resolution inside chroot works by testing /etc/resolv.conf and pinging a host.
+    Returns True if network usable.
+    """
+    root = Path(root).resolve()
+    resolv = root / "etc" / "resolv.conf"
+    if not resolv.exists():
+        logger.warning("resolv.conf missing inside chroot")
+        return False
+    # try simple DNS resolve using host command inside chroot or fallback to querying via host network
+    try:
+        rc, out, err = _run(["chroot", str(root), "sh", "-c", "getent hosts ftp.gnu.org >/dev/null 2>&1"], check=False, capture=True, timeout=timeout)
+        ok = rc == 0
+        logger.debug(f"DNS check inside chroot returned rc={rc}")
+        return ok
+    except Exception:
+        return False
+
+def run_in_chroot(cfg_or_root: Any, command: str, env: Optional[Dict[str,str]] = None,
+                  fakeroot: bool = False, dry_run: bool = False, timeout: Optional[int] = None) -> Tuple[int, str, str]:
+    """
+    Run a shell command inside the chroot. cfg_or_root may be either config dict with path or direct path.
+    Returns (rc, stdout, stderr).
+    """
+    if isinstance(cfg_or_root, dict):
+        root = Path(cfg_or_root.get("paths", {}).get("root", "/"))
+    else:
+        root = Path(cfg_or_root)
+    root = root.resolve()
+
+    if dry_run:
+        logger.info(f"[dry-run] run in chroot: {command}")
+        return 0, "", ""
+
+    # ensure chroot ready
+    if not is_chroot_ready(root):
+        raise RuntimeError("Chroot not prepared; call prepare_chroot first")
+
+    # build command for chroot: use env and fakeroot wrapper if requested
+    cmd = ["chroot", str(root), "sh", "-c", command]
+    if fakeroot:
+        # wrap with fakeroot if available
+        if shutil.which("fakeroot"):
+            cmd = ["fakeroot", "--"] + cmd
+        else:
+            logger.warning("fakeroot requested but not found; proceeding without fakeroot")
+
+    return _run(cmd, check=False, capture=True, timeout=timeout)
+
+def exec_in_chroot(root: Path, argv: List[str], env: Optional[Dict[str,str]] = None,
+                   fakeroot: bool = False, dry_run: bool = False) -> int:
+    """
+    Exec a binary (argv list) inside the chroot. Returns exit code.
+    """
+    root = Path(root).resolve()
+    if dry_run:
+        logger.info(f"[dry-run] exec in chroot: {' '.join(argv)}")
+        return 0
+    if not is_chroot_ready(root):
+        raise RuntimeError("Chroot not prepared")
+    cmd = ["chroot", str(root)] + argv
+    if fakeroot and shutil.which("fakeroot"):
+        cmd = ["fakeroot", "--"] + cmd
+    rc, out, err = _run(cmd, check=False, capture=True)
+    if rc != 0:
+        logger.warning(f"exec_in_chroot rc={rc} out={out} err={err}")
+    return rc
+
+def verify_chroot(root: Path, full: bool = False) -> Dict[str, Any]:
+    """
+    Run diagnostics on a chroot. Returns a report dict with mounted, missing, problems.
+    """
+    root = Path(root).resolve()
+    rec = _load_state().get("chroots", {}).get(str(root), {})
+    mounts = rec.get("mounts", []) if rec else _detect_mounts_under(root)
+    problems = []
+    mounted = []
+    for m in mounts:
+        dst = Path(m.get("dst"))
+        ok = _is_mounted(dst)
+        mounted.append({"dst": m.get("dst"), "mounted": ok, "type": m.get("type")})
+        if not ok:
+            problems.append(f"Not mounted: {dst}")
+    net_ok = ensure_network(root)
+    if not net_ok:
+        problems.append("Network (DNS) appears not working inside chroot")
+    report = {"root": str(root), "mounted": mounted, "problems": problems, "checked_at": int(time.time())}
+    if full:
+        # extra checks: check /proc entries and /dev presence
+        proc_ok = (root / "proc").exists() and _is_mounted(root / "proc")
+        dev_ok = (root / "dev").exists()
+        report["proc_ok"] = proc_ok
+        report["dev_ok"] = dev_ok
+    return report
+
+def force_cleanup_all(dry_run: bool = False) -> List[str]:
+    """
+    Force cleanup of all recorded chroots in state file. Returns list of cleaned roots.
+    """
+    state = _load_state()
+    roots = list(state.get("chroots", {}).keys())
+    cleaned = []
+    for r in roots:
+        try:
+            if dry_run:
+                logger.info(f"[dry-run] would cleanup {r}")
+                cleaned.append(r)
+                continue
+            rec = state["chroots"].get(r, {})
+            mounts = rec.get("mounts", [])
+            cleanup_chroot(Path(r), mounts=mounts, lazy=True, dry_run=False)
+            # remove entry
+            state = _load_state()
+            state.get("chroots", {}).pop(r, None)
+            _save_state(state)
+            cleaned.append(r)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup {r}: {e}")
+    return cleaned
+
+def cleanup_stale(threshold_secs: int = 3600, dry_run: bool = False) -> List[str]:
+    """
+    Cleanup chroots older than threshold (based on prepared_at). Returns list cleaned.
+    """
+    state = _load_state()
+    now = int(time.time())
+    cleaned = []
+    for r, rec in list(state.get("chroots", {}).items()):
+        prepared = rec.get("prepared_at", 0)
+        if now - prepared > threshold_secs:
+            if dry_run:
+                logger.info(f"[dry-run] stale chroot {r} would be cleaned (age={now-prepared}s)")
+                cleaned.append(r)
+                continue
+            try:
+                cleanup_chroot(Path(r), mounts=rec.get("mounts", []), lazy=True, dry_run=False)
+                state = _load_state()
+                state.get("chroots", {}).pop(r, None)
+                _save_state(state)
+                cleaned.append(r)
+            except Exception as e:
+                logger.warning(f"Failed cleaning stale chroot {r}: {e}")
+    return cleaned
+
+# ---- CLI ----------------------------------------------------------------
+def _cli():
+    import argparse
+    parser = argparse.ArgumentParser(prog="zeropkg-chroot", description="Manage safe chroots for building")
+    sub = parser.add_subparsers(dest="cmd")
+    p_prep = sub.add_parser("prepare")
+    p_prep.add_argument("root", help="root path to prepare")
+    p_prep.add_argument("--profile", default="lfs", help="profile (lfs|blfs|x11|minimal)")
+    p_prep.add_argument("--overlay", action="store_true", help="use overlayfs")
+    p_prep.add_argument("--dry-run", action="store_true")
+    p_prep.add_argument("--force", action="store_true")
+
+    p_clean = sub.add_parser("cleanup")
+    p_clean.add_argument("root", help="root path to cleanup")
+    p_clean.add_argument("--no-lazy", action="store_true", help="do not use lazy unmount")
+    p_clean.add_argument("--dry-run", action="store_true")
+
+    p_list = sub.add_parser("list")
+    p_verify = sub.add_parser("verify")
+    p_verify.add_argument("root", help="root to verify")
+    p_verify.add_argument("--full", action="store_true")
+    p_force = sub.add_parser("force-clean")
+    p_force.add_argument("--dry-run", action="store_true")
+
+    p_stale = sub.add_parser("cleanup-stale")
+    p_stale.add_argument("--age", type=int, default=3600)
+    p_stale.add_argument("--dry-run", action="store_true")
+
+    args = parser.parse_args()
+    if args.cmd == "prepare":
+        mounts = prepare_chroot(Path(args.root), profile=args.profile, overlay=args.overlay, dry_run=args.dry_run, force=args.force)
+        print(json.dumps(mounts, indent=2))
+    elif args.cmd == "cleanup":
+        mounts = cleanup_chroot(Path(args.root), lazy=not args.no_lazy, dry_run=args.dry_run)
+        print(json.dumps(mounts, indent=2))
+    elif args.cmd == "list":
+        print(json.dumps(list_chroots(), indent=2))
+    elif args.cmd == "verify":
+        print(json.dumps(verify_chroot(Path(args.root), full=args.full), indent=2))
+    elif args.cmd == "force-clean":
+        res = force_cleanup_all(dry_run=args.dry_run)
+        print(json.dumps(res, indent=2))
+    elif args.cmd == "cleanup-stale":
+        res = cleanup_stale(threshold_secs=args.age, dry_run=args.dry_run)
+        print(json.dumps(res, indent=2))
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    _cli()
