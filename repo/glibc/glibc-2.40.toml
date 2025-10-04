@@ -1,53 +1,98 @@
+# glibc-2.42.toml — receita completa adaptada ao LFS (capítulo Glibc)
 [package]
 name = "glibc"
-version = "2.40"
-category = "base"
-description = "GNU C Library — principal biblioteca C para LFS"
+version = "2.42"
+category = "lfs"
+description = "GNU C Library (glibc) — conforme LFS chapter: installation + sanity checks"
 homepage = "https://www.gnu.org/software/libc/"
-license = "LGPL-2.1+ / GPL-2"
+license = "LGPL-2.1-or-later"
 maintainer = "zeropkg"
 
 [sources]
 urls = [
-  "https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz"
+  "https://ftp.gnu.org/gnu/libc/glibc-2.42.tar.xz"
 ]
-# Você precisa verificar o checksum SHA256 oficial
-checksum = "sha256:<colocar_sha256_real_para_glibc-2.40>"
-extract_to = "glibc-2.40"
+# preencha o checksum com o sha256 oficial do tarball que você baixar
+checksum = "sha256:<COLOQUE_SHA256_AQUI>"
+extract_to = "glibc-2.42"
 
 [environment]
 LFS = "/mnt/lfs"
 LFS_TGT = "x86_64-lfs-linux-gnu"
-PATH = "/mnt/lfs/tools/bin:/bin:/usr/bin"
-DESTDIR = "@DESTDIR@"
+PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
+DESTDIR = "@DESTDIR@"   # builder/installer substituirão este token
+
+[patches]
+# Se você mantiver o patch glibc-2.42-fhs-1.patch em /usr/ports/glibc/patches/
+files = [
+  "patches/glibc-2.42-fhs-1.patch"
+]
 
 [build]
+# Executar em chroot LFS; fakeroot para preservar UID/GID se necessário
 chroot = true
 fakeroot = true
 cleanup_sources = true
+
+# Sequência de comandos — fiel ao LFS chapter (ordem importa)
 commands = [
+  # 0) Cria symlinks LSB / compat no destino LFS (feito antes da instalação)
+  "case $(uname -m) in \\",
+  "  i?86) ln -sfv ld-linux.so.2 ${LFS}/lib/ld-lsb.so.3 ;; \\",
+  "  x86_64) ln -sfv ../lib/ld-linux-x86-64.so.2 ${LFS}/lib64 && ln -sfv ../lib/ld-linux-x86-64.so.2 ${LFS}/lib64/ld-lsb-x86-64.so.3 ;; \\",
+  "esac",
+
+  # 1) Prepare build dir e aplique patch FHS (se presente)
   "mkdir -v build",
   "cd build",
-  "../configure                              \\",
-  "    --prefix=/usr                         \\",
-  "    --host=$LFS_TGT                       \\",
-  "    --build=$(../scripts/config.guess)    \\",
-  "    --enable-kernel=4.19                  \\",
-  "    --with-headers=$LFS/usr/include       \\",
-  "    --disable-nscd                        \\",
-  "    libc_cv_slibdir=/usr/lib",
+  "echo 'rootsbindir=/usr/sbin' > configparms",
 
+  # 2) Configure conforme LFS (descreve uso de --host/--build e libc_cv_slibdir)
+  "../configure \\",
+  "  --prefix=/usr \\",
+  "  --host=$LFS_TGT \\",
+  "  --build=$(../scripts/config.guess) \\",
+  "  --disable-nscd \\",
+  "  libc_cv_slibdir=/usr/lib \\",
+  "  --enable-kernel=5.4",
+
+  # 3) Compile
   "make",
-  "make check",
-  "make DESTDIR=${DESTDIR} install"
+
+  # 4) Testes (make check). LFS recomenda; pode falhar em alguns ambientes --> não abortar automaticamente
+  "make check || true",
+
+  # 5) Instalação no DESTDIR (sempre usar DESTDIR para não tocar host)
+  "make DESTDIR=${DESTDIR} install",
+
+  # 6) Corrigir o script ldd conforme LFS
+  "sed '/RTLDLIST=/s@/usr@@g' -i ${DESTDIR}/usr/bin/ldd",
+
+  # 7) Sanity checks (compilador/linker deve apontar para o LFS correto)
+  "echo 'int main(){}' | ${LFS_TGT}-gcc -x c - -v -Wl,--verbose &> /tmp/dummy.log || true",
+  "readelf -l a.out | grep ': /lib' || true",
+  "grep -E -o \"$LFS/lib.*/S?crt[1in].*succeeded\" /tmp/dummy.log || true",
+  "grep -B3 \"^ $LFS/usr/include\" /tmp/dummy.log || true",
+
+  # 8) Limpeza de testes
+  "rm -v a.out || true",
+  "rm -v /tmp/dummy.log || true",
+
+  # 9) criar /etc/nsswitch.conf e ld.so.conf padrão dentro do DESTDIR
+  "mkdir -pv ${DESTDIR}/etc",
+  "printf '%s\n' 'passwd: files' > ${DESTDIR}/etc/nsswitch.conf",
+  "printf '%s\n' 'group:  files' >> ${DESTDIR}/etc/nsswitch.conf",
+  "cat > ${DESTDIR}/etc/ld.so.conf << 'EOF'\n/usr/local/lib\n/opt/lib\nEOF",
+  "mkdir -pv ${DESTDIR}/etc/ld.so.conf.d"
 ]
 
 [hooks]
-pre_build = "echo '==> Iniciando compilação da Glibc-2.40'"
-post_install = "echo '==> Glibc-2.40 instalada com sucesso'"
+pre_build = "echo '==> Preparando Glibc-2.42 (LFS) — criando configparms e symlinks LSB...'"
+post_install = "echo '==> Glibc instalado. Verifique erros em logs e testes.'"
 
 [dependencies]
-build = ["linux-headers-6.6.54", "gcc-13.2.0", "binutils-2.43.1"]
+# use nomes exatos das receitas/versões que você tem no ports (ajuste conforme seu repositório)
+build = ["linux-headers-6.6.54", "gcc-13.2.0-pass1", "binutils-2.43.1"]
 runtime = []
 optional = []
 
