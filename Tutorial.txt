@@ -8,6 +8,128 @@ Executável: /usr/bin/zeropkg
 Módulos: /usr/lib/zeropkg/modules/
 
 ------------------------------------------------------------
+4. CONFIGURAÇÃO PADRÃO (/etc/zeropkg/config.toml)
+------------------------------------------------------------
+[paths]
+state_dir = "/var/lib/zeropkg"
+build_dir = "/var/zeropkg/build"
+backup_dir = "/var/lib/zeropkg/backups"
+db_path = "/var/lib/zeropkg/installed.sqlite3"
+log_dir = "/var/lib/zeropkg/logs"
+repo_dir = "/usr/ports"
+
+[install]
+fakeroot = true
+safe_chroot = true
+
+[repos]
+core = "https://github.com/fcanata00/Zeropkg-core.git"
+extra = "https://github.com/fcanata00/Zeropkg-extra.git"
+
+------------------------------------------------------------
+4.1 DEFINIÇÃO DE CONJUNTOS (world.base, world.xorg, etc.)
+------------------------------------------------------------
+O Zeropkg permite definir grupos de pacotes no config.toml.
+O grupo principal `world.base` é usado pelo comando `build-world (-B)`.
+
+Cada grupo pode conter uma lista de pacotes definidos nas receitas (.toml)
+do repositório sincronizado em /usr/ports.
+
+[world]
+base = [
+  "binutils",
+  "gcc",
+  "glibc",
+  "linux-headers",
+  "bash",
+  "coreutils",
+  "findutils",
+  "gawk",
+  "grep",
+  "sed",
+  "make",
+  "diffutils",
+  "file",
+  "gzip",
+  "tar",
+  "xz",
+  "bzip2",
+  "util-linux",
+  "shadow",
+  "ncurses"
+]
+
+# Outros grupos opcionais:
+xorg = [
+  "xorg-server",
+  "mesa",
+  "xinit",
+  "libx11",
+  "libxext",
+  "libxrandr",
+  "xf86-video-intel"
+]
+
+kde = [
+  "qtbase",
+  "kwin",
+  "plasma-workspace",
+  "dolphin",
+  "konsole",
+  "okular"
+]
+
+blfs = [
+  "openssl",
+  "curl",
+  "zlib",
+  "python",
+  "git",
+  "vim",
+  "nano",
+  "sudo"
+]
+
+# Qualquer conjunto definido aqui pode ser construído manualmente:
+# Exemplo: zeropkg build-world --set xorg
+# (implementação futura)
+
+------------------------------------------------------------
+USO DO COMANDO build-world (-B)
+------------------------------------------------------------
+Para construir e instalar todos os pacotes definidos no conjunto [world.base]:
+
+  zeropkg build-world
+  zeropkg -B
+
+Para usar chroot alternativo (exemplo LFS):
+
+  zeropkg -B --root /mnt/lfs
+
+Para simular o processo:
+
+  zeropkg -B --dry-run
+
+Para instalar em paralelo após a construção:
+
+  zeropkg -B --parallel
+
+O Zeropkg irá:
+  • Resolver dependências via zeropkg_deps
+  • Construir todos os pacotes listados em ordem
+  • Instalar cada um via zeropkg_installer dentro do chroot
+  • Gerar logs detalhados e atualizar o banco de dados
+  • Executar hooks pós-instalação (ex: ldconfig, mkinitcpio)
+
+------------------------------------------------------------
+OBSERVAÇÕES
+------------------------------------------------------------
+- Todos os pacotes mencionados em world.* devem ter receitas válidas em /usr/ports.
+- O comando build-world respeita o ambiente configurado em /etc/zeropkg/config.toml.
+- Você pode adicionar quantos conjuntos quiser (base, xorg, kde, blfs, minimal, etc.).
+- Cada conjunto pode ser ativado individualmente com scripts de automação.
+
+------------------------------------------------------------
 1. DESCRIÇÃO
 ------------------------------------------------------------
 Zeropkg é um gerenciador de pacotes baseado em código-fonte (source-based)
