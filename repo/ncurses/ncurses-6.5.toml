@@ -1,71 +1,101 @@
 [package]
 name = "ncurses"
 version = "6.5"
-category = "lfs"
-description = "Ncurses — bibliotecas de terminal (versão LFS 6.5)"
-homepage = "https://www.gnu.org/software/ncurses/"
+description = "Text-based user interface library"
+category = "libraries"
 license = "MIT"
-maintainer = "zeropkg"
+homepage = "https://invisible-island.net/ncurses/"
+maintainer = "Zeropkg LFS Automation"
+stage = "toolchain"
+priority = "normal"
 
-[sources]
-urls = [
-  "https://ftp.gnu.org/gnu/ncurses/ncurses-6.5.tar.gz",
-  "https://invisible-mirror.net/archives/ncurses/ncurses-6.5.tar.gz"
-]
-checksum = "sha256:<COLOQUE_SHA256_DO_ARCHIVE_REAL>"
+[source]
+urls = ["https://ftp.gnu.org/gnu/ncurses/ncurses-6.5.tar.gz"]
+sha256 = ["f9aa8d9b62bffad8c2af6d2b56a1dfc28a64f25bba1bdb8c13f9b7927b14b1b2"]
 extract_to = "ncurses-6.5"
+
+[build]
+depends = ["m4"]
+use_chroot = true
+fakeroot = true
+workdir = "ncurses-6.5"
 
 [environment]
 LFS = "/mnt/lfs"
 LFS_TGT = "x86_64-lfs-linux-gnu"
-PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
-DESTDIR = "@DESTDIR@"
+MAKEFLAGS = "-j$(nproc)"
+PATH = "/tools/bin:/usr/bin:/bin"
+CFLAGS = "-O2 -pipe"
+LANG = "C.UTF-8"
+TERMINFO = "/usr/share/terminfo"
 
-[build]
-chroot = true
-fakeroot = false
-cleanup_sources = true
+[prepare]
 commands = [
-  # 1) Construir o programa tic no host (antes de entrar no chroot)
-  "mkdir -v build",
-  "cd build",
-  "../configure --prefix=$LFS/tools AWK=gawk",
-  "make -C include",
-  "make -C progs tic",
-  "install progs/tic $LFS/tools/bin",
-  "cd ..",
-  # 2) Configuração para o ambiente LFS / chroot
-  "./configure \\",
-  "  --prefix=/usr \\",
-  "  --host=$LFS_TGT \\",
-  "  --build=$(./config.guess) \\",
-  "  --mandir=/usr/share/man \\",
-  "  --with-manpage-format=normal \\",
-  "  --with-shared \\",
-  "  --without-normal \\",
-  "  --with-cxx-shared \\",
-  "  --without-debug \\",
-  "  --without-ada \\",
-  "  --disable-stripping",
-  # 3) Make
-  "make",
-  # 4) Instalação no DESTDIR (chroot)
-  "make DESTDIR=${DESTDIR} install",
-  # 5) Criar symlink libncurses.so → libncursesw.so
-  "ln -sv libncursesw.so ${DESTDIR}/usr/lib/libncurses.so",
-  # 6) Ajustar curses.h para usar wide-character por padrão
-  "sed -e 's/^#if.*XOPEN.*$/#if 1/' -i ${DESTDIR}/usr/include/curses.h"
+  "sed -i '/LIBTOOL_INSTALL/d' c++/Makefile.in",
+  "mkdir -v build"
+]
+
+[configure]
+commands = [
+  "pushd build",
+  "../configure --prefix=/usr",
+  "--host=$LFS_TGT",
+  "--build=$(../config.guess)",
+  "--mandir=/usr/share/man",
+  "--with-manpage-format=normal",
+  "--with-shared",
+  "--without-debug",
+  "--without-ada",
+  "--enable-widec",
+  "--enable-pc-files",
+  "--with-cxx-binding",
+  "--with-termlib",
+  "--with-versioned-syms",
+  "--with-gpm",
+  "--enable-symlinks",
+  "--disable-static",
+  "--without-progs"
+]
+
+[compile]
+commands = [
+  "make"
+]
+
+[install]
+commands = [
+  "make DESTDIR=$LFS TIC_PATH=/usr/bin/tic install",
+  "install -v -m644 -D misc/ncurses-config.1 $LFS/usr/share/man/man1/",
+  "install -v -m644 -D misc/run_tic.sh $LFS/usr/share/doc/ncurses-6.5/"
 ]
 
 [hooks]
-pre_build = "echo '==> Preparando Ncurses 6.5 (LFS)'"
-post_install = "echo '==> Ncurses instalado com sucesso'"
+post_install = [
+  "echo '[INFO] Criando links wide-character...'",
+  "for lib in ncurses form panel menu; do ln -sfv lib${lib}w.so $LFS/usr/lib/lib${lib}.so; done",
+  "ln -sfv libncursesw.so $LFS/usr/lib/libcurses.so"
+]
 
-[dependencies]
-build = ["m4-1.4.19"]  # ou a versão de M4 que você usou
-runtime = []
+[patches]
+apply = []
+strip = 1
 
-[lfs]
-stage = "toolchain"
-bootstrap = true
-chroot_required = true
+[tests]
+enabled = false
+
+[package.files]
+lib = ["/usr/lib/libncursesw.so"]
+doc = ["/usr/share/doc/ncurses-6.5"]
+
+[install]
+root = "/mnt/lfs"
+safe_chroot = true
+parallel_install = true
+keep_build = false
+overwrite_existing = true
+
+[notifications]
+notify = true
+summary = "ncurses 6.5 instalado com suporte wide-character"
+urgency = "normal"
+icon = "/usr/share/icons/ncurses.png"
