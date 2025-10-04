@@ -1,0 +1,71 @@
+[package]
+name = "ncurses"
+version = "6.5"
+category = "lfs"
+description = "Ncurses — bibliotecas de terminal (versão LFS 6.5)"
+homepage = "https://www.gnu.org/software/ncurses/"
+license = "MIT"
+maintainer = "zeropkg"
+
+[sources]
+urls = [
+  "https://ftp.gnu.org/gnu/ncurses/ncurses-6.5.tar.gz",
+  "https://invisible-mirror.net/archives/ncurses/ncurses-6.5.tar.gz"
+]
+checksum = "sha256:<COLOQUE_SHA256_DO_ARCHIVE_REAL>"
+extract_to = "ncurses-6.5"
+
+[environment]
+LFS = "/mnt/lfs"
+LFS_TGT = "x86_64-lfs-linux-gnu"
+PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
+DESTDIR = "@DESTDIR@"
+
+[build]
+chroot = true
+fakeroot = false
+cleanup_sources = true
+commands = [
+  # 1) Construir o programa tic no host (antes de entrar no chroot)
+  "mkdir -v build",
+  "cd build",
+  "../configure --prefix=$LFS/tools AWK=gawk",
+  "make -C include",
+  "make -C progs tic",
+  "install progs/tic $LFS/tools/bin",
+  "cd ..",
+  # 2) Configuração para o ambiente LFS / chroot
+  "./configure \\",
+  "  --prefix=/usr \\",
+  "  --host=$LFS_TGT \\",
+  "  --build=$(./config.guess) \\",
+  "  --mandir=/usr/share/man \\",
+  "  --with-manpage-format=normal \\",
+  "  --with-shared \\",
+  "  --without-normal \\",
+  "  --with-cxx-shared \\",
+  "  --without-debug \\",
+  "  --without-ada \\",
+  "  --disable-stripping",
+  # 3) Make
+  "make",
+  # 4) Instalação no DESTDIR (chroot)
+  "make DESTDIR=${DESTDIR} install",
+  # 5) Criar symlink libncurses.so → libncursesw.so
+  "ln -sv libncursesw.so ${DESTDIR}/usr/lib/libncurses.so",
+  # 6) Ajustar curses.h para usar wide-character por padrão
+  "sed -e 's/^#if.*XOPEN.*$/#if 1/' -i ${DESTDIR}/usr/include/curses.h"
+]
+
+[hooks]
+pre_build = "echo '==> Preparando Ncurses 6.5 (LFS)'"
+post_install = "echo '==> Ncurses instalado com sucesso'"
+
+[dependencies]
+build = ["m4-1.4.19"]  # ou a versão de M4 que você usou
+runtime = []
+
+[lfs]
+stage = "toolchain"
+bootstrap = true
+chroot_required = true
