@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zeropkg_logger.py — Sistema de logging central do Zeropkg
-Integrado com zeropkg_config e zeropkg_db.
+Zeropkg Logger Module
+---------------------
+Sistema unificado de logging para todos os módulos Zeropkg.
+
+Recursos:
+- Logs em texto e JSON (com compressão .gz)
+- Rotação automática
+- Integração com zeropkg_db (DBManager)
+- Captura de exceções com tracebacks detalhados
+- Criação de logs por sessão de build/instalação
+- Compatível com chroot e fakeroot
 """
 
 import os
 import sys
 import json
-import time
+import gzip
+import shutil
+import traceback
+import datetime
 import logging
 from logging.handlers import RotatingFileHandler
-from threading import Lock
-
-try:
-    from zeropkg_config import load_config
-except ImportError:
-    load_config = lambda: {"paths": {"log_dir": "/var/log/zeropkg"}, "logging": {"level": "INFO", "json": False}}
 
 try:
     from zeropkg_db import DBManager
@@ -24,120 +30,119 @@ except ImportError:
     DBManager = None
 
 
-# 🔒 Lock global para acesso thread-safe
-_log_lock = Lock()
-_logger_cache = {}
+class ZeropkgLogger:
+    def __init__(self, log_dir="/var/log/zeropkg", db_path="/var/lib/zeropkg/zeropkg.db"):
+        self.log_dir = os.path.abspath(log_dir)
+        self.db_path = db_path
+        self.db = DBManager(db_path) if DBManager else None
+        os.makedirs(self.log_dir, exist_ok=True)
 
+        # Caminho principal dos logs
+        self.text_log_path = os.path.join(self.log_dir, "zeropkg.log")
+        self.json_log_path = os.path.join(self.log_dir, "zeropkg.jsonl")
 
-def _ensure_log_dir(path: str):
-    """Garante que o diretório de logs existe e possui permissões seguras."""
-    if not os.path.exists(path):
-        os.makedirs(path, mode=0o750, exist_ok=True)
-    elif not os.access(path, os.W_OK):
-        raise PermissionError(f"Sem permissão para gravar em {path}")
+        # Configuração do logger padrão
+        self.logger = logging.getLogger("zeropkg")
+        self.logger.setLevel(logging.DEBUG)
 
+        # Evita duplicação de handlers
+        if not self.logger.handlers:
+            self._setup_handlers()
 
-def get_logger(name: str = "zeropkg", stage: str = None) -> logging.Logger:
-    """Retorna (ou cria) um logger configurado com rotação e formato adequado."""
-    with _log_lock:
-        config = load_config()
-        log_dir = config.get("paths", {}).get("log_dir", "/var/log/zeropkg")
-        log_json = config.get("logging", {}).get("json", False)
-        log_level = getattr(logging, config.get("logging", {}).get("level", "INFO").upper(), logging.INFO)
-
-        _ensure_log_dir(log_dir)
-        logger_name = f"{name}.{stage}" if stage else name
-
-        if logger_name in _logger_cache:
-            return _logger_cache[logger_name]
-
-        logger = logging.getLogger(logger_name)
-        logger.setLevel(log_level)
-        logger.propagate = False
-
-        # Formato
-        fmt = (
-            json.dumps({"time": "%(asctime)s", "level": "%(levelname)s", "msg": "%(message)s"})
-            if log_json
-            else "%(asctime)s [%(levelname)s] %(message)s"
+    def _setup_handlers(self):
+        # Log em texto com rotação
+        text_handler = RotatingFileHandler(
+            self.text_log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
         )
-        formatter = logging.Formatter(fmt, "%Y-%m-%d %H:%M:%S")
+        text_formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] [%(module)s] %(message)s", "%Y-%m-%d %H:%M:%S"
+        )
+        text_handler.setFormatter(text_formatter)
 
-        # Handler de arquivo rotativo
-        log_path = os.path.join(log_dir, f"{logger_name}.log")
-        file_handler = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
-        # Handler de console
+        # Saída no terminal
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
+        console_handler.setFormatter(text_formatter)
 
-        _logger_cache[logger_name] = logger
-        return logger
+        self.logger.addHandler(text_handler)
+        self.logger.addHandler(console_handler)
 
+    def _write_json(self, level, module, message, **kwargs):
+        """Escreve log em formato JSON + compressão automática."""
+        log_entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "level": level,
+            "module": module,
+            "message": message,
+            "extra": kwargs,
+        }
+        os.makedirs(os.path.dirname(self.json_log_path), exist_ok=True)
+        with open(self.json_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
+        self._compress_json_if_needed()
 
-def log_event(pkg: str, stage: str, message: str, level: str = "info"):
-    """Loga um evento para um pacote e opcionalmente registra no banco de dados."""
-    logger = get_logger(pkg, stage)
-    log_func = getattr(logger, level.lower(), logger.info)
-    log_func(message)
+    def _compress_json_if_needed(self):
+        """Compacta JSON se o arquivo ultrapassar 10MB."""
+        if os.path.exists(self.json_log_path) and os.path.getsize(self.json_log_path) > 10 * 1024 * 1024:
+            gz_path = f"{self.json_log_path}.{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.gz"
+            with open(self.json_log_path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            open(self.json_log_path, "w").close()
 
-    # Registrar também no banco de dados, se disponível
-    if DBManager:
-        try:
-            with DBManager() as db:
-                db.conn.execute(
-                    "INSERT INTO events (pkg_name, stage, event, timestamp) VALUES (?, ?, ?, ?)",
-                    (pkg, stage, message, int(time.time())),
-                )
-        except Exception:
-            pass
+    def log(self, level, message, module="core", **kwargs):
+        """Log unificado (texto + JSON + DB)."""
+        if level.lower() == "debug":
+            self.logger.debug(message)
+        elif level.lower() == "info":
+            self.logger.info(message)
+        elif level.lower() == "warning":
+            self.logger.warning(message)
+        elif level.lower() == "error":
+            self.logger.error(message)
+        elif level.lower() == "critical":
+            self.logger.critical(message)
+        else:
+            self.logger.info(message)
 
+        self._write_json(level.upper(), module, message, **kwargs)
 
-def log_global(message: str, level: str = "info"):
-    """Loga mensagens globais (fora do contexto de pacote)."""
-    logger = get_logger("zeropkg")
-    log_func = getattr(logger, level.lower(), logger.info)
-    log_func(message)
-
-    if DBManager:
-        try:
-            with DBManager() as db:
-                db.conn.execute(
-                    "INSERT INTO events (pkg_name, stage, event, timestamp) VALUES (?, ?, ?, ?)",
-                    ("global", "system", message, int(time.time())),
-                )
-        except Exception:
-            pass
-
-
-def rotate_logs(max_age_days: int = 30):
-    """Remove logs antigos automaticamente."""
-    config = load_config()
-    log_dir = config.get("paths", {}).get("log_dir", "/var/log/zeropkg")
-    now = time.time()
-
-    for fname in os.listdir(log_dir):
-        fpath = os.path.join(log_dir, fname)
-        if not os.path.isfile(fpath):
-            continue
-        if now - os.path.getmtime(fpath) > max_age_days * 86400:
+        # Registro opcional no DB
+        if self.db:
             try:
-                os.remove(fpath)
-            except Exception:
-                pass
+                self.db.insert_log(level.upper(), module, message)
+            except Exception as e:
+                self.logger.error(f"Falha ao registrar log no DB: {e}")
 
+    def log_exception(self, module, exc: Exception):
+        """Captura exceções e loga traceback completo."""
+        tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        self.log("error", f"Exception in {module}: {exc}", module=module, traceback=tb_str)
 
-def get_session_logger():
-    """Cria logger específico para sessões (ex: chamadas CLI)."""
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    return get_logger(f"session-{ts}")
+    def new_session(self, action_type, package=None):
+        """Cria um log de sessão para build/instalação."""
+        session_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        session_log = os.path.join(self.log_dir, f"session-{session_id}.log")
+        self.log("info", f"Iniciando nova sessão: {action_type} para {package or 'desconhecido'}")
+        if self.db:
+            self.db.insert_session(session_id, action_type, package)
+        return session_id, session_log
 
+    def cleanup_old_logs(self, keep_days=30):
+        """Remove logs antigos."""
+        now = datetime.datetime.now()
+        for f in os.listdir(self.log_dir):
+            fpath = os.path.join(self.log_dir, f)
+            if os.path.isfile(fpath):
+                mtime = datetime.datetime.fromtimestamp(os.path.getmtime(fpath))
+                if (now - mtime).days > keep_days:
+                    os.remove(fpath)
+                    self.log("info", f"Log antigo removido: {fpath}")
 
 # Exemplo de uso
 if __name__ == "__main__":
-    log_global("Inicializando Zeropkg Logger", "info")
-    log_event("gcc", "build", "Compilando GCC etapa 1", "info")
-    log_event("glibc", "install", "Instalação concluída com sucesso", "info")
+    logger = ZeropkgLogger()
+    logger.log("info", "Teste de log de informação.")
+    logger.log("error", "Erro simulado no sistema.", module="installer")
+    try:
+        raise RuntimeError("Exceção de teste")
+    except Exception as e:
+        logger.log_exception("builder", e)
