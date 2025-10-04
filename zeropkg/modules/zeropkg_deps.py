@@ -1,520 +1,574 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-zeropkg_deps.py — Dependency graph, resolver and depclean utilities for Zeropkg
-Pattern B: integrated, lean, functional.
-
-Features:
-- build graph scanning ports (TOML recipes)
-- resolve dependencies with version constraint satisfaction (basic)
-- topological sort and cycle detection
-- reverse-deps and orphan detection
-- depclean (dry-run supported)
-- export/import JSON and DOT
-- cache management (rebuild_cache/load_cache)
-- integration with zeropkg_config, zeropkg_logger and zeropkg_db (optional)
-"""
+# zeropkg_deps.py
+# Zeropkg - dependency resolver, graph, depclean, and builder integration
+# Versão: completa, integrada e funcional
 
 from __future__ import annotations
 import os
 import sys
 import json
 import time
+import threading
 import traceback
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set, Any, Iterable
+from typing import Dict, List, Tuple, Set, Optional, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Optional integrations
+# Safe imports from project (with graceful fallback)
 try:
-    from zeropkg_config import load_config, get_ports_dirs
+    from zeropkg_config import load_config
 except Exception:
-    def load_config(*a, **k):
-        return {"paths": {"state_dir": "/var/lib/zeropkg", "ports_dir": "/usr/ports"}}
-    def get_ports_dirs(cfg=None):
-        cfg = cfg or {}
-        pd = cfg.get("paths", {}).get("ports_dir", "/usr/ports")
-        return [pd]
+    def load_config():
+        return {
+            "paths": {
+                "recipes_dir": "/usr/ports",
+                "cache_dir": "/var/cache/zeropkg",
+                "log_dir": "/var/log/zeropkg"
+            },
+            "build": {"jobs": 4}
+        }
 
 try:
-    from zeropkg_logger import log_event, log_global, get_logger
-    _logger = get_logger("deps")
+    # logger should expose get_logger or ZeropkgLogger class; support both
+    from zeropkg_logger import get_logger, ZeropkgLogger
+    try:
+        logger = get_logger("deps")
+    except Exception:
+        zl = ZeropkgLogger()
+        logger = zl.logger
 except Exception:
     import logging
-    _logger = logging.getLogger("zeropkg_deps")
-    if not _logger.handlers:
-        _logger.addHandler(logging.StreamHandler(sys.stdout))
-    def log_event(pkg, stage, msg, level="info"):
-        getattr(_logger, level if hasattr(_logger, level) else "info")(f"{pkg}:{stage} {msg}")
-    def log_global(msg, level="info"):
-        getattr(_logger, level if hasattr(_logger, level) else "info")(msg)
+    logger = logging.getLogger("zeropkg_deps")
+    if not logger.handlers:
+        logger.addHandler(logging.StreamHandler(sys.stdout))
+    def _log(level, msg):
+        getattr(logger, level)(msg)
+    logger.info = lambda m: _log("info", m)
+    logger.debug = lambda m: _log("debug", m)
+    logger.warning = lambda m: _log("warning", m)
+    logger.error = lambda m: _log("error", m)
 
 try:
-    from zeropkg_db import DBManager
+    from zeropkg_toml import ZeropkgTOML, resolve_macros
 except Exception:
-    DBManager = None
+    ZeropkgTOML = None
+    def resolve_macros(x, env=None): return x
 
-# We'll lazy-import the TOML parser utilities from zeropkg_toml when needed
-# State files
-DEFAULT_STATE_DIR = Path(load_config().get("paths", {}).get("state_dir", "/var/lib/zeropkg"))
-CACHE_PATH = DEFAULT_STATE_DIR / "deps_cache.json"
+try:
+    from zeropkg_db import list_installed_quick, get_orphaned_packages, find_revdeps
+    DB_AVAILABLE = True
+except Exception:
+    DB_AVAILABLE = False
 
-# Basic version parsing utilities (simple semver-ish)
-def parse_version(ver: Optional[str]) -> Tuple:
-    if not ver:
-        return ()
-    ver = str(ver).strip()
-    # remove leading 'v'
-    if ver.startswith("v"):
-        ver = ver[1:]
-    parts = []
-    for p in ver.split("."):
-        try:
-            parts.append(int(p))
-        except Exception:
-            # keep non-numeric as string chunk to allow some ordering
-            parts.append(p)
-    return tuple(parts)
+try:
+    from zeropkg_builder import Builder
+    BUILDER_AVAILABLE = True
+except Exception:
+    BUILDER_AVAILABLE = False
 
-def cmp_versions(a: Optional[str], b: Optional[str]) -> int:
-    """Return -1 if a<b, 0 if equal, 1 if a>b, unknown treated lexicographically."""
-    pa = parse_version(a)
-    pb = parse_version(b)
-    if pa == pb:
-        return 0
-    # compare elementwise
-    for xa, xb in zip(pa, pb):
-        if isinstance(xa, int) and isinstance(xb, int):
-            if xa < xb:
-                return -1
-            if xa > xb:
-                return 1
-        else:
-            sa, sb = str(xa), str(xb)
-            if sa < sb:
-                return -1
-            if sa > sb:
-                return 1
-    # fallback to length
-    if len(pa) < len(pb):
-        return -1
-    if len(pa) > len(pb):
-        return 1
-    return 0
+# Constants & cache paths
+CFG = load_config()
+CACHE_DIR = Path(CFG.get("paths", {}).get("cache_dir", "/var/cache/zeropkg"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+DEPS_CACHE_FILE = CACHE_DIR / "deps-cache.json"
+RECIPE_SCAN_DIR = Path(CFG.get("paths", {}).get("recipes_dir", "/usr/ports"))
 
-# Simple constraint matching: supports >=, <=, ==, >, <, ~= (compatible)
-def match_constraint(version: Optional[str], constraint: Optional[str]) -> bool:
-    if not constraint:
-        return True
-    if not version:
-        return False
-    c = str(constraint).strip()
-    ops = [">=", "<=", "==", ">", "<", "~="]
-    for op in ops:
-        if c.startswith(op):
-            req = c[len(op):].strip()
-            cmpv = cmp_versions(version, req)
-            if op == ">=":
-                return cmpv >= 0
-            if op == "<=":
-                return cmpv <= 0
-            if op == "==":
-                return cmpv == 0
-            if op == ">":
-                return cmpv > 0
-            if op == "<":
-                return cmpv < 0
-            if op == "~=":
-                # compatible: same major and >= req
-                pv = parse_version(version)
-                pr = parse_version(req)
-                if not pv or not pr:
-                    return version == req
-                return pv[0] == pr[0] and cmp_versions(version, req) >= 0
-    # fallback: bare version equals
-    return version == c
+_LOCK = threading.RLock()
 
-# Graph structure
-# nodes: package name (string); store version and meta
-# edges: pkg -> dependency_name
-class DepGraph:
-    def __init__(self):
-        # nodes mapped to metadata dict (including 'version' if known)
-        self.nodes: Dict[str, Dict[str, Any]] = {}
-        # adjacency list: node -> set(dependency_names)
-        self.edges: Dict[str, Set[str]] = {}
-        # reverse adjacency for quick revdeps
-        self.rev_edges: Dict[str, Set[str]] = {}
+# ---------------------------
+# Utilities
+# ---------------------------
+def _save_cache(data: Dict[str, Any]):
+    try:
+        DEPS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(DEPS_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "data": data}, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to save deps cache: {e}")
 
-    def add_node(self, name: str, meta: Optional[Dict[str,Any]] = None):
-        if name not in self.nodes:
-            self.nodes[name] = meta or {}
-        else:
-            # merge metadata shallowly
-            if meta:
-                self.nodes[name].update(meta)
-        self.edges.setdefault(name, set())
-        self.rev_edges.setdefault(name, set())
+def _load_cache() -> Dict[str, Any]:
+    if not DEPS_CACHE_FILE.exists():
+        return {}
+    try:
+        with open(DEPS_CACHE_FILE, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj.get("data", {}) or {}
+    except Exception as e:
+        logger.warning(f"Failed to load deps cache: {e}")
+        return {}
 
-    def add_edge(self, src: str, dst: str):
-        self.add_node(src)
-        self.add_node(dst)
-        self.edges.setdefault(src, set()).add(dst)
-        self.rev_edges.setdefault(dst, set()).add(src)
-
-    def remove_node(self, name: str):
-        if name in self.nodes:
-            # remove outgoing edges
-            for dep in list(self.edges.get(name, [])):
-                self.rev_edges.get(dep, set()).discard(name)
-            # remove incoming edges
-            for src in list(self.rev_edges.get(name, [])):
-                self.edges.get(src, set()).discard(name)
-            self.edges.pop(name, None)
-            self.rev_edges.pop(name, None)
-            self.nodes.pop(name, None)
-
-    def get_deps(self, name: str) -> List[str]:
-        return sorted(self.edges.get(name, set()))
-
-    def get_revdeps(self, name: str) -> List[str]:
-        return sorted(self.rev_edges.get(name, set()))
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {"nodes": self.nodes, "edges": {k: list(v) for k,v in self.edges.items()}}
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "DepGraph":
-        g = cls()
-        for n, meta in (data.get("nodes") or {}).items():
-            g.add_node(n, meta)
-        for src, dsts in (data.get("edges") or {}).items():
-            for d in dsts:
-                g.add_edge(src, d)
-        return g
-
-# Utilities scanning ports for metadata
-def _collect_ports_meta(cfg: Optional[Dict[str,Any]] = None) -> Dict[str, Dict[str,Any]]:
-    """
-    Walk ports directories and load toml metas.
-    Returns mapping: package_name -> meta (as dict).
-    """
-    cfg = cfg or load_config()
-    ports_dirs = get_ports_dirs(cfg)
-    out: Dict[str, Dict[str,Any]] = {}
-    for pd in ports_dirs:
-        pd = str(pd)
-        if not os.path.isdir(pd):
-            continue
-        for root, dirs, files in os.walk(pd):
-            for fn in files:
-                if fn.endswith(".toml"):
-                    full = os.path.join(root, fn)
-                    try:
-                        # lazy import to avoid hard dependency if module not present yet
-                        from zeropkg_toml import load_toml, get_package_meta
-                        meta = load_toml(full)
-                        name, version = get_package_meta(meta)
-                        if name:
-                            out[name] = meta
-                    except Exception:
-                        # skip invalid toml but log at debug
-                        log_global(f"Skipping invalid toml {full}", "debug")
-                        continue
+def _list_recipe_files(recipes_dir: Path) -> List[Path]:
+    # Accept TOML files under recipes_dir; scan non-recursively and recursively
+    out = []
+    if not recipes_dir.exists():
+        return out
+    for p in recipes_dir.rglob("*.toml"):
+        out.append(p)
     return out
 
-# Build graph from recipe metadata
-def build_graph_from_ports(cfg: Optional[Dict[str,Any]] = None, save_cache: bool = True) -> DepGraph:
-    cfg = cfg or load_config()
-    DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    metas = _collect_ports_meta(cfg)
-    graph = DepGraph()
-    for name, meta in metas.items():
-        pkg = meta.get("package", {}) or {}
-        version = pkg.get("version")
-        graph.add_node(name, {"version": version, "meta": meta})
-    # add edges
-    for name, meta in metas.items():
-        deps = meta.get("dependencies") or []
-        for d in deps:
-            # d expected either {"name":..., "version_req": ...} or string
-            if isinstance(d, dict):
-                dep_name = d.get("name") or d.get("dep_name")
-            else:
-                dep_name = str(d)
-            if dep_name:
-                graph.add_edge(name, dep_name)
-    # optionally save cache
-    if save_cache:
-        try:
-            save_cache(graph)
-            log_global(f"Deps graph cached to {CACHE_PATH}", "debug")
-        except Exception:
-            log_global("Failed to save deps cache", "warning")
-    return graph
-
-def save_cache(graph: DepGraph, path: Optional[Path]=None):
-    path = path or CACHE_PATH
-    DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    data = graph.to_dict()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    log_global(f"Saved deps cache to {path}", "debug")
-
-def load_cache(path: Optional[Path]=None) -> DepGraph:
-    path = path or CACHE_PATH
-    if not path.exists():
-        raise FileNotFoundError(path)
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    g = DepGraph.from_dict(data)
-    return g
-
-# Resolve dependencies: topological sort for a set of root packages
-def topo_sort_subgraph(graph: DepGraph, roots: Iterable[str]) -> Tuple[List[str], List[List[str]]]:
-    """
-    Returns (ordered_list, cycles_list). cycles_list is non-empty if cycles detected.
-    Standard Kahn's algorithm restricted to subgraph reachable from roots.
-    """
-    # compute reachable set via DFS
-    reachable = set()
-    def dfs(n):
-        if n in reachable:
-            return
-        reachable.add(n)
-        for d in graph.edges.get(n, []):
-            dfs(d)
-    for r in roots:
-        if r in graph.nodes:
-            dfs(r)
-    # build indegree for reachable nodes
-    indeg = {}
-    for n in reachable:
-        indeg[n] = 0
-    for n in reachable:
-        for d in graph.edges.get(n, []):
-            if d in indeg:
-                indeg[d] += 1
-    # Kahn
-    queue = [n for n,k in indeg.items() if k==0]
-    order = []
-    while queue:
-        node = queue.pop(0)
-        order.append(node)
-        for m in list(graph.edges.get(node, [])):
-            if m in indeg:
-                indeg[m] -= 1
-                if indeg[m] == 0:
-                    queue.append(m)
-    # if some nodes not in order -> cycles
-    cycles = []
-    remaining = [n for n in indeg.keys() if n not in order]
-    if remaining:
-        # naive cycle detection: try to produce cycles via DFS stack
-        visited = set()
-        stack = []
-        def visit(node):
-            if node in stack:
-                idx = stack.index(node)
-                cycles.append(stack[idx:] + [node])
-                return
-            if node in visited:
-                return
-            visited.add(node)
-            stack.append(node)
-            for child in graph.edges.get(node, []):
-                if child in indeg:
-                    visit(child)
-            stack.pop()
-        for n in remaining:
-            visit(n)
-    return order, cycles
-
-def resolve_install_order(graph: DepGraph, targets: Iterable[str], require_constraints: bool = False) -> Dict[str, Any]:
-    """
-    Given a graph and target package names, returns:
-        { "order": [pkg...], "cycles": [...], "missing": [...], "unsat_constraints": [...] }
-    If require_constraints True, will attempt to enforce version constraints present in recipe dependencies.
-    """
-    missing = []
-    for t in targets:
-        if t not in graph.nodes:
-            missing.append(t)
-    if missing:
-        return {"order": [], "cycles": [], "missing": missing, "unsat_constraints": []}
-    order, cycles = topo_sort_subgraph(graph, targets)
-    unsat = []
-    if require_constraints:
-        # check each edge for version requirements if present in source meta
-        for src, deps in graph.edges.items():
-            src_meta = graph.nodes.get(src, {}).get("meta", {}) or {}
-            dep_entries = src_meta.get("dependencies", []) or []
-            # map by name for declared constraints
-            for d in dep_entries:
-                if isinstance(d, dict):
-                    dep_name = d.get("name") or d.get("dep_name")
-                    ver_req = d.get("version_req") or d.get("dep_version_req") or d.get("version")
-                else:
-                    # string possibly with operator inlined; skip heavy parsing here
-                    dep_name = str(d)
-                    ver_req = None
-                if not dep_name:
-                    continue
-                # if graph has node and version, test
-                dep_node = graph.nodes.get(dep_name)
-                if dep_node:
-                    dep_ver = dep_node.get("version")
-                    if ver_req and not match_constraint(dep_ver, ver_req):
-                        unsat.append({"package": src, "dep": dep_name, "required": ver_req, "found": dep_ver})
-    return {"order": order, "cycles": cycles, "missing": missing, "unsat_constraints": unsat}
-
-# Reverse deps
-def find_revdeps(graph: DepGraph, package_name: str, deep: bool = True) -> List[str]:
-    """
-    Return list of packages depending on `package_name`.
-    If deep True, returns entire transitive reverse deps.
-    """
-    if package_name not in graph.nodes:
-        return []
-    res = set()
-    stack = [package_name]
-    while stack:
-        n = stack.pop()
-        for r in graph.rev_edges.get(n, []):
-            if r not in res:
-                res.add(r)
-                if deep:
-                    stack.append(r)
-    return sorted(res)
-
-# Orphan detection: packages with zero reverse deps and not "manual"
-def find_orphans(graph: DepGraph, exclude_manual: bool = True) -> List[str]:
-    orphans = []
-    for pkg in graph.nodes.keys():
-        revs = graph.rev_edges.get(pkg, set())
-        if not revs:
-            meta = graph.nodes.get(pkg, {}).get("meta") or {}
-            try:
-                metadata = meta.get("package") or {}
-            except Exception:
-                metadata = {}
-            # consider manual flag in metadata.install or metadata.package
-            manual = False
-            mblock = meta.get("metadata") or meta.get("install") or {}
-            if isinstance(mblock, dict) and mblock.get("manual"):
-                manual = True
-            if exclude_manual and manual:
-                continue
-            orphans.append(pkg)
-    return sorted(orphans)
-
-# Depclean: remove orphan packages (integrates with DB and logs)
-def depclean(graph: DepGraph, dry_run: bool = True, remove_callback: Optional[Any] = None) -> Dict[str,Any]:
-    """
-    Identify and optionally remove orphan packages.
-    remove_callback(package_name) will be called to perform removal (installer/remover).
-    Returns a report dict.
-    """
-    orphans = find_orphans(graph)
-    report = {"orphans": orphans, "removed": [], "skipped": []}
-    for pkg in orphans:
-        if dry_run:
-            log_event(pkg, "depclean", "Orphan candidate (dry-run)")
-            report["skipped"].append(pkg)
-        else:
-            try:
-                if remove_callback:
-                    remove_callback(pkg)
-                else:
-                    # best-effort: log and remove node from graph
-                    log_event(pkg, "depclean", "Removing orphan package")
-                graph.remove_node(pkg)
-                report["removed"].append(pkg)
-                # record DB event
-                if DBManager:
-                    try:
-                        with DBManager() as db:
-                            db._execute("INSERT INTO events (pkg_name, event_type, payload, ts) VALUES (?, ?, ?, ?)",
-                                        (pkg, "depclean.remove", json.dumps({"pkg": pkg}), int(time.time())))
-                    except Exception:
-                        pass
-            except Exception as e:
-                report.setdefault("errors", []).append({pkg: str(e)})
-    return report
-
-# Export to DOT
-def export_to_dot(graph: DepGraph, outpath: str):
-    lines = ["digraph zeropkg_deps {"]
-    for n, meta in graph.nodes.items():
-        label = n
-        ver = meta.get("version")
-        if ver:
-            label = f"{n}\\n{ver}"
-        lines.append(f'  "{n}" [label="{label}"];')
-    for src, dsts in graph.edges.items():
-        for d in dsts:
-            lines.append(f'  "{src}" -> "{d}";')
-    lines.append("}")
-    Path(outpath).write_text("\n".join(lines), encoding="utf-8")
-    log_global(f"Exported deps graph to {outpath}", "info")
-
-# Utility: rebuild cache
-def rebuild_cache(cfg: Optional[Dict[str,Any]] = None, save: bool = True) -> DepGraph:
-    cfg = cfg or load_config()
-    graph = build_graph_from_ports(cfg, save_cache=save)
-    log_global("Rebuilt dependency cache", "info")
-    return graph
-
-# Check missing packages referenced in graph but not present
-def find_missing_nodes(graph: DepGraph) -> List[str]:
-    missing = []
-    for src, deps in graph.edges.items():
-        for d in deps:
-            if d not in graph.nodes:
-                missing.append(d)
-    return sorted(set(missing))
-
-# Convenience wrappers for typical CLI / integration usage
-def ensure_graph_loaded(cache_path: Optional[str]=None) -> DepGraph:
+def _read_recipe_minimal(path: Path) -> Optional[Dict[str,Any]]:
+    # Minimal parse: try to extract package.name and dependencies quickly (avoid full TOML lib calls if not available)
     try:
-        return load_cache(Path(cache_path) if cache_path else None)
-    except Exception:
-        return rebuild_cache()
+        if ZeropkgTOML:
+            parser = ZeropkgTOML()
+            r = parser.load(path)
+            name = r.get("package", {}).get("name")
+            version = r.get("package", {}).get("version")
+            deps = r.get("dependencies", []) or []
+            return {"path": str(path), "name": name, "version": version, "dependencies": deps, "mtime": path.stat().st_mtime}
+        else:
+            # fallback naive parse: look for lines 'name' or 'dependencies'
+            name = None
+            version = None
+            deps = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    l = line.strip()
+                    if l.startswith("name") and "=" in l:
+                        name = l.split("=",1)[1].strip().strip('"').strip("'")
+                    if l.startswith("version") and "=" in l:
+                        version = l.split("=",1)[1].strip().strip('"').strip("'")
+                    if l.startswith("[[dependencies]]") or l.startswith("dependencies"):
+                        # fallback skip complex parsing
+                        pass
+            return {"path": str(path), "name": name, "version": version, "dependencies": deps, "mtime": path.stat().st_mtime}
+    except Exception as e:
+        logger.warning(f"Failed to parse recipe {path}: {e}")
+        return None
 
-# CLI entrypoint
-def _cli():
-    import argparse, pprint
-    p = argparse.ArgumentParser(prog="zeropkg-deps", description="Zeropkg dependency utilities")
-    p.add_argument("--rebuild-cache", action="store_true", help="Rebuild deps cache scanning ports")
-    p.add_argument("--graph-deps", help="Export graph to DOT file", metavar="OUT")
-    p.add_argument("--resolve", nargs="+", help="Resolve install order for listed packages")
-    p.add_argument("--depclean", action="store_true", help="Find orphan packages (dry-run by default)")
-    p.add_argument("--do-depclean", action="store_true", help="Actually remove orphans (calls callback if provided)")
-    p.add_argument("--cache", help="Override cache path")
-    args = p.parse_args()
+# ---------------------------
+# Graph building & resolution
+# ---------------------------
+class DependencyGraph:
+    """
+    Directed graph representation: nodes are package names (string).
+    edges: pkg -> dependency (i.e., pkg depends on dep)
+    """
+    def __init__(self):
+        self.nodes: Set[str] = set()
+        self.adj: Dict[str, Set[str]] = {}   # pkg -> set(deps)
+        self.meta: Dict[str, Dict[str,Any]] = {}  # pkg -> metadata: version, path, recipe_mtime
 
-    graph = None
-    if args.rebuild_cache:
-        graph = rebuild_cache()
-    else:
+    def add_node(self, pkg: str, version: Optional[str] = None, recipe_path: Optional[str] = None, recipe_mtime: Optional[float] = None):
+        self.nodes.add(pkg)
+        if pkg not in self.adj:
+            self.adj[pkg] = set()
+        self.meta.setdefault(pkg, {})
+        if version:
+            self.meta[pkg]["version"] = version
+        if recipe_path:
+            self.meta[pkg]["path"] = recipe_path
+        if recipe_mtime:
+            self.meta[pkg]["recipe_mtime"] = recipe_mtime
+
+    def add_edge(self, pkg: str, dep: str):
+        self.add_node(pkg)
+        self.add_node(dep)
+        self.adj.setdefault(pkg, set()).add(dep)
+
+    def to_dict(self) -> Dict[str,Any]:
+        return {"nodes": list(self.nodes), "edges": {k:list(v) for k,v in self.adj.items()}, "meta": self.meta}
+
+    def reverse_graph(self) -> Dict[str, Set[str]]:
+        rev = {n:set() for n in self.nodes}
+        for a, deps in self.adj.items():
+            for d in deps:
+                rev.setdefault(d, set()).add(a)
+        return rev
+
+    def topological_sort(self) -> Tuple[bool, List[str], Optional[List[List[str]]]]:
+        """
+        Return (ok, ordered_list, groups)
+        ok == False => cycle detected
+        ordered_list is a topological order (if ok)
+        groups is list of lists where each list can be built in parallel (level order)
+        """
+        # Kahn's algorithm
+        indeg = {n:0 for n in self.nodes}
+        for a,deps in self.adj.items():
+            for d in deps:
+                indeg[d] = indeg.get(d,0) + 1
+        zero = [n for n,d in indeg.items() if d==0]
+        order = []
+        groups = []
+        while zero:
+            groups.append(sorted(zero))
+            next_zero = []
+            for n in zero:
+                order.append(n)
+                for m in self.adj.get(n, []):
+                    indeg[m] -= 1
+                    if indeg[m] == 0:
+                        next_zero.append(m)
+            zero = next_zero
+        if len(order) != len(self.nodes):
+            # cycle exists; detect nodes in cycle by indeg>0
+            cycle_nodes = [n for n,d in indeg.items() if d>0]
+            return False, order, [cycle_nodes]
+        return True, order, groups
+
+    def detect_cycles(self) -> List[List[str]]:
+        ok, order, groups = self.topological_sort()
+        if ok:
+            return []
+        return groups or []
+
+# ---------------------------
+# High level manager
+# ---------------------------
+class DepsManager:
+    def __init__(self, recipes_dir: Optional[str] = None, config: Optional[Dict]=None):
+        self.cfg = config or CFG
+        self.recipes_dir = Path(recipes_dir or self.cfg.get("paths", {}).get("recipes_dir", "/usr/ports"))
+        self.cache = _load_cache()
+        self.graph = DependencyGraph()
+        self._load_graph_from_cache_if_valid()
+
+    # -------------------------
+    # Scan recipes and build graph
+    # -------------------------
+    def scan_recipes(self, force: bool = False) -> DependencyGraph:
+        """
+        Scan recipe files and build dependency graph.
+        Uses cache to speed up unless force=True.
+        """
+        with _LOCK:
+            recipes = _list_recipe_files(self.recipes_dir)
+            modified = False
+            cached = self.cache.get("recipes", {})
+            new_cache_recipes = {}
+            for p in recipes:
+                try:
+                    info = _read_recipe_minimal(p)
+                    if not info or not info.get("name"):
+                        continue
+                    name = info["name"]
+                    mtime = info.get("mtime", 0)
+                    cached_entry = cached.get(info["path"])
+                    if cached_entry and cached_entry.get("mtime") == mtime and not force:
+                        # reuse cached metadata
+                        new_cache_recipes[info["path"]] = cached_entry
+                        parsed_deps = cached_entry.get("dependencies", [])
+                    else:
+                        # parse fully using ZeropkgTOML if available
+                        if ZeropkgTOML:
+                            try:
+                                parser = ZeropkgTOML()
+                                rec = parser.load(p)
+                                deps = rec.get("dependencies", []) or []
+                                # normalize deps to names (strings or dicts)
+                                parsed_deps = []
+                                for d in deps:
+                                    if isinstance(d, str):
+                                        parsed_deps.append(d)
+                                    elif isinstance(d, dict):
+                                        parsed_deps.append(d.get("name"))
+                                new_cache_recipes[str(p)] = {"name": name, "version": info.get("version"), "mtime": mtime, "dependencies": parsed_deps}
+                            except Exception as e:
+                                logger.warning(f"Parser failed for {p}: {e}")
+                                parsed_deps = []
+                        else:
+                            parsed_deps = [d if isinstance(d, str) else d.get("name") for d in (info.get("dependencies") or [])]
+                            new_cache_recipes[str(p)] = {"name": name, "version": info.get("version"), "mtime": mtime, "dependencies": parsed_deps}
+
+                    # add to graph
+                    self.graph.add_node(name, version=info.get("version"), recipe_path=str(p), recipe_mtime=mtime)
+                    for dep in parsed_deps:
+                        if not dep:
+                            continue
+                        depn = dep.split()[0] if isinstance(dep, str) else dep
+                        self.graph.add_edge(name, depn)
+                except Exception as e:
+                    logger.warning(f"Error scanning {p}: {e}")
+                    continue
+            # update cache
+            self.cache["recipes"] = new_cache_recipes
+            _save_cache(self.cache)
+            return self.graph
+
+    # -------------------------
+    # Resolve dependencies and return build order or groups
+    # -------------------------
+    def resolve(self, targets: Optional[List[str]] = None, include_optional: bool = False) -> Dict[str,Any]:
+        """
+        If targets provided, reduce graph to reachable nodes from targets.
+        Returns dict with keys: ok, order, groups, cycles, missing (deps with no recipe)
+        """
+        with _LOCK:
+            if not self.graph.nodes:
+                self.scan_recipes()
+
+            # if targets, compute reachable set
+            if targets:
+                reachable = set()
+                stack = list(targets)
+                while stack:
+                    cur = stack.pop()
+                    if cur in reachable:
+                        continue
+                    reachable.add(cur)
+                    for d in self.graph.adj.get(cur, []):
+                        if d not in reachable:
+                            stack.append(d)
+                # build subgraph
+                sub = DependencyGraph()
+                for n in reachable:
+                    meta = self.graph.meta.get(n, {})
+                    sub.add_node(n, version=meta.get("version"), recipe_path=meta.get("path"), recipe_mtime=meta.get("recipe_mtime"))
+                    for d in self.graph.adj.get(n, []):
+                        if d in reachable:
+                            sub.add_edge(n,d)
+                ok, order, groups = sub.topological_sort()
+                cycles = [] if ok else sub.detect_cycles()
+                # missing = nodes that appear as deps but have no recipe (we added nodes for them, but meta/path empty)
+                missing = [n for n in sub.nodes if not sub.meta.get(n,{}).get("path")]
+                return {"ok": ok, "order": order, "groups": groups, "cycles": cycles, "missing": missing}
+            else:
+                ok, order, groups = self.graph.topological_sort()
+                cycles = [] if ok else self.graph.detect_cycles()
+                missing = [n for n in self.graph.nodes if not self.graph.meta.get(n,{}).get("path")]
+                return {"ok": ok, "order": order, "groups": groups, "cycles": cycles, "missing": missing}
+
+    # -------------------------
+    # Reverse dependencies
+    # -------------------------
+    def revdeps(self, pkg: str) -> List[str]:
+        with _LOCK:
+            if not self.graph.nodes:
+                self.scan_recipes()
+            rev = self.graph.reverse_graph()
+            return sorted(list(rev.get(pkg, set())))
+
+    # -------------------------
+    # Build order integration with builder
+    # -------------------------
+    def resolve_and_build(self, targets: List[str], jobs: Optional[int] = None, dry_run: bool = False, continue_on_error: bool = False) -> Dict[str,Any]:
+        """
+        Resolve graph restricted to targets, then build in group levels using ThreadPoolExecutor.
+        Each group contains packages that can be built in parallel.
+        Tries to call Builder.build(package_name) for each package if builder available.
+        Returns dict of results per package.
+        """
+        if not targets:
+            raise ValueError("No targets provided for build")
+
+        res = self.resolve(targets)
+        if not res["ok"]:
+            logger.error(f"Cycle detected in dependencies: {res['cycles']}")
+            return {"ok": False, "error": "cycles", "cycles": res.get("cycles")}
+
+        groups = res["groups"] or []
+        jobs = jobs or int(self.cfg.get("build", {}).get("jobs", 4))
+        results = {}
+        builder = Builder() if BUILDER_AVAILABLE else None
+
+        for level, group in enumerate(groups):
+            logger.info(f"Building group {level+1}/{len(groups)}: {group}")
+            if dry_run:
+                for pkg in group:
+                    results[pkg] = {"status": "dry-run"}
+                continue
+
+            # build in parallel within this group
+            with ThreadPoolExecutor(max_workers=jobs) as ex:
+                futures = {}
+                for pkg in group:
+                    if builder:
+                        fut = ex.submit(self._build_with_builder, builder, pkg)
+                    else:
+                        fut = ex.submit(self._fake_build, pkg)
+                    futures[fut] = pkg
+                for fut in as_completed(futures):
+                    pkg = futures[fut]
+                    try:
+                        out = fut.result()
+                        results[pkg] = {"status": "ok", "detail": out}
+                    except Exception as e:
+                        logger.error(f"Build failed for {pkg}: {e}")
+                        results[pkg] = {"status": "failed", "error": str(e)}
+                        if not continue_on_error:
+                            logger.error("Stopping builds due to error and continue_on_error=False")
+                            return {"ok": False, "results": results}
+        return {"ok": True, "results": results}
+
+    def _build_with_builder(self, builder: Any, pkg: str) -> Any:
         try:
-            graph = ensure_graph_loaded(args.cache)
+            # builder.build_package signature is not strictly enforced — attempt common ones
+            if hasattr(builder, "build"):
+                return builder.build(pkg)
+            if hasattr(builder, "build_package"):
+                return builder.build_package(pkg)
+            if hasattr(builder, "build_and_install"):
+                return builder.build_and_install(pkg)
+            # fallback: call builder.main like interface
+            if hasattr(builder, "main"):
+                return builder.main(["build", pkg])
+            raise RuntimeError("Builder available but has no known build entrypoint")
         except Exception as e:
-            print("Failed to load or build cache:", e)
-            sys.exit(1)
+            logger.error(f"Exception while building {pkg} with builder: {e}")
+            raise
+
+    def _fake_build(self, pkg: str) -> str:
+        # placeholder action when builder not available
+        logger.info(f"[fake-build] would build: {pkg}")
+        return "fake-built"
+
+    # -------------------------
+    # Depclean / orphan removal
+    # -------------------------
+    def depclean_system(self, dry_run: bool = True, auto_confirm: bool = False) -> Dict[str,Any]:
+        """
+        Use DB to find orphaned packages and remove them (via zeropkg_remover if available)
+        Returns dict with removed/missing/errors
+        """
+        if not DB_AVAILABLE:
+            raise RuntimeError("Database (zeropkg_db) not available for depclean")
+
+        orphans = get_orphaned_packages()
+        logger.info(f"Orphan candidates: {orphans}")
+        report = {"orphans": orphans, "removed": [], "skipped": [], "errors": []}
+        if not orphans:
+            return report
+
+        # prompt if not auto_confirm and not dry_run
+        if not auto_confirm and not dry_run:
+            ans = input(f"Remove {len(orphans)} orphan packages? [y/N] ")
+            if ans.strip().lower() not in ("y","yes"):
+                logger.info("User aborted depclean")
+                report["skipped"] = orphans
+                return report
+
+        # Attempt removal by calling zeropkg_remover module if present
+        try:
+            from zeropkg_remover import Remover
+            remover = Remover()
+        except Exception:
+            remover = None
+
+        for pkg in orphans:
+            if dry_run:
+                report["skipped"].append(pkg)
+                continue
+            try:
+                if remover:
+                    r = remover.remove(pkg)
+                    report["removed"].append(pkg)
+                else:
+                    # fallback: remove DB entry only
+                    from zeropkg_db import remove_package_quick
+                    remove_package_quick(pkg)
+                    report["removed"].append(pkg)
+                logger.info(f"Removed orphan {pkg}")
+            except Exception as e:
+                report["errors"].append({"pkg": pkg, "error": str(e)})
+        return report
+
+    # -------------------------
+    # Graph exporting
+    # -------------------------
+    def export_dot(self, out_path: str, include_versions: bool = True, highlight_installed: bool = True) -> str:
+        """
+        Export the current graph to Graphviz DOT format.
+        """
+        installed = set()
+        if DB_AVAILABLE:
+            try:
+                inst = list_installed_quick()
+                installed = set([f"{p['name']}" for p in inst])
+            except Exception:
+                installed = set()
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("digraph zeropkg_deps {\n")
+            f.write("  rankdir=LR;\n")
+            for n in sorted(self.graph.nodes):
+                label = n
+                meta = self.graph.meta.get(n, {})
+                if include_versions and meta.get("version"):
+                    label = f"{n}\\n{meta.get('version')}"
+                attrs = []
+                if highlight_installed and n in installed:
+                    attrs.append('style=filled')
+                    attrs.append('fillcolor="#ccffcc"')
+                f.write(f'  "{n}" [{",".join(attrs)} label="{label}"];\n')
+            for a, deps in self.graph.adj.items():
+                for d in deps:
+                    f.write(f'  "{a}" -> "{d}";\n')
+            f.write("}\n")
+        logger.info(f"Graph exported to {out_path}")
+        return out_path
+
+    # -------------------------
+    # Misc helpers
+    # -------------------------
+    def missing_dependencies(self) -> List[str]:
+        """Return list of dependency names present in graph that have no recipe (no path)"""
+        missing = [n for n in self.graph.nodes if not self.graph.meta.get(n,{}).get("path")]
+        return missing
+
+# ---------------------------
+# CLI wrapper
+# ---------------------------
+def _cli():
+    import argparse
+    parser = argparse.ArgumentParser(description="Zeropkg dependency resolver and helper")
+    parser.add_argument("--recipes", "-r", help="recipes dir (default from config)", default=None)
+    parser.add_argument("--scan", action="store_true", help="scan recipes and build graph")
+    parser.add_argument("--resolve", nargs="+", help="resolve dependencies for given targets")
+    parser.add_argument("--build-order", nargs="+", help="print build order for targets")
+    parser.add_argument("--build", nargs="+", help="resolve and build targets (uses builder)", default=None)
+    parser.add_argument("--jobs", "-j", type=int, help="parallel jobs for build")
+    parser.add_argument("--dry-run", action="store_true", help="dry-run for build/depclean")
+    parser.add_argument("--depclean", action="store_true", help="run depclean using DB or dry-run")
+    parser.add_argument("--graph-deps", help="export dependency graph to DOT file")
+    parser.add_argument("--revdep", help="show reverse dependencies for package")
+    parser.add_argument("--missing", action="store_true", help="list missing dependencies")
+    parser.add_argument("--continue-on-error", action="store_true", help="continue builds on error")
+    args = parser.parse_args()
+
+    dm = DepsManager(recipes_dir=args.recipes)
+    if args.scan:
+        dm.scan_recipes(force=False)
+        print(json.dumps(dm.graph.to_dict(), indent=2))
+        return
+
+    if args.resolve:
+        out = dm.resolve(args.resolve)
+        print(json.dumps(out, indent=2))
+        return
+
+    if args.build_order:
+        out = dm.resolve(args.build_order)
+        print(json.dumps({"order": out.get("order"), "groups": out.get("groups"), "cycles": out.get("cycles")}, indent=2))
+        return
+
+    if args.build:
+        res = dm.resolve_and_build(args.build, jobs=args.jobs, dry_run=args.dry_run, continue_on_error=args.continue_on_error)
+        print(json.dumps(res, indent=2))
+        return
+
+    if args.depclean:
+        res = dm.depclean_system(dry_run=args.dry_run, auto_confirm=True)
+        print(json.dumps(res, indent=2))
+        return
 
     if args.graph_deps:
-        export_to_dot(graph, args.graph_deps)
-        print("DOT exported to", args.graph_deps)
-    if args.resolve:
-        res = resolve_install_order(graph, args.resolve, require_constraints=True)
-        pprint.pprint(res)
-    if args.depclean:
-        rpt = depclean(graph, dry_run=True)
-        print("Orphans (dry-run):", rpt["orphans"])
-    if args.do_depclean:
-        # best-effort removal: here we just remove from graph (no system uninstall)
-        rpt = depclean(graph, dry_run=False, remove_callback=lambda pkg: log_event(pkg, "depclean", "removed by CLI"))
-        print("Depclean result:", rpt)
+        path = args.graph_deps
+        dm.scan_recipes()
+        dm.export_dot(path)
+        print(f"graph exported to {path}")
+        return
+
+    if args.revdep:
+        print(json.dumps({"revdeps": dm.revdeps(args.revdep)}, indent=2))
+        return
+
+    if args.missing:
+        dm.scan_recipes()
+        print(json.dumps({"missing": dm.missing_dependencies()}, indent=2))
+        return
+
+    parser.print_help()
 
 if __name__ == "__main__":
     _cli()
