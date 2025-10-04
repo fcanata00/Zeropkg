@@ -1,0 +1,51 @@
+[package]
+name = "linux-headers"
+version = "6.6.54"
+category = "lfs"
+description = "Linux API Headers — cabeçalhos expostos pelo kernel usados pela glibc"
+homepage = "https://www.kernel.org"
+license = "GPL-2.0-only"
+maintainer = "zeropkg"
+
+[sources]
+urls = [
+  "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.54.tar.xz"
+]
+checksum = "sha256:bb991b4c1d9ef249e3ab43f8c82c2a46b097417df0ec8239867eec5f418906b8"
+extract_to = "linux-6.6.54"
+
+[environment]
+LFS = "/mnt/lfs"
+DESTDIR = "@DESTDIR@"
+PATH = "/usr/bin:/bin"
+
+[build]
+chroot = true
+fakeroot = true
+cleanup_sources = true
+commands = [
+  # Limpa a árvore de build
+  "make mrproper",
+
+  # Gera os cabeçalhos expostos ao espaço de usuário
+  "make headers",
+
+  # Remove todos os arquivos que não sejam .h
+  "find usr/include -type f ! -name '*.h' -delete",
+
+  # Copia os headers para o destino final
+  "mkdir -pv ${DESTDIR}/usr",
+  "cp -rv usr/include ${DESTDIR}/usr"
+]
+
+[hooks]
+pre_build = "echo '==> Iniciando build dos Linux API Headers (LFS)'"
+post_install = "echo '==> Linux headers instalados em ${DESTDIR}/usr/include'"
+
+[dependencies]
+build = []
+runtime = []
+
+[lfs]
+stage = "toolchain"
+bootstrap = true
