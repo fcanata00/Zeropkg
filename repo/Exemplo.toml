@@ -1,140 +1,216 @@
-# Exemplo de Receita Completa Zeropkg
-# Mostra todos os recursos suportados pelo Zeropkg
+# ========================================================================
+# Zeropkg Example Recipe (full-feature-example.toml)
+# Exemplo completo com todos os campos e recursos suportados
+# ========================================================================
 
 [package]
-name = "example-complete"
-version = "1.0"
-category = "utils"
-description = "Exemplo completo de receita Zeropkg com todos os recursos disponíveis."
-maintainer = "Você <seu.email@dominio>"
-license = "GPL-3.0"
-homepage = "https://example.org"
-variant = "default"
+name = "example-app"
+version = "1.0.0"
+release = 1
+category = "utilities"
+description = "Um exemplo completo de receita Zeropkg com todos os campos"
+license = "GPL-3.0-or-later"
+homepage = "https://example.org/example-app"
+maintainer = "Zeropkg Developers <dev@zeropkg.org>"
+stage = "stable"
+priority = "normal"
 
-# ====================================================================
-# Múltiplas fontes suportadas: tarballs, git, patch, mirror
-# ====================================================================
-[sources]
+# Tags opcionais (usadas em update/notify)
+tags = ["example", "demo", "showcase"]
 
-# Fonte principal em tar.xz
-[[sources.entries]]
-url = "https://example.org/sources/example-complete-1.0.tar.xz"
-checksum = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-format = "tar.xz"
-priority = 1
-
-# Mirror alternativo
-[[sources.entries]]
-url = "https://mirror.kernel.org/example/example-complete-1.0.tar.xz"
-format = "tar.xz"
-priority = 2
-
-# Clonagem via Git também é suportada
-[[sources.entries]]
-url = "git+https://github.com/example/example-complete.git"
-branch = "main"
-type = "git"
-
-# ====================================================================
-# Definição de patches (aplicados automaticamente pelo módulo patcher)
-# ====================================================================
-[patches]
-# Cada patch é aplicado em ordem
-files = [
-    "patches/fix-paths.patch",
-    "patches/add-feature.patch"
+# ------------------------------------------------------------------------
+[source]
+# Múltiplos URLs e formatos suportados (tar.xz, tar.gz, zip, git)
+urls = [
+  "https://example.org/releases/example-app-1.0.0.tar.xz",
+  "https://mirror.example.com/example-app-1.0.0.tar.gz",
+  "git+https://github.com/example/example-app.git"
 ]
 
-# ====================================================================
-# Ambiente customizado (passado ao builder e fakeroot)
-# ====================================================================
-[environment]
-CFLAGS = "-O2 -pipe -march=native"
-CXXFLAGS = "-O2 -pipe -march=native"
-LDFLAGS = "-Wl,-O1"
-PKG_CONFIG_PATH = "/usr/lib/pkgconfig:/usr/share/pkgconfig"
-MAKEFLAGS = "-j4"
+# Suporte a múltiplas assinaturas/checsums
+sha256 = [
+  "c3b9a2e42cf028cf72a153e47bb5cc4d6a27e20df80f444a03e15ac933d23915",
+  "5b243e17d231f8b09a54e58758a9c2dba7087ac84db06c77a9e58a0b10a3cf77"
+]
 
-# Variáveis específicas
-CUSTOM_VAR = "example_value"
-PREFIX = "/usr"
+extract_to = "example-app-1.0.0"
 
-# ====================================================================
-# Dependências
-# ====================================================================
-[dependencies]
-runtime = ["glibc", "gcc"]
-build = ["make", "pkg-config"]
-optional = ["zlib", "openssl"]
-conflicts = ["example-old"]
-
-# ====================================================================
-# Hooks — scripts executados em diferentes estágios
-# ====================================================================
-[hooks]
-pre_download = "scripts/pre_download.sh"
-post_download = "scripts/post_download.sh"
-pre_configure = "scripts/pre_configure.sh"
-post_configure = "scripts/post_configure.sh"
-pre_build = "scripts/pre_build.sh"
-post_build = "scripts/post_build.sh"
-pre_install = "scripts/pre_install.sh"
-post_install = "scripts/post_install.sh"
-pre_remove = "scripts/pre_remove.sh"
-post_remove = "scripts/post_remove.sh"
-
-# ====================================================================
-# Instruções de build — integradas com builder/chroot/fakeroot
-# ====================================================================
+# ------------------------------------------------------------------------
 [build]
-system = "autotools"  # pode ser: make, meson, cmake, custom, autotools
-configure = "./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var"
-build = "make"
-test = "make check"
-install = "make install DESTDIR=${PKGDEST}"
-fakeroot = true
-chroot = false
-strip_binaries = true
+# Dependências compiladas antes desta
+depends = ["gcc", "make", "glibc", "zlib"]
 
-# Comandos adicionais customizados
-commands = [
-    "echo 'Iniciando build do exemplo completo...'",
-    "make -j$(nproc)"
+# Dependências opcionais (apenas avisos se ausentes)
+optional_depends = ["curl", "openssl"]
+
+# Diretório de trabalho e flags
+workdir = "build"
+use_chroot = true
+fakeroot = true
+parallel_build = true
+
+# Sequência de etapas
+prepare = [
+  "patch -Np1 -i ../example-app-fix-paths.patch",
+  "autoreconf -fi",
+  "mkdir -pv build"
 ]
 
-# ====================================================================
-# Empacotamento — cria binário em /var/zeropkg/packages antes da instalação
-# ====================================================================
-[package_build]
+configure = [
+  "cd build",
+  "../configure",
+  "--prefix=/usr",
+  "--sysconfdir=/etc",
+  "--localstatedir=/var",
+  "--enable-shared",
+  "--disable-static"
+]
+
+compile = [
+  "cd build",
+  "make -j$(nproc)"
+]
+
+check = [
+  "cd build",
+  "make check"
+]
+
+install = [
+  "cd build",
+  "make DESTDIR=$ZEROPKG_DESTDIR install"
+]
+
+post_install_cleanup = [
+  "find $ZEROPKG_DESTDIR/usr/share/doc -type f -delete"
+]
+
+# ------------------------------------------------------------------------
+[environment]
+# Variáveis de ambiente adicionais
+CC = "gcc"
+CXX = "g++"
+CFLAGS = "-O2 -pipe -fPIC"
+CXXFLAGS = "-O2 -pipe -fPIC"
+LDFLAGS = "-Wl,-O1,--as-needed"
+MAKEFLAGS = "-j$(nproc)"
+LANG = "en_US.UTF-8"
+PKG_CONFIG_PATH = "/usr/lib/pkgconfig:/usr/share/pkgconfig"
+CONFIG_SITE = "/usr/share/config.site"
+PATH = "/tools/bin:/usr/bin:/bin"
+
+# ------------------------------------------------------------------------
+[patches]
+# Aplicação automática de patches locais ou remotos
+apply = [
+  "https://example.org/patches/example-fix-paths.patch",
+  "local-fixes/0001-fix-env-vars.patch"
+]
+strip = 1
+
+# ------------------------------------------------------------------------
+[hooks]
+# Hooks automáticos executados antes/depois de cada fase
+pre_fetch = ["echo '[HOOK] Pré-download iniciado'"]
+post_fetch = ["echo '[HOOK] Download concluído'"]
+
+pre_configure = ["echo '[HOOK] Preparando configuração'"]
+post_configure = ["echo '[HOOK] Configuração concluída'"]
+
+pre_build = ["echo '[HOOK] Iniciando compilação'"]
+post_build = ["echo '[HOOK] Compilação concluída com sucesso'"]
+
+pre_install = ["echo '[HOOK] Iniciando instalação'"]
+post_install = [
+  "echo '[HOOK] Instalação finalizada'",
+  "ldconfig || true"
+]
+
+pre_remove = ["echo '[HOOK] Removendo pacote example-app'"]
+post_remove = ["echo '[HOOK] Remoção concluída'"]
+
+# ------------------------------------------------------------------------
+[package.files]
+# Arquivos rastreados após instalação (usado por zeropkg_db)
+bin = ["/usr/bin/example-app"]
+lib = ["/usr/lib/libexample.so"]
+conf = ["/etc/example.conf"]
+doc = ["/usr/share/doc/example-app/README"]
+
+# ------------------------------------------------------------------------
+[tests]
+# Suporte a testes automáticos pós-build
 enabled = true
-type = "tar"
-output_dir = "/var/zeropkg/packages"
-compress = "xz"
-include_docs = true
+commands = [
+  "example-app --version",
+  "example-app --help",
+  "test -x /usr/bin/example-app"
+]
 
-# ====================================================================
-# Pós-instalação — scripts, limpeza e registro
-# ====================================================================
-[post_install]
-register = true
-clean_build_dir = true
-update_cache = true
+# ------------------------------------------------------------------------
+[package.meta]
+# Metadados extras para análise e atualização
+provides = ["example-lib"]
+conflicts = ["example-old"]
+replaces = ["example-legacy"]
+group = "base"
+keywords = ["demo", "reference", "complete"]
+
+# ------------------------------------------------------------------------
+[revdep]
+# Dependências reversas declaradas manualmente (usado em revdep scan)
+reverse = ["example-utils", "example-gui"]
+
+# ------------------------------------------------------------------------
+[notifications]
+# Integração com o sistema de notificações e barra de status
 notify = true
+urgency = "normal"   # valores possíveis: normal, critical, urgent
+summary = "Novo pacote instalado: example-app"
+icon = "/usr/share/icons/example.png"
 
-# ====================================================================
-# Segurança do build — modo chroot/fakeroot e isolamento
-# ====================================================================
-[security]
-fakeroot = true
-use_chroot = false
-verify_checksums = true
-signature_check = false
+# ------------------------------------------------------------------------
+[package.post]
+# Comandos pós-instalação específicos
+run = [
+  "update-desktop-database -q",
+  "gtk-update-icon-cache -q /usr/share/icons/hicolor || true",
+  "echo 'example-app instalado com sucesso'"
+]
 
-# ====================================================================
-# Metadados para LFS
-# ====================================================================
-[lfs]
-stage = "final"
-toolchain = false
-bootstrap = false
-chroot_required = false
+# ------------------------------------------------------------------------
+[package.scripts]
+# Scripts extras (executados via chroot)
+pre_script = "/etc/zeropkg/hooks.d/pre-example.sh"
+post_script = "/etc/zeropkg/hooks.d/post-example.sh"
+
+# ------------------------------------------------------------------------
+[package.cleanup]
+# Itens a remover após build para reduzir tamanho
+remove = [
+  "/usr/share/info",
+  "/usr/share/locale/*",
+  "/usr/share/man/*"
+]
+
+# ------------------------------------------------------------------------
+[package.verify]
+# Verificação de integridade
+signatures = ["example-app-1.0.0.tar.xz.sig"]
+gpg_key = "0xAABBCCDDEEFF1122"
+
+# ------------------------------------------------------------------------
+[debug]
+# Opções para builds de depuração
+enable_debug = false
+strip_binaries = true
+keep_temp = false
+
+# ------------------------------------------------------------------------
+[install]
+# Parâmetros de instalação específicos
+root = "/"
+keep_build = false
+safe_chroot = true
+parallel_install = true
+overwrite_existing = false
