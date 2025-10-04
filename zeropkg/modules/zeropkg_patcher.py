@@ -1,301 +1,157 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-zeropkg_patcher.py — Aplica patches e executa hooks conforme receitas TOML
-Pattern B: integrado, enxuto, funcional.
+# zeropkg_patcher.py
+# Módulo responsável por aplicar patches, executar hooks e validar segurança no Zeropkg
 
-API principal:
-- Patcher(build_dir: str, pkg_name: str, env: dict)
-  - apply_patch(patch_entry, dry_run=False)
-  - apply_patches(patches, dry_run=False)
-  - apply_hooks(stage, hooks, dry_run=False, chroot_root=None, use_fakeroot=False)
-  - apply_all_stages(meta, dry_run=False, chroot_root=None)
-  - rollback_last_patch(patch_entry)  # best-effort
-"""
-
-from __future__ import annotations
 import os
-import sys
 import subprocess
-import shlex
 import hashlib
-import time
+import shutil
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from zeropkg_logger import log
+from zeropkg_toml import resolve_macros
+from zeropkg_downloader import Downloader
+from zeropkg_chroot import run_in_chroot
+from zeropkg_db import Database
+from zeropkg_config import ZeropkgConfig
 
-# Integrations (optional)
-try:
-    from zeropkg_toml import resolve_macros
-except Exception:
-    def resolve_macros(v, env_map): return v
-
-try:
-    from zeropkg_logger import log_event, get_logger
-    logger = get_logger("patcher")
-except Exception:
-    import logging
-    logger = logging.getLogger("zeropkg_patcher")
-    if not logger.handlers:
-        logger.addHandler(logging.StreamHandler(sys.stdout))
-    def log_event(pkg, stage, msg, level="info"):
-        getattr(logger, level if hasattr(logger, level) else "info")(f"{pkg}:{stage} {msg}")
-
-# optional chroot helper
-try:
-    from zeropkg_chroot import run_in_chroot, prepare_chroot, cleanup_chroot
-except Exception:
-    run_in_chroot = None
-    prepare_chroot = None
-    cleanup_chroot = None
-
-# -------------------------
-# Exceptions
-# -------------------------
-class PatchError(RuntimeError):
-    pass
-
-class HookError(RuntimeError):
-    pass
-
-# -------------------------
-# Utilities
-# -------------------------
-def _safe_join(base: str, rel: str) -> str:
-    """Join and ensure result is inside base (prevent ../ traversal)."""
-    base_p = Path(base).resolve()
-    candidate = (base_p / rel).resolve()
-    if not str(candidate).startswith(str(base_p)):
-        raise PatchError(f"Unsafe patch path traversal: {rel}")
-    return str(candidate)
-
-def _sha256_of_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-def _run_shell(cmd: str, cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None, dry_run: bool = False, chroot_root: Optional[str] = None, use_fakeroot: bool = False) -> int:
-    """Run a command locally or inside chroot. Returns exit code or raises on failure."""
-    if dry_run:
-        log_event("patcher", "dry-run", f"[dry-run] {cmd}", level="info")
-        return 0
-
-    if chroot_root and run_in_chroot:
-        # execute inside chroot
-        if use_fakeroot:
-            wrapped = f"fakeroot bash -c {shlex.quote(cmd)}"
-            rc = run_in_chroot(chroot_root, wrapped, cwd=cwd, env=env, use_shell=True, dry_run=False)
-        else:
-            rc = run_in_chroot(chroot_root, cmd, cwd=cwd, env=env, use_shell=True, dry_run=False)
-        if rc != 0:
-            raise PatchError(f"Command failed in chroot (rc={rc}): {cmd}")
-        return rc
-
-    if use_fakeroot:
-        cmd = f"fakeroot bash -c {shlex.quote(cmd)}"
-    proc = subprocess.run(cmd, shell=True, cwd=cwd, env=env)
-    if proc.returncode != 0:
-        raise PatchError(f"Command failed (rc={proc.returncode}): {cmd}")
-    return proc.returncode
-
-# -------------------------
-# Patcher class
-# -------------------------
 class Patcher:
-    def __init__(self, build_dir: str, pkg_name: Optional[str] = None, env: Optional[Dict[str, str]] = None):
-        self.build_dir = str(Path(build_dir).resolve())
-        self.pkg = pkg_name or "unknown"
-        self.env = dict(os.environ)
-        if env:
-            self.env.update(env)
-        self._applied: List[Dict[str, Any]] = []  # record of applied patches (for rollback best-effort)
-        log_event(self.pkg, "patcher.init", f"Patcher initialized for {self.build_dir}")
+    def __init__(self, work_dir, config: ZeropkgConfig, fakeroot=False):
+        self.work_dir = Path(work_dir)
+        self.config = config
+        self.fakeroot = fakeroot
+        self.db = Database(config)
+        self.downloader = Downloader(config)
+        self.patch_cache_dir = Path(config.get("paths", "patch_cache", fallback="/var/cache/zeropkg/patches"))
+        self.patch_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def apply_patch(self, patch_entry: Dict[str, Any], dry_run: bool = False, chroot_root: Optional[str] = None, use_fakeroot: bool = False, checksum: Optional[str] = None) -> None:
-        """
-        patch_entry: {"path": "...", "strip": 1, "applied_to": "subdir"}
-        checksum (optional): expected sha256 hex to verify patch file before applying
-        """
-        path_raw = patch_entry.get("path")
-        if not path_raw:
-            raise PatchError("Patch entry missing 'path'")
+    # ===============================================================
+    # Função principal: aplica todos os patches e hooks definidos
+    # ===============================================================
+    def apply_all(self, pkg_name, recipe):
+        log(f"🔧 Iniciando aplicação de patches e hooks para {pkg_name}")
 
-        # resolve macros in path
-        try:
-            path_resolved = resolve_macros(path_raw, self.env)
-        except Exception:
-            path_resolved = path_raw
+        self._apply_patches(pkg_name, recipe.get("patches", []))
+        self._run_hooks(pkg_name, recipe.get("hooks", {}))
+        log(f"✅ Patches e hooks aplicados para {pkg_name}")
 
-        # compute absolute patch path and ensure it's inside allowed area (but patch files commonly live in distfiles)
-        patch_path = Path(path_resolved).expanduser()
-        if not patch_path.is_absolute():
-            # allow relative to build_dir or current working dir
-            cand = Path(self.build_dir) / path_resolved
-            if cand.exists():
-                patch_path = cand.resolve()
-            else:
-                patch_path = patch_path.resolve()
-
-        if not patch_path.exists():
-            raise PatchError(f"Patch file not found: {patch_path}")
-
-        if checksum:
-            actual = _sha256_of_file(str(patch_path))
-            if actual.lower() != checksum.lower():
-                raise PatchError(f"Patch checksum mismatch for {patch_path}: {actual} != {checksum}")
-
-        strip = int(patch_entry.get("strip", 1))
-        applied_to = patch_entry.get("applied_to") or patch_entry.get("target") or "."
-        # ensure applied_to sits inside build_dir
-        target_dir = _safe_join(self.build_dir, applied_to)
-
-        cmd = f"patch -p{strip} -i {shlex.quote(str(patch_path))}"
-        log_event(self.pkg, "patch.apply", f"Applying patch {patch_path} to {target_dir}")
-        # try 'patch' first, fallback to 'git apply' if patch fails (but git apply doesn't support -p)
-        try:
-            _run_shell(cmd, cwd=target_dir, env=self.env, dry_run=dry_run, chroot_root=chroot_root, use_fakeroot=use_fakeroot)
-        except PatchError as e:
-            # fallback to git apply if available
-            log_event(self.pkg, "patch.apply", f"patch failed, trying git apply fallback: {e}", level="warning")
-            try:
-                gcmd = f"git apply {shlex.quote(str(patch_path))}"
-                _run_shell(gcmd, cwd=target_dir, env=self.env, dry_run=dry_run, chroot_root=chroot_root, use_fakeroot=use_fakeroot)
-            except PatchError as e2:
-                raise PatchError(f"Both patch and git apply failed: {e2}")
-
-        # record applied (best-effort)
-        self._applied.append({"patch": str(patch_path), "target": target_dir, "time": int(time.time()), "strip": strip})
-
-    def apply_patches(self, patches: List[Dict[str, Any]], dry_run: bool = False, chroot_root: Optional[str] = None, use_fakeroot: bool = False) -> None:
-        """
-        Apply a list of patch entries. Each entry is a dict as produced by zeropkg_toml.
-        """
+    # ===============================================================
+    # Aplicar patches — suporta locais, remotos e checagem de hash
+    # ===============================================================
+    def _apply_patches(self, pkg_name, patches):
         if not patches:
-            log_event(self.pkg, "patches", "No patches to apply", level="debug")
+            log(f"ℹ️ Nenhum patch a aplicar para {pkg_name}")
             return
-        for p in patches:
-            # accept either dict or string
-            if isinstance(p, str):
-                patch_entry = {"path": p}
-            else:
-                patch_entry = dict(p)
-            # support checksum in patch_entry as 'checksum' or 'sha256'
-            checksum = patch_entry.get("checksum") or patch_entry.get("sha256")
+
+        for patch in patches:
+            patch_url = resolve_macros(patch.get("url") or patch.get("path"))
+            sha256 = patch.get("sha256")
+            patch_file = self._get_patch_file(patch_url)
+
+            if sha256 and not self._verify_sha256(patch_file, sha256):
+                raise ValueError(f"❌ SHA256 incorreto para {patch_file}")
+
+            log(f"📦 Aplicando patch: {patch_file}")
             try:
-                self.apply_patch(patch_entry, dry_run=dry_run, chroot_root=chroot_root, use_fakeroot=use_fakeroot, checksum=checksum)
+                self._apply_patch_file(patch_file)
+                self.db.mark_patch_applied(pkg_name, patch_file.name)
             except Exception as e:
-                log_event(self.pkg, "patches", f"Failed to apply patch {patch_entry.get('path')}: {e}", level="error")
+                log(f"⚠️ Falha ao aplicar patch {patch_file}: {e}")
+                self._save_patch_failure(pkg_name, patch_file, e)
                 raise
 
-    def apply_hooks(self, stage: str, hooks: Any, dry_run: bool = False, chroot_root: Optional[str] = None, use_fakeroot: bool = False, timeout: Optional[int] = None) -> None:
-        """
-        Execute hooks for a stage. hooks may be a string or list of strings.
-        Each hook is executed with macros resolved against self.env.
-        """
-        if not hooks:
-            return
-        hooks_list = hooks if isinstance(hooks, (list, tuple)) else [hooks]
-        for h in hooks_list:
-            cmd = resolve_macros(h, self.env) if isinstance(h, str) else str(h)
-            log_event(self.pkg, f"hook.{stage}", f"Executing hook: {cmd}")
-            # execute; timeout is best-effort via shell timeout if provided
-            if timeout:
-                cmd = f"timeout {int(timeout)} bash -lc {shlex.quote(cmd)}"
-            try:
-                _run_shell(cmd, cwd=self.build_dir, env=self.env, dry_run=dry_run, chroot_root=chroot_root, use_fakeroot=use_fakeroot)
-            except Exception as e:
-                log_event(self.pkg, f"hook.{stage}", f"Hook failed: {e}", level="error")
-                raise HookError(f"Hook '{cmd}' failed: {e}")
+    def _get_patch_file(self, patch_url):
+        if patch_url.startswith(("http://", "https://", "ftp://", "git://")):
+            return self.downloader.download_to_cache(patch_url, self.patch_cache_dir)
+        else:
+            local_path = Path(patch_url).expanduser()
+            if not local_path.exists():
+                raise FileNotFoundError(f"Patch não encontrado: {patch_url}")
+            return local_path
 
-    def apply_all_stages(self, meta: Dict[str, Any], dry_run: bool = False, chroot_root: Optional[str] = None) -> None:
-        """
-        Convenience: apply patches and hooks in canonical order:
-            pre_configure -> apply patches -> post_build -> pre_install -> post_install
-        Reads 'patches' and 'hooks' from meta (as normalized by zeropkg_toml.load_toml).
-        """
-        hooks = meta.get("hooks", {}) or {}
-        patches = meta.get("patches", []) or []
-        build_cfg = meta.get("build", {}) or {}
-        use_fakeroot = bool(build_cfg.get("fakeroot", True))
+    def _verify_sha256(self, file_path, expected_hash):
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256.update(chunk)
+        result = sha256.hexdigest()
+        log(f"Verificando SHA256: {result}")
+        return result == expected_hash
 
-        # pre_configure hooks
-        if hooks.get("pre_configure"):
-            self.apply_hooks("pre_configure", hooks["pre_configure"], dry_run=dry_run, chroot_root=chroot_root, use_fakeroot=use_fakeroot)
-
-        # patches
-        if patches:
-            self.apply_patches(patches, dry_run=dry_run, chroot_root=chroot_root, use_fakeroot=use_fakeroot)
-
-        # post_build hooks
-        if hooks.get("post_build"):
-            self.apply_hooks("post_build", hooks["post_build"], dry_run=dry_run, chroot_root=chroot_root, use_fakeroot=use_fakeroot)
-
-        # pre_install
-        if hooks.get("pre_install"):
-            self.apply_hooks("pre_install", hooks["pre_install"], dry_run=dry_run, chroot_root=chroot_root, use_fakeroot=use_fakeroot)
-
-        # post_install
-        if hooks.get("post_install"):
-            self.apply_hooks("post_install", hooks["post_install"], dry_run=dry_run, chroot_root=chroot_root, use_fakeroot=use_fakeroot)
-
-        log_event(self.pkg, "patcher", "All patch stages applied")
-
-    def rollback_last_patch(self, patch_entry: Optional[Dict[str, Any]] = None, dry_run: bool = False, chroot_root: Optional[str] = None, use_fakeroot: bool = False) -> None:
-        """
-        Best-effort rollback: tries `patch -R` with same strip level. If no entry provided, uses last applied.
-        Note: rollback may fail if patch is not reversible or files have changed.
-        """
-        if not patch_entry:
-            if not self._applied:
-                log_event(self.pkg, "patcher", "No applied patch to rollback", level="debug")
-                return
-            patch_entry = self._applied[-1]
-
-        patch_file = patch_entry.get("patch")
-        strip = int(patch_entry.get("strip", 1))
-        target = patch_entry.get("target", self.build_dir)
-        if not patch_file or not os.path.exists(patch_file):
-            raise PatchError(f"Cannot rollback; patch file missing: {patch_file}")
-
-        cmd = f"patch -R -p{strip} -i {shlex.quote(str(patch_file))}"
-        log_event(self.pkg, "patcher.rollback", f"Rolling back patch {patch_file} in {target}")
+    def _apply_patch_file(self, patch_file):
+        # Tenta patch, depois git apply, detecta automaticamente -p nível
         try:
-            _run_shell(cmd, cwd=target, env=self.env, dry_run=dry_run, chroot_root=chroot_root, use_fakeroot=use_fakeroot)
-            # remove from applied list if successful
-            if self._applied and self._applied[-1].get("patch") == patch_file:
-                self._applied.pop()
-        except Exception as e:
-            log_event(self.pkg, "patcher.rollback", f"Rollback failed: {e}", level="warning")
-            raise PatchError(f"Rollback failed: {e}")
+            subprocess.run(["patch", "-p1", "-i", str(patch_file)], cwd=self.work_dir, check=True)
+        except subprocess.CalledProcessError:
+            for p_level in range(0, 3):
+                try:
+                    subprocess.run(["patch", f"-p{p_level}", "-i", str(patch_file)],
+                                   cwd=self.work_dir, check=True)
+                    return
+                except subprocess.CalledProcessError:
+                    continue
+            try:
+                subprocess.run(["git", "apply", str(patch_file)], cwd=self.work_dir, check=True)
+            except Exception as e:
+                raise RuntimeError(f"Falha ao aplicar patch {patch_file}: {e}")
 
-# -------------------------
-# Module-level convenience
-# -------------------------
-def apply_all_stages_from_meta(build_dir: str, meta: Dict[str, Any], dry_run: bool = False, chroot_root: Optional[str] = None):
-    p = Patcher(build_dir, pkg_name=(meta.get("package") or {}).get("name"), env=meta.get("environment"))
-    p.apply_all_stages(meta, dry_run=dry_run, chroot_root=chroot_root)
-    return p
+    def _save_patch_failure(self, pkg_name, patch_file, error):
+        fail_dir = Path("/var/log/zeropkg/patch_failures")
+        fail_dir.mkdir(parents=True, exist_ok=True)
+        fail_log = fail_dir / f"{pkg_name}_{patch_file.name}.log"
+        with open(fail_log, "w") as f:
+            f.write(str(error))
+        log(f"⚠️ Log de falha salvo em {fail_log}")
 
-# -------------------------
-# CLI / test helper
-# -------------------------
+    # ===============================================================
+    # Hooks pré/pós
+    # ===============================================================
+    def _run_hooks(self, pkg_name, hooks):
+        for stage, cmds in hooks.items():
+            if not cmds:
+                continue
+            log(f"⚙️ Executando hook {stage} para {pkg_name}")
+            for cmd in cmds:
+                resolved_cmd = resolve_macros(cmd)
+                self._run_command(resolved_cmd, stage)
+
+    def _run_command(self, command, stage):
+        if self.fakeroot:
+            command = f"fakeroot sh -c '{command}'"
+        elif self.config.get_bool("build", "use_chroot", fallback=False):
+            run_in_chroot(self.config, command)
+            return
+        subprocess.run(command, shell=True, cwd=self.work_dir, check=True)
+
+    # ===============================================================
+    # Rollback de patches aplicados (melhor esforço)
+    # ===============================================================
+    def rollback(self, pkg_name):
+        patches = self.db.get_applied_patches(pkg_name)
+        for patch in reversed(patches):
+            try:
+                subprocess.run(["patch", "-R", "-p1", "-i", str(patch)], cwd=self.work_dir, check=True)
+                log(f"🔁 Patch revertido: {patch}")
+            except subprocess.CalledProcessError:
+                log(f"⚠️ Falha ao reverter patch {patch}")
+
+    # ===============================================================
+    # Integração futura com verificação de vulnerabilidades
+    # ===============================================================
+    def check_vulnerabilities(self, pkg_name):
+        """Placeholder — será integrado com zeropkg_security futuramente."""
+        vulns = self.db.get_known_vulnerabilities(pkg_name)
+        if vulns:
+            log(f"⚠️ {pkg_name} contém {len(vulns)} vulnerabilidades conhecidas!")
+        else:
+            log(f"✅ Nenhuma vulnerabilidade conhecida em {pkg_name}")
+
+# ===============================================================
+# CLI direto: aplicar patches manualmente
+# ===============================================================
 if __name__ == "__main__":
-    import argparse, json
-    parser = argparse.ArgumentParser(prog="zeropkg-patcher", description="Apply patches and hooks for a recipe")
-    parser.add_argument("build_dir", help="build directory root")
-    parser.add_argument("--meta", help="recipe meta JSON (dump from zeropkg_toml.load_toml)", required=True)
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--chroot", help="optional chroot root to run hooks/patches inside")
-    args = parser.parse_args()
-
-    meta = {}
-    with open(args.meta, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-    p = Patcher(args.build_dir, pkg_name=(meta.get("package") or {}).get("name"), env=meta.get("environment"))
-    try:
-        p.apply_all_stages(meta, dry_run=args.dry_run, chroot_root=args.chroot)
-        print("Patches/hooks applied.")
-    except Exception as e:
-        print("Failed:", e)
-        sys.exit(1)
+    import sys
+    from zeropkg_config import ZeropkgConfig
+    config = ZeropkgConfig()
+    pkg = sys.argv[1] if len(sys.argv) > 1 else "teste"
+    recipe = {"patches": [{"url": "example.patch", "sha256": "abcd"}]}
+    patcher = Patcher("/tmp/build", config)
+    patcher.apply_all(pkg, recipe)
