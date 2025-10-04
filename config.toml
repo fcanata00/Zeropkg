@@ -16,6 +16,8 @@ log_dir     = "/var/lib/zeropkg/logs"
 repo_dir    = "/usr/ports"
 distfiles   = "/usr/ports/distfiles"
 hooks_dir   = "/etc/zeropkg/hooks.d"
+patches = "/usr/ports/distfiles/patches"
+#build_root = "/var/tmp/zeropkg/build"
 
 # Chroot (usado pelo builder e installer)
 chroot_dir  = "/mnt/lfs"
