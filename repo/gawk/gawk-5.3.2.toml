@@ -1,0 +1,52 @@
+[package]
+name = "gawk"
+version = "5.3.1"
+category = "lfs"
+description = "Gawk — GNU awk, para manipulação de texto (LFS capítulo 6.9)"
+homepage = "https://www.gnu.org/software/gawk/"
+license = "GPL-3.0-or-later"
+maintainer = "zeropkg"
+
+[sources]
+urls = [
+  "https://ftp.gnu.org/gnu/gawk/gawk-5.3.1.tar.xz"
+]
+checksum = "sha256:<COLOQUE_SHA256_REAL_DO_TARBALL>"
+extract_to = "gawk-5.3.1"
+
+[environment]
+LFS = "/mnt/lfs"
+LFS_TGT = "x86_64-lfs-linux-gnu"
+PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
+DESTDIR = "@DESTDIR@"
+
+[build]
+chroot = true
+fakeroot = false
+cleanup_sources = true
+commands = [
+  # 1) Remover "extras" de Makefile.in conforme instrução do LFS
+  "sed -i 's/extras//' Makefile.in",
+
+  # 2) Configurar com prefixo /usr e host cruzado
+  "./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess)",
+
+  # 3) Compilar
+  "make",
+
+  # 4) Instalar no DESTDIR
+  "make DESTDIR=${DESTDIR} install"
+]
+
+[hooks]
+pre_build = "echo '==> Construindo Gawk 5.3.1 (LFS)'"
+post_install = "echo '==> Gawk instalado no destino'"
+
+[dependencies]
+build = []
+runtime = []
+
+[lfs]
+stage = "toolchain"
+bootstrap = true
+chroot_required = true
