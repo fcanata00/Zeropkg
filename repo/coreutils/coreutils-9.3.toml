@@ -1,57 +1,104 @@
+# /usr/ports/coreutils/coreutils-9.6.toml
 [package]
 name = "coreutils"
-version = "9.3"
-category = "lfs"
-description = "GNU Coreutils — utilitários essenciais para LFS (Capítulo 6.5)"
-homepage = "https://www.gnu.org/software/coreutils/"
+version = "9.6"
+description = "GNU Core Utilities - utilitários básicos do sistema"
+category = "tools"
 license = "GPL-3.0-or-later"
-maintainer = "zeropkg"
+homepage = "https://www.gnu.org/software/coreutils/"
+maintainer = "Zeropkg LFS Automation"
+stage = "toolchain"
+priority = "normal"
 
-[sources]
-urls = [
-  "https://ftp.gnu.org/gnu/coreutils/coreutils-9.3.tar.xz"
-]
-checksum = "sha256:adbcfcfe8992358f99eb6f75986a8e7b3c270a3f6125a7a1f0b4e33de788de00"
-extract_to = "coreutils-9.3"
+[source]
+urls = ["https://ftp.gnu.org/gnu/coreutils/coreutils-9.6.tar.xz"]
+# SHA256 obtido do anúncio oficial/FTP do GNU.
+sha256 = ["7a0124327b398fd9eb1a6abde583389821422c744ffa10734b24f557610d3283"]
+extract_to = "coreutils-9.6"
+
+[build]
+# Coreutils no LFS capítulo 6 é construído in-tree (sem build/ separado).
+depends = []
+optional_depends = []
+use_chroot = true
+fakeroot = true
+workdir = "coreutils-9.6"
 
 [environment]
 LFS = "/mnt/lfs"
 LFS_TGT = "x86_64-lfs-linux-gnu"
-PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
-DESTDIR = "@DESTDIR@"
+PATH = "/tools/bin:/usr/bin:/bin"
+MAKEFLAGS = "-j$(nproc)"
+LC_ALL = "POSIX"
+CFLAGS = "-O2 -pipe"
 
-[build]
-chroot = true
-fakeroot = false
-cleanup_sources = true
-commands = [
-  # 1️⃣ Configuração para cross-build no ambiente LFS
-  "./configure --prefix=/usr \\",
-  "  --host=$LFS_TGT \\",
-  "  --build=$(build-aux/config.guess) \\",
-  "  --enable-install-program=hostname",
+# prepare: (não precisa criar "build" - coreutils usa build in-tree)
+prepare = [
+  "echo '[prepare] Source ready: $(pwd)'"
+]
 
-  # 2️⃣ Compilação
-  "make",
+# configure: usar exatamente as opções LFS (hostname habilitado; kill/uptime desabilitados)
+configure = [
+  "pushd .",
+  "./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess) \\",
+  "  --enable-install-program=hostname \\",
+  "  --enable-no-install-program=kill,uptime",
+  "popd"
+]
 
-  # 3️⃣ Instalação no destino
-  "make DESTDIR=${DESTDIR} install",
+compile = [
+  "make"
+]
 
-  # 4️⃣ Reorganização conforme LFS — mover binários críticos
-  "mv -v ${DESTDIR}/usr/bin/{cat,chgrp,chmod,chown,cp,date,dd,df,echo,false,ln,ls,mkdir,mknod,mv,pwd,rm,rmdir,stty,sync,true,uname} ${DESTDIR}/bin",
-  "mv -v ${DESTDIR}/usr/bin/{head,tail,basename,dirname} ${DESTDIR}/usr/bin",
-  "mv -v ${DESTDIR}/usr/bin/{install,tee,link,unlink} ${DESTDIR}/usr/bin"
+# instalar para DESTDIR=$LFS conforme LFS
+install = [
+  "make DESTDIR=$LFS install"
+]
+
+# comandos pós-instalação: mover chroot para /usr/sbin e ajustar manpage para man8
+# (essas ações são necessárias mesmo no ambiente temporário do LFS).
+post_install = [
+  "mv -v $LFS/usr/bin/chroot $LFS/usr/sbin || true",
+  "mkdir -pv $LFS/usr/share/man/man8",
+  "mv -v $LFS/usr/share/man/man1/chroot.1 $LFS/usr/share/man/man8/chroot.8 || true",
+  "sed -i 's/\"1\"/\"8\"/' $LFS/usr/share/man/man8/chroot.8 || true"
 ]
 
 [hooks]
-pre_build = "echo '==> Iniciando build do Coreutils 9.3 (LFS temporário)'"
-post_install = "echo '==> Coreutils 9.3 instalado e reorganizado conforme LFS'"
+pre_configure = ["echo '[HOOK] iniciando configure coreutils'"]
+post_install_hook = ["echo '[HOOK] coreutils instalado e movido (chroot->/usr/sbin)'" ]
 
-[dependencies]
-build = ["bash-5.2.37", "ncurses-6.5", "m4-1.4.19"]
-runtime = []
+[patches]
+apply = []
+strip = 1
 
-[lfs]
-stage = "toolchain"
-bootstrap = true
-chroot_required = true
+[tests]
+# LFS não exige 'make check' aqui — mantemos testes desabilitados por padrão.
+enabled = false
+commands = []
+
+[package.files]
+bin = [
+  "/usr/bin/ls", "/usr/bin/cp", "/usr/bin/mv", "/usr/bin/rm",
+  "/usr/bin/mkdir", "/usr/bin/ln", "/usr/bin/chmod", "/usr/bin/chown"
+]
+sbin = ["/usr/sbin/chroot"]
+man = ["/usr/share/man/man1/*", "/usr/share/man/man8/*"]
+
+[package.meta]
+provides = ["coreutils"]
+group = "base"
+keywords = ["core", "utils"]
+
+[install]
+# por padrão instala em / quando chamado sem --root; para LFS use --root /mnt/lfs
+root = "/"
+keep_build = false
+safe_chroot = true
+parallel_install = true
+overwrite_existing = true
+
+[notifications]
+notify = true
+urgency = "normal"
+summary = "Coreutils 9.6 instalado"
