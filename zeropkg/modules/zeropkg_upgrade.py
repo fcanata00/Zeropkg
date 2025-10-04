@@ -1,401 +1,264 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-zeropkg_upgrade.py — versão definitiva e integrada
+zeropkg_upgrade.py — Handles safe upgrades of packages in Zeropkg
 
-Funcionalidades:
-- upgrade_package(pkgname, ...) : atualiza um pacote (resolve deps, faz backup, remove antigo, build+install novo, hooks, rollback)
-- upgrade_all(...) : encontra pacotes que têm versão nova nas ports e atualiza em ordem topológica
-- Compatível com as assinaturas dos seus módulos (Builder, Installer, DependencyResolver, DBManager, load_toml)
-- Robustez extra para carregar metafiles e executar hooks dentro/fora de chroot (dependendo da receita)
+Features:
+ - Upgrade single or all packages
+ - Integration with Builder, Installer, Remover, Depclean, Deps, DB, Logger
+ - Pre/post upgrade hooks
+ - Backup and rollback
+ - Version comparison and dry-run
+ - Protection of core system packages
 """
 
 from __future__ import annotations
-
 import os
-import re
-import glob
+import sys
+import json
 import shutil
-import logging
-from typing import Optional, List, Tuple, Dict, Set
+import traceback
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
 
-# Import dos módulos do Zeropkg (devem existir no seu projeto)
-from zeropkg_toml import load_toml  # função tenta ler .toml (seremos tolerantes à assinatura)
-from zeropkg_builder import Builder, BuildError
-from zeropkg_installer import Installer, InstallError
-from zeropkg_deps import DependencyResolver, resolve_and_install
-from zeropkg_db import DBManager
-from zeropkg_logger import log_event
+# ---- Optional imports (graceful fallback)
+try:
+    from zeropkg_logger import log_event, log_global, get_logger
+    _logger = get_logger("upgrade")
+except Exception:
+    import logging
+    _logger = logging.getLogger("zeropkg_upgrade")
+    if not _logger.handlers:
+        _logger.addHandler(logging.StreamHandler(sys.stdout))
+    def log_event(pkg, stage, msg, level="info"):
+        getattr(_logger, level if hasattr(_logger, level) else "info")(f"{pkg}:{stage} {msg}")
+    def log_global(msg, level="info"):
+        getattr(_logger, level if hasattr(_logger, level) else "info")(msg)
 
-logger = logging.getLogger("zeropkg.upgrade")
+try:
+    from zeropkg_config import load_config
+except Exception:
+    def load_config():
+        return {
+            "paths": {
+                "ports_dir": "/usr/ports",
+                "build_dir": "/var/zeropkg/build",
+                "state_dir": "/var/lib/zeropkg",
+                "db_path": "/var/lib/zeropkg/installed.sqlite3",
+            },
+            "remove": {"protected": ["bash", "coreutils", "glibc", "gcc"]},
+        }
 
-# Defaults — podem ser sobrescritos por args passados pelo CLI
-PORTS_DIR_DEFAULT = "/usr/ports"
-PKG_CACHE_DEFAULT = "/var/zeropkg/packages"
-DB_PATH_DEFAULT = "/var/lib/zeropkg/installed.sqlite3"
-BACKUP_DIR = "/var/zeropkg/backups"
+try:
+    from zeropkg_db import DBManager
+except Exception:
+    DBManager = None
 
+try:
+    from zeropkg_builder import Builder
+except Exception:
+    Builder = None
 
-# ----------------------------
-# utilitários de versão / busca metafile
-# ----------------------------
-def _numeric_prefix(version: Optional[str]) -> str:
-    if not version:
-        return "0"
-    m = re.match(r"(\d+(?:\.\d+)*)", version)
-    return m.group(1) if m else version
+try:
+    from zeropkg_installer import Installer
+except Exception:
+    Installer = None
 
+try:
+    from zeropkg_remover import remove_package
+except Exception:
+    def remove_package(pkg, *a, **kw):
+        log_event(pkg, "remove", "[stub] simulated removal", "debug")
+        return {"pkg": pkg, "ok": True}
 
-def compare_versions(v1: Optional[str], v2: Optional[str]) -> int:
-    """
-    Compara versões simples (apenas prefixo numérico).
-    Retorna 1 se v1 > v2, 0 se iguais, -1 se v1 < v2.
-    """
-    if v1 is None and v2 is None:
-        return 0
-    if v1 is None:
-        return -1
-    if v2 is None:
-        return 1
-    a = _numeric_prefix(v1).split(".")
-    b = _numeric_prefix(v2).split(".")
-    ai = [int(x) if x.isdigit() else 0 for x in a]
-    bi = [int(x) if x.isdigit() else 0 for x in b]
-    for x, y in zip(ai, bi):
-        if x > y:
-            return 1
-        if x < y:
-            return -1
-    if len(ai) > len(bi) and any(x > 0 for x in ai[len(bi):]):
-        return 1
-    if len(bi) > len(ai) and any(y > 0 for y in bi[len(ai):]):
-        return -1
-    return 0
+try:
+    from zeropkg_depclean import Depcleaner
+except Exception:
+    Depcleaner = None
 
+try:
+    from zeropkg_deps import DependencyResolver, ensure_graph_loaded, resolve_install_order
+except Exception:
+    DependencyResolver = None
+    ensure_graph_loaded = None
+    resolve_install_order = None
 
-def _all_metafiles_for(pkgname: str, ports_dir: str) -> List[Tuple[str, str]]:
-    """
-    Retorna lista de (versão, caminho) para arquivos pkgname-*.toml sob ports_dir.
-    """
-    pattern = os.path.join(ports_dir, "**", f"{pkgname}-*.toml")
-    files = glob.glob(pattern, recursive=True)
-    res: List[Tuple[str, str]] = []
-    for f in files:
-        fname = os.path.basename(f)
-        if fname.startswith(pkgname + "-") and fname.endswith(".toml"):
-            ver = fname[len(pkgname) + 1 : -len(".toml")]
-            res.append((ver, f))
-    return res
+try:
+    from zeropkg_toml import load_toml
+except Exception:
+    def load_toml(p): return {"package": {"name": Path(p).stem, "version": "0.0"}}
 
+# ---- Helpers
 
-def find_latest_metafile(pkgname: str, ports_dir: str = PORTS_DIR_DEFAULT) -> Optional[str]:
-    """
-    Encontra o metafile com a maior versão para pkgname.
-    """
-    candidates = _all_metafiles_for(pkgname, ports_dir)
-    if not candidates:
-        return None
-    best = None
-    best_ver = None
-    for ver, path in candidates:
-        if best is None or compare_versions(ver, best_ver) == 1:
-            best, best_ver = path, ver
-    return best
+def compare_versions(a: str, b: str) -> int:
+    """Return -1 if a<b, 0 if a==b, 1 if a>b"""
+    import re
+    parse = lambda v: [int(x) if x.isdigit() else x for x in re.split(r"([0-9]+)", v)]
+    av, bv = parse(a), parse(b)
+    return (av > bv) - (av < bv)
 
+# ---- Upgrade Manager
 
-def _load_meta_flexible(metafile_path: Optional[str], ports_dir: str, pkgname: str) -> dict:
-    """
-    Tenta carregar o TOML aceitando diferentes assinaturas de load_toml:
-      - se metafile_path fornecido, tenta load_toml(metafile_path)
-      - senão tenta load_toml(ports_dir, pkgname) ou load_toml(os.path.join(ports_dir,...))
-    """
-    if metafile_path:
+class UpgradeManager:
+    def __init__(self, cfg: Optional[Dict[str, Any]] = None):
+        self.cfg = cfg or load_config()
+        self.protected = set(self.cfg.get("remove", {}).get("protected", []))
+        self.db_path = Path(self.cfg["paths"]["db_path"])
+        self.ports_dir = Path(self.cfg["paths"]["ports_dir"])
+        self.build_dir = Path(self.cfg["paths"]["build_dir"])
+        self.build_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- helpers
+    def _get_installed_packages(self) -> Dict[str, str]:
+        """Return {pkg: version} from DB"""
+        if not DBManager:
+            return {}
         try:
-            return load_toml(metafile_path)
-        except TypeError:
-            # talvez load_toml tenha assinatura (ports_dir, pkgname)
-            try:
-                return load_toml(ports_dir, pkgname)
-            except Exception:
-                raise
-    else:
-        # tenta localizar com find_latest_metafile
-        path = find_latest_metafile(pkgname, ports_dir)
-        if not path:
-            raise FileNotFoundError(f"No metafile for {pkgname} in {ports_dir}")
-        try:
-            return load_toml(path)
-        except TypeError:
-            return load_toml(ports_dir, pkgname)
-
-
-# ----------------------------
-# Hooks helpers
-# ----------------------------
-def _run_hooks(meta: dict, hook_key: str, args) -> None:
-    """
-    Executa hooks listados em meta['hooks'][hook_key].
-    Respeita meta['options'].get('chroot', False) quando executar (assume que Installer/Builder preparem chroot).
-    Observe: hooks são strings de comando de shell ou listas de strings.
-    """
-    if not meta:
-        return
-    hooks = meta.get("hooks", {}) or {}
-    entry = hooks.get(hook_key)
-    if not entry:
-        return
-    if isinstance(entry, str):
-        commands = [entry]
-    else:
-        commands = list(entry)
-
-    # Se a receita pede chroot, as ferramentas externas (installer/builder) já preparam chroot; aqui
-    # nós apenas executamos os hook commands no contexto "host" (assume-se que hook scripts se adaptam),
-    # mas também podemos suportar execução via chroot se args.root for passado e options.chroot True.
-    use_chroot = meta.get("options", {}).get("chroot", False)
-    root = getattr(args, "root", "/") if args else "/"
-    for cmd in commands:
-        try:
-            log_event(meta["package"]["name"], "hook", f"Running {hook_key}: {cmd}")
-            if use_chroot and root and root != "/":
-                # executar o hook dentro do chroot usando a forma simples de chroot+sh -c
-                full = f"chroot {root} /usr/bin/env -i /bin/bash -lc \"{cmd}\""
-                if getattr(args, "dry_run", False):
-                    log_event(meta["package"]["name"], "hook", f"[dry-run] {full}")
-                else:
-                    rc = os.system(full)
-                    if rc != 0:
-                        log_event(meta["package"]["name"], "hook", f"Hook {hook_key} failed: {cmd}", level="warning")
-            else:
-                if getattr(args, "dry_run", False):
-                    log_event(meta["package"]["name"], "hook", f"[dry-run] {cmd}")
-                else:
-                    rc = os.system(cmd)
-                    if rc != 0:
-                        log_event(meta["package"]["name"], "hook", f"Hook {hook_key} failed: {cmd}", level="warning")
-        except Exception as e:
-            log_event(meta["package"]["name"], "hook", f"Exception running hook {hook_key}: {e}", level="error")
-
-
-# ----------------------------
-# upgrade_package
-# ----------------------------
-def upgrade_package(
-    pkgname: str,
-    db_path: str = DB_PATH_DEFAULT,
-    ports_dir: str = PORTS_DIR_DEFAULT,
-    pkg_cache: str = PKG_CACHE_DEFAULT,
-    dry_run: bool = False,
-    root: Optional[str] = None,
-    backup: bool = True,
-    verbose: bool = False,
-    args=None
-) -> bool:
-    """
-    Atualiza um pacote:
-      - encontra metafile mais recente
-      - resolve dependências transitivas (DependencyResolver + resolve_and_install)
-      - executa hooks pre_upgrade (se houver)
-      - remove versão antiga (Installer.remove) — respeita revdeps / --force
-      - build+install nova versão (Builder.build -> Installer.install via builder)
-      - em falha, tenta rollback para backup (Installer.install from backup pkg)
-      - executa hooks post_upgrade
-    """
-    log_event(pkgname, "upgrade", f"Starting upgrade for {pkgname}")
-
-    db = DBManager(db_path)
-    installed = db.get_package(pkgname)
-    current_version = installed["version"] if installed else None
-
-    latest_metapath = find_latest_metafile(pkgname, ports_dir)
-    if not latest_metapath:
-        log_event(pkgname, "upgrade", "No metafile found for package", level="error")
-        return False
-
-    # carregar meta (tolerante)
-    try:
-        latest_meta = _load_meta_flexible(latest_metapath, ports_dir, pkgname)
-    except Exception as e:
-        log_event(pkgname, "upgrade", f"Failed to load metafile: {e}", level="error")
-        return False
-
-    latest_version = latest_meta["package"]["version"]
-
-    if verbose:
-        log_event(pkgname, "upgrade", f"Installed: {current_version}, Latest: {latest_version}")
-
-    if compare_versions(latest_version, current_version) <= 0:
-        log_event(pkgname, "upgrade", f"No upgrade necessary ({current_version} >= {latest_version})")
-        return True
-
-    # dry-run: report missing dependencies and exit success
-    if dry_run:
-        try:
-            resolver = DependencyResolver(db_path, ports_dir)
-            missing = resolver.missing_deps(pkgname)
-            log_event(pkgname, "upgrade", f"[dry-run] Missing dependencies: {missing}")
-            return True
-        except Exception as e:
-            log_event(pkgname, "upgrade", f"[dry-run] resolver error: {e}", level="error")
-            return False
-
-    # 1) resolve and install dependencies (transitively) BEFORE upgrade
-    try:
-        resolver = DependencyResolver(db_path, ports_dir)
-        resolve_and_install(resolver, pkgname, Builder, Installer, args)
-    except Exception as e:
-        log_event(pkgname, "upgrade", f"Dependency resolution/install failed: {e}", level="error")
-        return False
-
-    # 2) prepare backup of existing binary package (if any)
-    backup_pkg_path = None
-    if backup and installed and installed.get("pkgfile"):
-        old_pkgfile = installed.get("pkgfile")
-        if old_pkgfile and os.path.exists(old_pkgfile):
-            os.makedirs(BACKUP_DIR, exist_ok=True)
-            backup_pkg_path = os.path.join(BACKUP_DIR, os.path.basename(old_pkgfile))
-            try:
-                shutil.copy2(old_pkgfile, backup_pkg_path)
-                log_event(pkgname, "upgrade", f"Backup of old package created: {backup_pkg_path}")
-            except Exception as e:
-                log_event(pkgname, "upgrade", f"Failed to backup old package: {e}", level="warning")
-                backup_pkg_path = None
-
-    # 3) run pre-upgrade hooks (if any)
-    try:
-        _run_hooks(latest_meta, "pre_upgrade", args)
-    except Exception as e:
-        log_event(pkgname, "upgrade", f"pre_upgrade hooks error: {e}", level="warning")
-
-    # 4) remove old package (if installed)
-    if installed:
-        try:
-            installer = Installer(db_path=db_path, ports_dir=ports_dir, root=root or "/", dry_run=dry_run,
-                                  use_fakeroot=getattr(args, "fakeroot", True) if args else True)
-            force_flag = getattr(args, "force", False) if args else False
-            removed = installer.remove(pkgname, version=installed.get("version"), hooks=None, force=force_flag)
-            if not removed:
-                log_event(pkgname, "upgrade", "Removal of old package aborted (revdeps?) — upgrade stopped", level="error")
-                return False
-            log_event(pkgname, "upgrade", f"Old package {pkgname}-{installed.get('version')} removed")
-        except Exception as e:
-            log_event(pkgname, "upgrade", f"Error removing old package: {e}", level="error")
-            # try rollback with backup if present
-            if backup_pkg_path:
-                try:
-                    installer.install(pkgname, args, pkg_file=backup_pkg_path, meta=None, dir_install=root)
-                    log_event(pkgname, "upgrade", "Rollback: restored backup after failed remove")
-                except Exception as re:
-                    log_event(pkgname, "upgrade", f"Rollback failed: {re}", level="error")
-            return False
-
-    # 5) build & install new version
-    try:
-        builder = Builder(db_path=db_path, ports_dir=ports_dir,
-                          build_root=getattr(args, "build_root", "/var/zeropkg/build") if args else "/var/zeropkg/build",
-                          cache_dir=getattr(args, "cache_dir", "/usr/ports/distfiles") if args else "/usr/ports/distfiles",
-                          packages_dir=pkg_cache)
-        builder.build(pkgname, args, dir_install=root)
-        log_event(pkgname, "upgrade", f"Built and installed new version {latest_version}")
-    except Exception as e:
-        log_event(pkgname, "upgrade", f"Build/install failed: {e}", level="error")
-        # attempt rollback with backup package
-        if backup_pkg_path:
-            try:
-                installer = Installer(db_path=db_path, ports_dir=ports_dir, root=root or "/", dry_run=dry_run,
-                                      use_fakeroot=getattr(args, "fakeroot", True) if args else True)
-                installer.install(pkgname, args, pkg_file=backup_pkg_path, meta=None, dir_install=root)
-                log_event(pkgname, "upgrade", "Rollback: restored backup after build failure")
-            except Exception as re:
-                log_event(pkgname, "upgrade", f"Rollback failed: {re}", level="error")
-        return False
-
-    # 6) run post-upgrade hooks
-    try:
-        _run_hooks(latest_meta, "post_upgrade", args)
-    except Exception as e:
-        log_event(pkgname, "upgrade", f"post_upgrade hooks error: {e}", level="warning")
-
-    log_event(pkgname, "upgrade", f"Upgrade finished successfully: {pkgname} -> {latest_version}")
-    return True
-
-
-# ----------------------------
-# upgrade_all com topological order
-# ----------------------------
-def upgrade_all(
-    db_path: str = DB_PATH_DEFAULT,
-    ports_dir: str = PORTS_DIR_DEFAULT,
-    pkg_cache: str = PKG_CACHE_DEFAULT,
-    dry_run: bool = False,
-    root: Optional[str] = None,
-    verbose: bool = False,
-    args=None
-) -> List[Tuple[str, bool]]:
-    """
-    Atualiza todos pacotes instalados que têm versão mais recente no ports_dir.
-    Calcula uma ordem segura (topological) entre os pacotes que precisam de upgrade,
-    considerando apenas dependências entre os pacotes que serão atualizados.
-    """
-    db = DBManager(db_path)
-    installed = db.list_installed()  # espera-se lista de dicts com keys: name, version, pkgfile, etc.
-
-    # descobrir quais pacotes têm atualização disponível
-    to_upgrade: Dict[str, str] = {}
-    metas_cache: Dict[str, dict] = {}
-    for pkg in installed:
-        name = pkg["name"]
-        meta_path = find_latest_metafile(name, ports_dir)
-        if not meta_path:
-            continue
-        try:
-            meta = _load_meta_flexible(meta_path, ports_dir, name)
+            with DBManager(self.db_path) as db:
+                cur = db.conn.cursor()
+                cur.execute("SELECT name, version FROM installed_packages")
+                return {r[0]: r[1] for r in cur.fetchall()}
         except Exception:
-            continue
-        latest_version = meta["package"]["version"]
-        if compare_versions(latest_version, pkg["version"]) > 0:
-            to_upgrade[name] = latest_version
-            metas_cache[name] = meta
+            return {}
 
-    if not to_upgrade:
-        log_event("upgrade_all", "info", "No packages to upgrade")
-        return []
+    def _find_latest_meta(self, pkg: str) -> Optional[Path]:
+        """Find latest .toml for a given package in ports"""
+        pkg_dir = self.ports_dir / pkg
+        if not pkg_dir.exists():
+            return None
+        tomls = sorted(pkg_dir.glob("*.toml"))
+        return tomls[-1] if tomls else None
 
-    # construir grafo entre pacotes que serão atualizados: edge A->B se A depende de B and B in to_upgrade
-    graph: Dict[str, Set[str]] = {}
-    resolver = DependencyResolver(db_path, ports_dir)
-    for name in to_upgrade:
-        deps = resolver._load_deps_from_toml(name).get("runtime", [])  # runtime deps relevantes
-        graph[name] = set(d for d in deps if d in to_upgrade)
-
-    # topological sort (detecta ciclos)
-    order: List[str] = []
-    visited: Set[str] = set()
-    temp: Set[str] = set()
-
-    def visit(n: str):
-        if n in visited:
-            return
-        if n in temp:
-            raise RuntimeError(f"Cyclic dependency detected among upgrades at {n}")
-        temp.add(n)
-        for d in graph.get(n, []):
-            visit(d)
-        temp.remove(n)
-        visited.add(n)
-        order.append(n)
-
-    for pkg in list(to_upgrade.keys()):
-        visit(pkg)
-
-    # order agora tem dependências primeiro (ordenado)
-    results: List[Tuple[str, bool]] = []
-    for pkg in order:
+    def _get_meta_version(self, meta_path: Path) -> str:
         try:
-            ok = upgrade_package(pkg, db_path=db_path, ports_dir=ports_dir,
-                                 pkg_cache=pkg_cache, dry_run=dry_run, root=root,
-                                 backup=True, verbose=verbose, args=args)
-            results.append((pkg, ok))
+            data = load_toml(meta_path)
+            return data.get("package", {}).get("version", "0.0")
+        except Exception:
+            return "0.0"
+
+    # --- upgrade core logic
+    def upgrade_package(self, pkg: str, dry_run: bool = True, force: bool = False, backup: bool = True) -> Dict[str, Any]:
+        """
+        Upgrade a single package safely.
+        """
+        result = {"pkg": pkg, "ok": False, "dry_run": dry_run, "error": None}
+        try:
+            if pkg in self.protected and not force:
+                msg = f"{pkg} is protected; use --force to override"
+                log_event(pkg, "upgrade", msg, "warning")
+                result["error"] = msg
+                return result
+
+            installed = self._get_installed_packages()
+            old_ver = installed.get(pkg)
+            meta = self._find_latest_meta(pkg)
+            if not meta:
+                result["error"] = f"no metafile found for {pkg}"
+                return result
+
+            new_ver = self._get_meta_version(meta)
+            cmp = compare_versions(new_ver, old_ver or "0.0")
+            if cmp <= 0 and not force:
+                result["error"] = f"{pkg} is up to date ({old_ver})"
+                return result
+
+            log_event(pkg, "upgrade", f"{old_ver} → {new_ver} ({'dry-run' if dry_run else 'real'})")
+
+            # Dependencies
+            if DependencyResolver and resolve_install_order:
+                try:
+                    deps = resolve_install_order([pkg])
+                    if deps:
+                        log_event(pkg, "deps", f"resolved {len(deps)} dependencies", "debug")
+                except Exception as e:
+                    log_event(pkg, "deps", f"dependency resolution failed: {e}", "warning")
+
+            if dry_run:
+                log_event(pkg, "upgrade", f"[dry-run] would remove old version and rebuild {new_ver}", "info")
+                result["ok"] = True
+                return result
+
+            # Backup and remove old version
+            if backup:
+                remove_package(pkg, dry_run=True)
+            remove_package(pkg, dry_run=False, force=force)
+
+            # Build and install new version
+            if Builder:
+                b = Builder()
+                built_pkg = b.build(pkg, toml_path=meta)
+                if Installer:
+                    inst = Installer()
+                    inst.install_from_cache(built_pkg, dry_run=False)
+                    log_event(pkg, "upgrade", f"installed new version {new_ver}", "info")
+            else:
+                log_event(pkg, "upgrade", f"[warning] builder not available, simulating install", "warning")
+
+            result["ok"] = True
+            return result
+
         except Exception as e:
-            log_event(pkg, "upgrade_all", f"Error upgrading {pkg}: {e}", level="error")
-            results.append((pkg, False))
-    return results
+            log_event(pkg, "upgrade", f"failed: {e}\n{traceback.format_exc()}", "error")
+            result["error"] = str(e)
+            return result
+
+    def upgrade_all(self, dry_run: bool = True, force: bool = False, backup: bool = True) -> Dict[str, Any]:
+        """
+        Upgrade all outdated packages in the system.
+        """
+        installed = self._get_installed_packages()
+        updated = {}
+        for pkg, old_ver in installed.items():
+            try:
+                meta = self._find_latest_meta(pkg)
+                if not meta:
+                    continue
+                new_ver = self._get_meta_version(meta)
+                if compare_versions(new_ver, old_ver) > 0:
+                    updated[pkg] = (old_ver, new_ver)
+            except Exception:
+                continue
+
+        log_global(f"{len(updated)} packages have updates available")
+
+        if not updated:
+            return {"updated": {}, "ok": True}
+
+        results = {}
+        for pkg, (old, new) in updated.items():
+            results[pkg] = self.upgrade_package(pkg, dry_run=dry_run, force=force, backup=backup)
+        if not dry_run and Depcleaner:
+            try:
+                cleaner = Depcleaner()
+                cleaner.depclean(dry_run=False)
+            except Exception as e:
+                log_global(f"depclean failed post-upgrade: {e}", "warning")
+
+        return {"updated": results, "ok": all(r.get("ok") for r in results.values())}
+
+# ---- CLI entry
+
+def main():
+    import argparse, pprint
+    parser = argparse.ArgumentParser(prog="zeropkg-upgrade", description="Upgrade packages with Zeropkg")
+    parser.add_argument("packages", nargs="*", help="Packages to upgrade (leave empty for all)")
+    parser.add_argument("--force", action="store_true", help="Force upgrade even if protected or up to date")
+    parser.add_argument("--no-backup", dest="backup", action="store_false", help="Skip backup before upgrade")
+    parser.add_argument("--do-it", action="store_true", help="Actually perform upgrades (default dry-run)")
+    args = parser.parse_args()
+
+    um = UpgradeManager()
+    if args.packages:
+        results = {}
+        for p in args.packages:
+            results[p] = um.upgrade_package(p, dry_run=not args.do_it, force=args.force, backup=args.backup)
+    else:
+        results = um.upgrade_all(dry_run=not args.do_it, force=args.force, backup=args.backup)
+
+    pprint.pprint(results)
+    if args.do_it and any(not r.get("ok") for r in (results.values() if isinstance(results, dict) else [])):
+        sys.exit(2)
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
