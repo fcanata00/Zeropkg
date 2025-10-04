@@ -84,6 +84,7 @@ zeropkg --lfs-bootstrap --root /mnt/lfs -> Constrói toolchain LFS
 zeropkg --lfs-bootstrap --root /mnt/lfs -b binutils-2.43.1-pass1
 zeropkg -b binutils --variant pass1 --root /mnt/lfs
 zeropkg --root /mnt/lfs --chroot -b binutils-2.43.1
+zeropkg lfs-bootstrap binutils-pass1 gcc-pass1 linux-headers glibc binutils gcc
 
 Todos os comandos aceitam --dry-run e abreviações (-b, -i, -r).
 
