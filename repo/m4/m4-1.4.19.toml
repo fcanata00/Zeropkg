@@ -1,45 +1,79 @@
 [package]
 name = "m4"
-version = "1.4.19"
-category = "lfs"
-description = "GNU M4 — macro processor usado em compilação de ferramentas temporárias"
+version = "1.4.20"
+description = "GNU M4 macro processor"
+category = "tools"
+license = "GPLv3"
 homepage = "https://www.gnu.org/software/m4/"
-license = "GPL-3.0-or-later"
-maintainer = "zeropkg"
+maintainer = "Zeropkg LFS Automation"
+stage = "toolchain"
+priority = "normal"
 
-[sources]
+[source]
 urls = [
-  "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz"
+  "https://ftp.gnu.org/gnu/m4/m4-1.4.20.tar.xz"
 ]
-checksum = "sha256:f702f273a7d85d837b8cd0e68e4f3e854cd40ce5960a93d98ad6c69b1aa584e8"
-extract_to = "m4-1.4.19"
+sha256 = [
+  "c0e9bfefb51f6ea61e7c1a221a3f9cd16e169e4cbfa3e0cb8dcf4dc7ab1cd7e9"
+]
+extract_to = "m4-1.4.20"
+
+[build]
+depends = []
+optional_depends = []
+use_chroot = true
+fakeroot = true
+workdir = "build"
 
 [environment]
 LFS = "/mnt/lfs"
 LFS_TGT = "x86_64-lfs-linux-gnu"
-PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
-DESTDIR = "@DESTDIR@"
+MAKEFLAGS = "-j$(nproc)"
+PATH = "/tools/bin:/usr/bin:/bin"
+CFLAGS = "-O2 -pipe"
+LC_ALL = "POSIX"
 
-[build]
-chroot = true
-fakeroot = false
-cleanup_sources = true
+[configure]
 commands = [
-  # configuração cross compilação
-  "./configure --prefix=/usr --host=$LFS_TGT --build=$(build-aux/config.guess)",
-  "make",
-  "make DESTDIR=${DESTDIR} install"
+  "./configure --prefix=/usr --host=$LFS_TGT --build=$(./build-aux/config.guess)"
 ]
 
+[compile]
+commands = ["make"]
+
+[install]
+commands = ["make DESTDIR=$LFS install"]
+
 [hooks]
-pre_build = "echo '==> Construindo M4 (temporário)'"
-post_install = "echo '==> M4 instalado no prefixo temporário'"
+pre_configure = ["echo '[HOOK] Preparando M4 1.4.20...'"]
+post_install = ["echo '[HOOK] M4 instalado em /usr no chroot'"]
 
-[dependencies]
-build = []
-runtime = []
+[patches]
+apply = []
+strip = 1
 
-[lfs]
-stage = "toolchain"
-bootstrap = true
-chroot_required = true
+[tests]
+enabled = false
+
+[package.files]
+bin = ["/usr/bin/m4"]
+doc = ["/usr/share/doc/m4-1.4.20"]
+
+[package.meta]
+provides = ["m4"]
+group = "tools"
+conflicts = []
+replaces = []
+
+[install]
+root = "/mnt/lfs"
+safe_chroot = true
+parallel_install = false
+keep_build = false
+overwrite_existing = true
+
+[notifications]
+notify = true
+urgency = "normal"
+summary = "M4 1.4.20 instalado"
+icon = "/usr/share/icons/m4.png"
