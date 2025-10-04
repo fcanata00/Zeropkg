@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zeropkg_db.py — Database manager for Zeropkg
-Pattern B: integrated, lean, functional.
+zeropkg_db.py — Database manager for Zeropkg (extended)
 
-Features:
-- DBManager context manager with automatic commit/rollback
-- Uses paths from zeropkg_config.load_config()
-- Thread-safe sqlite access (check_same_thread=False) with a module-level Lock
-- Tables: packages, files, dependencies, events, upgrade_history
-- High-level API: add_package, remove_package, list_installed, find_revdeps,
-  get_dependency_tree, get_orphaned_packages, get_outdated_packages,
-  validate_integrity, export_db, import_db
-- Lightweight logging via zeropkg_logger.log_event
+Augmented with:
+ - record_install(name_or_namever, manifest, version=None, deps=None, metadata=None)
+ - get_manifest(name_or_namever) -> returns categorized manifest dict
+ - convenience quick wrappers for record_install/get_manifest
+ - keeps existing API (add_package, remove_package, list_installed, etc.)
+
+The DB is SQLite (path defined via zeropkg_config or default /var/lib/zeropkg/installed.sqlite3)
 """
 
 from __future__ import annotations
@@ -22,6 +19,7 @@ import shutil
 import json
 import time
 import tempfile
+import re
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
@@ -110,6 +108,7 @@ class DBManager:
     Usage:
         with DBManager() as db:
             db.add_package(...)
+            db.record_install(...)
     """
     def __init__(self, db_path: Optional[str] = None):
         cfg = load_config() if db_path is None else None
@@ -179,7 +178,26 @@ class DBManager:
         cur = self._execute(sql, params)
         return cur.fetchall()
 
-    # High-level API
+    # -----------------------
+    # helpers for name/version parsing
+    # -----------------------
+    @staticmethod
+    def _split_name_version(name_or_namever: str) -> Tuple[str, Optional[str]]:
+        """
+        Try to split a string like 'pkg-1.2.3' into ('pkg','1.2.3').
+        Heuristic: last dash followed by digit starts version.
+        Returns (name, version_or_None)
+        """
+        if not name_or_namever:
+            return (name_or_namever, None)
+        m = re.match(r"^(?P<name>.+)-(?P<ver>\d[\w\.\+\-]*)$", name_or_namever)
+        if m:
+            return (m.group("name"), m.group("ver"))
+        return (name_or_namever, None)
+
+    # -----------------------
+    # High-level API (existing)
+    # -----------------------
     def add_package(self, name: str, version: str, files: List[str], deps: List[Dict[str, str]] = None, metadata: Dict[str, Any] = None):
         """
         Register a package and its files + dependencies.
@@ -424,7 +442,125 @@ class DBManager:
         shutil.copy2(str(src), self.db_path)
         _logger.info(f"Imported DB from {src}")
 
+    # ---------------------------
+    # New methods for installer integration
+    # ---------------------------
+    def _categorize_paths(self, paths: List[str]) -> Dict[str, List[str]]:
+        """
+        Simple heuristic to categorize a list of file paths into keys:
+        bin, sbin, lib, include, doc, man, conf, other
+        """
+        mapping = {
+            "bin": [],
+            "sbin": [],
+            "lib": [],
+            "include": [],
+            "doc": [],
+            "man": [],
+            "conf": [],
+            "other": []
+        }
+        for p in paths:
+            # normalize leading slash
+            rp = p if p.startswith("/") else "/" + p
+            parts = rp.split("/")
+            # heuristics (similar to installer)
+            if ("/usr/bin/" in rp) or (rp.startswith("/bin/")) or ("/bin/" in rp and len(parts) > 2 and parts[1] == "bin"):
+                mapping["bin"].append(rp)
+            elif ("/usr/sbin/" in rp) or (rp.startswith("/sbin/")):
+                mapping["sbin"].append(rp)
+            elif ("/lib/" in rp) or ("/lib64/" in rp) or ("/usr/lib/" in rp):
+                mapping["lib"].append(rp)
+            elif "/include/" in rp or rp.endswith(".h"):
+                mapping["include"].append(rp)
+            elif "/share/man/" in rp or re.search(r"/man[0-9]/", rp):
+                mapping["man"].append(rp)
+            elif "/share/doc/" in rp or "/doc/" in rp:
+                mapping["doc"].append(rp)
+            elif rp.startswith("/etc/") or "/etc/" in rp:
+                mapping["conf"].append(rp)
+            else:
+                mapping["other"].append(rp)
+        # dedupe and sort
+        for k in mapping:
+            mapping[k] = sorted(set(mapping[k]))
+        return mapping
+
+    def record_install(self, name_or_namever: str, manifest: Dict[str, List[str]],
+                       version: Optional[str] = None, deps: Optional[List[Dict[str, str]]] = None,
+                       metadata: Optional[Dict[str, Any]] = None) -> int:
+        """
+        High-level helper to register an installed package from a manifest dict.
+        name_or_namever can be 'pkg' or 'pkg-1.2.3'. If version provided, it overrides parsing.
+        manifest: dict with categories->list-of-paths (absolute or relative)
+        Returns package_id.
+        """
+        deps = deps or []
+        metadata = metadata or {}
+        # parse name/version
+        parsed_name, parsed_version = self._split_name_version(name_or_namever)
+        ver = version or parsed_version or "0"
+        name = parsed_name
+
+        # flatten files list
+        files: List[str] = []
+        for cat, lst in (manifest or {}).items():
+            for p in lst:
+                # ensure absolute-like path stored
+                if not p:
+                    continue
+                if not p.startswith("/"):
+                    files.append("/" + p.lstrip("/"))
+                else:
+                    files.append(p)
+
+        # include original manifest in metadata for future reference
+        metadata = dict(metadata)
+        metadata["manifest"] = manifest
+
+        # call existing add_package
+        pkg_id = self.add_package(name=name, version=ver, files=files, deps=deps, metadata=metadata)
+        _logger.info(f"record_install: registered {name}-{ver} with {len(files)} files (pkg_id={pkg_id})")
+        return pkg_id
+
+    def get_manifest(self, name_or_namever: str) -> Optional[Dict[str, List[str]]]:
+        """
+        Return the categorized manifest for a package (if stored).
+        Accepts 'pkg' or 'pkg-1.2.3'. If version not provided, returns latest installed version.
+        """
+        parsed_name, parsed_version = self._split_name_version(name_or_namever)
+        name = parsed_name
+        version = parsed_version
+
+        pkg = None
+        if version:
+            pkg = self.get_package(name, version)
+        else:
+            pkg = self.get_package(name)
+
+        if not pkg:
+            return None
+
+        pkg_id = pkg["id"]
+
+        # try to fetch manifest from metadata first
+        try:
+            meta = json.loads(pkg.get("metadata") or "{}")
+            if meta and isinstance(meta, dict) and "manifest" in meta:
+                # metadata manifest may already be categorized; return it
+                return meta["manifest"]
+        except Exception:
+            pass
+
+        # otherwise reconstruct from files table
+        rows = self._many("SELECT file_path FROM files WHERE package_id = ?", (pkg_id,))
+        files = [r["file_path"] for r in rows]
+        categorized = self._categorize_paths(files)
+        return categorized
+
+    # ---------------------------
     # convenience static helper
+    # ---------------------------
     @staticmethod
     def open(db_path: Optional[str] = None) -> "DBManager":
         return DBManager(db_path=db_path)
@@ -436,7 +572,6 @@ class DBManager:
 def connect(db_path: Optional[str] = None) -> DBManager:
     return DBManager.open(db_path)
 
-# Example convenience wrappers for external modules to call without context manager:
 def add_package_quick(name: str, version: str, files: List[str], deps: List[Dict[str, str]] = None, metadata: Dict[str, Any] = None, db_path: Optional[str] = None):
     with DBManager(db_path) as db:
         return db.add_package(name, version, files, deps, metadata)
@@ -449,6 +584,17 @@ def list_installed_quick(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     with DBManager(db_path) as db:
         return db.list_installed()
 
+def record_install_quick(name_or_namever: str, manifest: Dict[str, List[str]], version: Optional[str] = None,
+                         deps: Optional[List[Dict[str, str]]] = None, metadata: Optional[Dict[str, Any]] = None,
+                         db_path: Optional[str] = None):
+    with DBManager(db_path) as db:
+        return db.record_install(name_or_namever, manifest, version=version, deps=deps, metadata=metadata)
+
+def get_manifest_quick(name_or_namever: str, db_path: Optional[str] = None) -> Optional[Dict[str, List[str]]]:
+    with DBManager(db_path) as db:
+        return db.get_manifest(name_or_namever)
+
+
 # ---------------------------
 # Quick test
 # ---------------------------
@@ -458,9 +604,15 @@ if __name__ == "__main__":
     if os.path.exists(dbfile):
         os.unlink(dbfile)
     with DBManager(dbfile) as db:
-        pid = db.add_package("sample", "1.0", ["/usr/bin/true"], [{"dep_name": "libc", "dep_version_req": ">=2.35"}], {"manual": True})
+        sample_manifest = {
+            "bin": ["/usr/bin/true"],
+            "lib": ["/usr/lib/libsample.so"],
+            "doc": ["/usr/share/doc/sample"]
+        }
+        pid = db.record_install("sample-1.0", sample_manifest, deps=[{"dep_name":"libc","dep_version_req":">=2.35"}], metadata={"manual": True})
         print("Added package id:", pid)
         print("Installed:", db.list_installed())
         print("Files:", db.get_files_for_pkg("sample"))
         print("Revdeps for libc:", db.find_revdeps("libc"))
         print("Integrity:", db.validate_integrity())
+        print("Manifest reconstructed:", db.get_manifest("sample-1.0"))
