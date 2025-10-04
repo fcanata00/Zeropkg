@@ -1,0 +1,51 @@
+[package]
+name = "findutils"
+version = "4.10.0"
+category = "lfs"
+description = "GNU Findutils — utilitários find, xargs e locate (LFS capítulo 6.8)"
+homepage = "https://www.gnu.org/software/findutils/"
+license = "GPL-3.0-or-later"
+maintainer = "zeropkg"
+
+[sources]
+urls = [
+  "https://ftp.gnu.org/gnu/findutils/findutils-4.10.0.tar.xz",
+  "https://invisible-mirror.net/archives/findutils/findutils-4.10.0.tar.xz"
+]
+checksum = "sha256:<COLOQUE_SHA256_REAL_AQUI>"
+extract_to = "findutils-4.10.0"
+
+[environment]
+LFS = "/mnt/lfs"
+LFS_TGT = "x86_64-lfs-linux-gnu"
+PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
+DESTDIR = "@DESTDIR@"
+
+[build]
+chroot = true
+fakeroot = false
+cleanup_sources = true
+commands = [
+  "./configure \\",
+  "  --prefix=/usr \\",
+  "  --localstatedir=/var/lib/locate \\",
+  "  --host=$LFS_TGT \\",
+  "  --build=$(build-aux/config.guess)",
+  "make",
+  "make DESTDIR=${DESTDIR} install"
+]
+
+[hooks]
+pre_build = "echo '==> Construindo Findutils 4.10.0 (LFS)'"
+post_install = "echo '==> Findutils instalado no destino'"
+
+[dependencies]
+# depende de utilitários básicos (normalmente já construídos no Capítulo 6)
+build = []
+runtime = []
+optional = []
+
+[lfs]
+stage = "toolchain"
+bootstrap = true
+chroot_required = true
