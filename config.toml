@@ -1,36 +1,159 @@
+# ===========================================================
+# Zeropkg Configuration File
+# /etc/zeropkg/config.toml
+# ===========================================================
+# Configuração global do gerenciador de pacotes source-based
+# Escrito em Python 3, com suporte a LFS/BLFS, chroot e build-world.
+# ===========================================================
+
 [paths]
-db_path = "/var/lib/zeropkg/installed.sqlite3"
-ports_dir = "/usr/ports"
-build_root = "/var/zeropkg/build"
-cache_dir = "/usr/ports/distfiles"
-packages_dir = "/var/zeropkg/packages"
+# Diretórios principais
+state_dir   = "/var/lib/zeropkg"
+build_dir   = "/var/lib/zeropkg/build"
+backup_dir  = "/var/lib/zeropkg/backups"
+db_path     = "/var/lib/zeropkg/installed.sqlite3"
+log_dir     = "/var/lib/zeropkg/logs"
+repo_dir    = "/usr/ports"
+distfiles   = "/usr/ports/distfiles"
+hooks_dir   = "/etc/zeropkg/hooks.d"
 
-[options]
-jobs = 4
-fakeroot = true
-chroot_enabled = true
-auto_clean = true
-log_level = "INFO"
+# Chroot (usado pelo builder e installer)
+chroot_dir  = "/mnt/lfs"
 
-[repos]
-# Repositório principal oficial
-main = "https://github.com/fcanata00/Zeropkg-Ports.git"
-
-# Repositório experimental (opcional)
-testing = "https://github.com/fcanata00/Zeropkg-Testing.git"
-
-# Mirror local (opcional)
-local = "/mnt/repos/zeropkg-local"
+[install]
+fakeroot    = true
+safe_chroot = true
+parallel    = false
 
 [network]
-proxy = ""
-verify_ssl = true
-retries = 3
-timeout = 30
+# Gerenciamento de fontes e sincronização
+timeout     = 60
+retries     = 3
+proxy       = ""
+mirror_mode = true
 
-[lfs]
-# Caminho base para construir o Linux From Scratch
-root = "/mnt/lfs"
-chroot_shell = "/bin/bash"
-user = "lfs"
-group = "lfs"
+[build]
+use_chroot  = true
+max_jobs    = 4
+log_builds  = true
+preserve_logs = true
+extract_to  = "build"
+
+# Controle de hooks e patches
+apply_patches = true
+hooks_enabled = true
+
+[repos]
+# Repositórios ativos (sincronizados via zeropkg --sync)
+core   = "https://github.com/fcanata00/Zeropkg-core.git"
+extra  = "https://github.com/fcanata00/Zeropkg-extra.git"
+lfs    = "https://github.com/fcanata00/Zeropkg-lfs.git"
+blfs   = "https://github.com/fcanata00/Zeropkg-blfs.git"
+
+# Módulos adicionais (caso disponíveis)
+xorg   = "https://github.com/fcanata00/Zeropkg-xorg.git"
+kde    = "https://github.com/fcanata00/Zeropkg-kde.git"
+
+[world]
+# Grupo principal de pacotes para o comando zeropkg -B / --build-world
+base = [
+  "binutils",
+  "gcc",
+  "glibc",
+  "linux-headers",
+  "bash",
+  "coreutils",
+  "findutils",
+  "gawk",
+  "grep",
+  "sed",
+  "make",
+  "diffutils",
+  "file",
+  "gzip",
+  "tar",
+  "xz",
+  "bzip2",
+  "util-linux",
+  "shadow",
+  "ncurses"
+]
+
+# Grupos adicionais opcionais
+xorg = [
+  "xorg-server",
+  "mesa",
+  "xinit",
+  "libx11",
+  "libxext",
+  "libxrandr",
+  "xf86-video-intel"
+]
+
+kde = [
+  "qtbase",
+  "kwin",
+  "plasma-workspace",
+  "dolphin",
+  "konsole",
+  "okular"
+]
+
+blfs = [
+  "openssl",
+  "curl",
+  "zlib",
+  "python",
+  "git",
+  "vim",
+  "nano",
+  "sudo"
+]
+
+[logger]
+level = "INFO"
+log_to_file = true
+file_path = "/var/lib/zeropkg/logs/zeropkg.log"
+timestamp = true
+
+[update]
+# Controle de atualização e verificação de versões upstream
+check_interval_days = 1
+notify_on_critical  = true
+auto_download       = false
+metadata_file       = "/var/lib/zeropkg/update-metadata.json"
+
+[upgrade]
+auto_rebuild_deps = true
+backup_before_upgrade = true
+keep_old_versions = false
+
+[depclean]
+protect_essential = true
+backup_removed = true
+log_results = true
+
+[chroot]
+# Configuração detalhada de chroot
+mounts = [
+  "/dev",
+  "/proc",
+  "/sys"
+]
+copy_resolv = true
+bind_mounts = true
+secure_umount = true
+auto_cleanup = true
+
+[security]
+verify_hashes = true
+check_signatures = false
+sandbox_build = false
+isolation_level = "medium"
+
+[notifications]
+# Controle de notificações CLI e logs
+enable_notifications = true
+summary_updates = true
+summary_interval = 24
+notify_on_complete = true
