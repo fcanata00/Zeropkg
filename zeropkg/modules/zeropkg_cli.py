@@ -1,70 +1,74 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zeropkg CLI — interface de linha de comando principal.
-Mantém todos os comandos existentes e adiciona:
-- graph-deps
-- full-build
+Zeropkg CLI — interface principal para gerenciamento e construção do sistema
+Padrão B: Integrado, enxuto e funcional.
 """
 
-import os
 import sys
 import argparse
 from zeropkg_config import load_config
 from zeropkg_logger import log_event, get_logger
 
-logger = get_logger("cli")
+logger = get_logger("zeropkg-cli")
+
 
 # ============================================================
-# Comandos existentes
+# Execução de comandos principais
 # ============================================================
 
-def cmd_build(args):
+def cmd_build(cfg, args):
     from zeropkg_builder import Builder
-    b = Builder(config_path=args.config)
-    b.build(args.target, args=args, dry_run=args.dry_run, rebuild=args.rebuild)
+    builder = Builder(args.config)
+    log_event("CLI", f"Iniciando build de {args.target}")
+    builder.build(args.target, args=args, dry_run=args.dry_run, rebuild=args.rebuild)
+    log_event("CLI", f"Build finalizado para {args.target}")
 
-def cmd_install(args):
+def cmd_install(cfg, args):
     from zeropkg_installer import Installer
-    i = Installer(args.config)
+    installer = Installer(args.config)
     meta = {}
-    i.install(args.target, {"root": args.root, "dry_run": args.dry_run}, meta)
+    log_event("CLI", f"Instalando {args.target}")
+    installer.install(args.target, {"root": args.root, "dry_run": args.dry_run}, meta)
 
-def cmd_remove(args):
+def cmd_remove(cfg, args):
     from zeropkg_remover import Remover
-    r = Remover(args.config)
-    r.remove(args.target, force=args.force)
+    remover = Remover(args.config)
+    log_event("CLI", f"Removendo {args.target}")
+    remover.remove(args.target, force=args.force)
 
-def cmd_depclean(args):
+def cmd_depclean(cfg, args):
     from zeropkg_depclean import DepCleaner
     cleaner = DepCleaner(args.config)
+    log_event("CLI", "Executando depclean")
     cleaner.clean(dry_run=args.dry_run, force=args.force)
 
-def cmd_sync(args):
+def cmd_sync(cfg, args):
     from zeropkg_sync import sync_repos
+    log_event("CLI", "Sincronizando repositórios")
     sync_repos()
 
-def cmd_upgrade(args):
+def cmd_upgrade(cfg, args):
     from zeropkg_upgrade import UpgradeManager
     upgr = UpgradeManager(args.config)
+    log_event("CLI", f"Atualizando {args.target or 'todos os pacotes'}")
     upgr.upgrade(args.target, dry_run=args.dry_run, force=args.force)
 
-def cmd_update(args):
+def cmd_update(cfg, args):
     from zeropkg_update import Updater
     updater = Updater(args.config)
+    log_event("CLI", "Verificando novas versões upstream")
     updater.check_updates(report=True)
 
-def cmd_revdep(args):
+def cmd_revdep(cfg, args):
     from zeropkg_deps import DependencyResolver
-    cfg = load_config(args.config)
     resolver = DependencyResolver(cfg["paths"]["db_path"], cfg["paths"]["ports_dir"])
     print(f"Dependências reversas de {args.package}:")
     for pkg in resolver.reverse_deps(args.package):
         print("  -", pkg)
 
-def cmd_info(args):
-    import toml
-    cfg = load_config(args.config)
+def cmd_info(cfg, args):
+    import toml, os
     ports_dir = cfg["paths"]["ports_dir"]
     matches = list(os.popen(f"find {ports_dir} -type f -name '{args.package}-*.toml'").read().splitlines())
     if not matches:
@@ -80,23 +84,19 @@ def cmd_info(args):
         print()
 
 # ============================================================
-# NOVOS COMANDOS
+# Novos comandos integrados
 # ============================================================
 
-def cmd_graph_deps(args):
+def cmd_graph_deps(cfg, args):
     from zeropkg_deps import DependencyResolver
-    cfg = load_config(args.config)
     resolver = DependencyResolver(cfg["paths"]["db_path"], cfg["paths"]["ports_dir"])
-
     if args.all:
         graph = resolver.build_graph_all()
     else:
         graph = resolver.build_graph_for(args.package)
-
     print("\n=== GRAFO DE DEPENDÊNCIAS ===")
     for pkg, deps in graph.items():
         print(f"{pkg} -> {', '.join(deps) if deps else '(sem deps)'}")
-
     if args.export:
         with open(args.export, "w") as f:
             f.write("digraph deps {\n")
@@ -106,29 +106,25 @@ def cmd_graph_deps(args):
             f.write("}\n")
         print(f"Grafo exportado para {args.export}")
 
-def cmd_full_build(args):
+def cmd_full_build(cfg, args):
     from zeropkg_builder import Builder
     from zeropkg_installer import Installer
     from zeropkg_deps import DependencyResolver
 
-    cfg = load_config(args.config)
     builder = Builder(args.config)
     installer = Installer(args.config)
     resolver = DependencyResolver(cfg["paths"]["db_path"], cfg["paths"]["ports_dir"])
 
-    if args.all:
-        pkgs = resolver.all_packages()
-    else:
-        pkgs = resolver.resolve_tree(args.package)
-
+    pkgs = resolver.all_packages() if args.all else resolver.resolve_tree(args.package)
     print(f"Iniciando build completo de {len(pkgs)} pacotes...")
     for pkg in pkgs:
-        print(f"\n==> Construindo {pkg}")
         try:
+            log_event("CLI", f"Build iniciado para {pkg}")
             builder.build(pkg, args=args, dry_run=args.dry_run)
             installer.install(pkg, {"root": "/", "dry_run": args.dry_run}, {})
+            log_event("CLI", f"Build e instalação finalizados para {pkg}")
         except Exception as e:
-            print(f"[ERRO] Falha ao construir {pkg}: {e}")
+            log_event("CLI", f"Erro ao construir {pkg}: {e}")
             if not args.force:
                 sys.exit(1)
     print("\n✅ Build completo finalizado com sucesso!")
@@ -142,77 +138,69 @@ def main():
         prog="zeropkg",
         description="Zeropkg - Gerenciador Source-based e LFS Builder"
     )
-    parser.add_argument("--config", default="/etc/zeropkg/config.toml", help="Caminho para o arquivo de configuração")
-
+    parser.add_argument("--config", default="/etc/zeropkg/config.toml",
+                        help="Caminho para o arquivo de configuração")
     subparsers = parser.add_subparsers(dest="command")
 
-    # Comandos existentes
-    sp = subparsers.add_parser("build", help="Constrói um pacote")
-    sp.add_argument("target", help="Pacote ou caminho da receita TOML")
-    sp.add_argument("--dry-run", action="store_true")
-    sp.add_argument("--rebuild", action="store_true")
-    sp.set_defaults(func=cmd_build)
+    # --- Comandos principais ---
+    def add_cmd(name, help_text, func, args_def):
+        sp = subparsers.add_parser(name, help=help_text)
+        args_def(sp)
+        sp.set_defaults(func=func)
 
-    sp = subparsers.add_parser("install", help="Instala um pacote já construído")
-    sp.add_argument("target", help="Pacote ou arquivo .tar.xz")
-    sp.add_argument("--root", default="/")
-    sp.add_argument("--dry-run", action="store_true")
-    sp.set_defaults(func=cmd_install)
+    add_cmd("build", "Constrói um pacote", cmd_build,
+            lambda sp: [sp.add_argument("target"), sp.add_argument("--dry-run", action="store_true"),
+                        sp.add_argument("--rebuild", action="store_true")])
 
-    sp = subparsers.add_parser("remove", help="Remove um pacote")
-    sp.add_argument("target")
-    sp.add_argument("--force", action="store_true")
-    sp.set_defaults(func=cmd_remove)
+    add_cmd("install", "Instala um pacote", cmd_install,
+            lambda sp: [sp.add_argument("target"), sp.add_argument("--root", default="/"),
+                        sp.add_argument("--dry-run", action="store_true")])
 
-    sp = subparsers.add_parser("depclean", help="Remove dependências órfãs")
-    sp.add_argument("--dry-run", action="store_true")
-    sp.add_argument("--force", action="store_true")
-    sp.set_defaults(func=cmd_depclean)
+    add_cmd("remove", "Remove um pacote", cmd_remove,
+            lambda sp: [sp.add_argument("target"), sp.add_argument("--force", action="store_true")])
 
-    sp = subparsers.add_parser("sync", help="Sincroniza repositórios")
-    sp.set_defaults(func=cmd_sync)
+    add_cmd("depclean", "Remove dependências órfãs", cmd_depclean,
+            lambda sp: [sp.add_argument("--dry-run", action="store_true"),
+                        sp.add_argument("--force", action="store_true")])
 
-    sp = subparsers.add_parser("upgrade", help="Atualiza pacotes instalados")
-    sp.add_argument("target", nargs="?", default=None)
-    sp.add_argument("--dry-run", action="store_true")
-    sp.add_argument("--force", action="store_true")
-    sp.set_defaults(func=cmd_upgrade)
+    add_cmd("sync", "Sincroniza repositórios", cmd_sync, lambda sp: None)
 
-    sp = subparsers.add_parser("update", help="Verifica novas versões upstream")
-    sp.set_defaults(func=cmd_update)
+    add_cmd("upgrade", "Atualiza pacotes instalados", cmd_upgrade,
+            lambda sp: [sp.add_argument("target", nargs="?"),
+                        sp.add_argument("--dry-run", action="store_true"),
+                        sp.add_argument("--force", action="store_true")])
 
-    sp = subparsers.add_parser("revdep", help="Lista dependências reversas")
-    sp.add_argument("package")
-    sp.set_defaults(func=cmd_revdep)
+    add_cmd("update", "Verifica novas versões upstream", cmd_update, lambda sp: None)
 
-    sp = subparsers.add_parser("info", help="Mostra informações sobre um pacote")
-    sp.add_argument("package")
-    sp.set_defaults(func=cmd_info)
+    add_cmd("revdep", "Lista dependências reversas", cmd_revdep,
+            lambda sp: [sp.add_argument("package")])
 
-    # =======================================================
-    # Novos subcomandos adicionados
-    # =======================================================
+    add_cmd("info", "Mostra informações sobre um pacote", cmd_info,
+            lambda sp: [sp.add_argument("package")])
 
-    sp = subparsers.add_parser("graph-deps", help="Mostra o grafo de dependências")
-    sp.add_argument("package", nargs="?", help="Pacote alvo (opcional)")
-    sp.add_argument("--all", action="store_true", help="Mostrar todas as dependências do sistema")
-    sp.add_argument("--export", help="Exporta o grafo em formato DOT")
-    sp.set_defaults(func=cmd_graph_deps)
+    # --- Novos comandos ---
+    add_cmd("graph-deps", "Mostra o grafo de dependências", cmd_graph_deps,
+            lambda sp: [sp.add_argument("package", nargs="?"),
+                        sp.add_argument("--all", action="store_true"),
+                        sp.add_argument("--export")])
 
-    sp = subparsers.add_parser("full-build", help="Constrói e instala todos os pacotes com resolução de dependências")
-    sp.add_argument("package", nargs="?", help="Pacote inicial (ou use --all)")
-    sp.add_argument("--all", action="store_true", help="Construir todos os pacotes do repositório")
-    sp.add_argument("--force", action="store_true", help="Ignorar erros de build e continuar")
-    sp.add_argument("--dry-run", action="store_true", help="Simula sem executar os comandos")
-    sp.set_defaults(func=cmd_full_build)
+    add_cmd("full-build", "Constrói e instala todos os pacotes com resolução de dependências", cmd_full_build,
+            lambda sp: [sp.add_argument("package", nargs="?"),
+                        sp.add_argument("--all", action="store_true"),
+                        sp.add_argument("--force", action="store_true"),
+                        sp.add_argument("--dry-run", action="store_true")])
 
+    # --- Execução ---
     args = parser.parse_args()
-
     if not args.command:
         parser.print_help()
         sys.exit(1)
 
-    args.func(args)
+    cfg = load_config(args.config)
+    log_event("CLI", f"Executando comando {args.command}")
+    args.func(cfg, args)
+    sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
