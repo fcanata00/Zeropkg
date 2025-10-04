@@ -1,28 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zeropkg CLI — ponto único de entrada integrado para todos os módulos Zeropkg.
+zeropkg CLI final integrado
 
-Comandos principais:
-  install (-i, --install)       : instalar pacotes (resolve deps, build, install)
-  build (-b, --build)           : construir pacote(s) (não instala por padrão)
-  build-world (--build-world)   : construir lista world.base (do config)
-  build-toolchain (--toolchain) : construir toolchain LFS (gcc pass1, binutils, etc.)
-  remove (-r, --remove)         : remover pacote(s)
-  upgrade (--upgrade)           : atualizar pacotes instalados
-  update (--update)             : checar upstreams e gerar resumo de updates
-  sync (--sync)                 : sincronizar repositórios (ports)
-  depclean (--depclean)         : limpar dependências órfãs
-  revdep (--revdep)             : mostrar reverse-deps
-  search (--search)             : procurar receita por nome
-  info (--info)                 : mostrar info de recipe/instalado
-  patch (--patch)               : aplicar patches (chama patcher)
-  deps (--graph-deps)           : exportar/mostrar grafo de dependências
-  chroot (subcommands)          : preparar/cleanup/verify chroots
-  db (subcommands)              : DB inspections (list, manifest, export)
-  logger (subcommands)          : show sessions, cleanup logs
-  help
-Usa config via zeropkg_config.load_config()
+Subcomandos principais (resumo):
+  install, build, build-world, build-toolchain,
+  remove, clean, upgrade, update, sync,
+  deps, graph-deps, patch, chroot, db, logger, search, info, revdep
+
+Colore mensagens:
+  SUCESSO -> verde
+  AVISO   -> amarelo
+  ERRO    -> vermelho
 """
 
 from __future__ import annotations
@@ -31,18 +20,54 @@ import os
 import argparse
 import json
 import shutil
+import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional, List, Any, Set
 
-# --- Safe imports of Zeropkg modules (fall back to None or simple wrappers) ---
-def safe_import(name: str):
+# -------------------------
+# Terminal color helpers
+# -------------------------
+def _supports_color() -> bool:
+    return sys.stdout.isatty()
+
+CSI = "\x1b["
+def color(text: str, code: str) -> str:
+    if not _supports_color():
+        return text
+    return f"{CSI}{code}m{text}{CSI}0m"
+
+def green(s: str) -> str:
+    return color(s, "32")
+
+def yellow(s: str) -> str:
+    return color(s, "33")
+
+def red(s: str) -> str:
+    return color(s, "31")
+
+def bold(s: str) -> str:
+    return color(s, "1")
+
+def info(msg: str):
+    print(green("✔") + " " + msg)
+
+def warn(msg: str):
+    print(yellow("!")+ " " + msg)
+
+def error(msg: str):
+    print(red("✖") + " " + msg, file=sys.stderr)
+
+# -------------------------
+# Safe import wrapper
+# -------------------------
+def safe_import(module_name: str):
     try:
-        mod = __import__(name, fromlist=["*"])
+        mod = __import__(module_name, fromlist=["*"])
         return mod
     except Exception:
         return None
 
-# core modules
+# Core modules (may be None if not installed)
 cfg_mod = safe_import("zeropkg_config")
 logger_mod = safe_import("zeropkg_logger")
 db_mod = safe_import("zeropkg_db")
@@ -59,42 +84,29 @@ sync_mod = safe_import("zeropkg_sync")
 chroot_mod = safe_import("zeropkg_chroot")
 vuln_mod = safe_import("zeropkg_vuln")
 
-# helpers
-def print_err(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
-
-# config bootstrap
-if cfg_mod and hasattr(cfg_mod, "load_config"):
-    CONFIG = cfg_mod.load_config()
-else:
-    CONFIG = {"paths": {"cache_dir": "/var/cache/zeropkg", "log_dir": "/var/log/zeropkg"}, "cli": {"default_jobs": 4}}
-
-# logger bootstrap
+# Logger fallback
 if logger_mod and hasattr(logger_mod, "get_logger"):
     log = logger_mod.get_logger("cli")
-    log_event = getattr(logger_mod, "log_event", lambda pkg, stage, msg, level="info", extra=None: None)
+    try:
+        log_event = logger_mod.log_event
+    except Exception:
+        def log_event(pkg, stage, msg, level="info", extra=None):
+            pass
 else:
-    import logging
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger("zeropkg.cli")
     def log_event(pkg, stage, msg, level="info", extra=None):
-        logging.getLogger("zeropkg.cli").info(f"{pkg}:{stage} - {msg}")
-
-# db convenience
-DB = None
-if db_mod and hasattr(db_mod, "ZeroPKGDB"):
-    try:
-        # use default db instance helper if provided
-        if hasattr(db_mod, "_get_default_db"):
-            DB = db_mod._get_default_db()
+        if level == "error":
+            log.error(f"{pkg}:{stage} - {msg}")
+        elif level == "warning":
+            log.warning(f"{pkg}:{stage} - {msg}")
         else:
-            DB = db_mod.ZeroPKGDB()
-    except Exception:
-        DB = None
+            log.info(f"{pkg}:{stage} - {msg}")
 
-# find modules convenience wrappers
+# Convenience wrappers/instances (if available)
 DEPS = deps_mod.DepsManager() if deps_mod and hasattr(deps_mod, "DepsManager") else None
 BUILDER = builder_mod.ZeropkgBuilder() if builder_mod and hasattr(builder_mod, "ZeropkgBuilder") else None
+DB = db_mod._get_default_db() if db_mod and hasattr(db_mod, "_get_default_db") else (db_mod.ZeroPKGDB() if db_mod and hasattr(db_mod, "ZeroPKGDB") else None)
 INSTALLER = installer_mod if installer_mod else None
 DOWNLOADER = downloader_mod.Downloader() if downloader_mod and hasattr(downloader_mod, "Downloader") else None
 PATCHER = patcher_mod.ZeropkgPatcher() if patcher_mod and hasattr(patcher_mod, "ZeropkgPatcher") else None
@@ -104,577 +116,646 @@ UPGRADE = upgrade_mod if upgrade_mod else None
 UPDATE = update_mod if update_mod else None
 SYNC = sync_mod if sync_mod else None
 CHROOT = chroot_mod if chroot_mod else None
-VULN = vuln_mod if vuln_mod else None
+VULN = vuln_mod.ZeroPKGVulnManager() if vuln_mod and hasattr(vuln_mod, "ZeroPKGVulnManager") else None
 
-# Utility: ensure path for recipe/ports
-def find_recipe_by_name(name: str) -> Optional[str]:
-    """Try to locate recipe by scanning DEPS index or /usr/ports structure."""
-    # check DEPS index first
-    if DEPS and hasattr(DEPS, "_recipes_index"):
-        rp = DEPS._recipes_index.get(name)
-        if rp:
-            return rp
-    # try common locations from config
-    ports_roots = []
+# Load configuration (best-effort)
+def load_config_safe():
     try:
-        ports_roots = CONFIG.get("repos", {}).get("roots", []) or [CONFIG.get("paths", {}).get("ports_dir", "/usr/ports")]
+        if cfg_mod and hasattr(cfg_mod, "load_config"):
+            return cfg_mod.load_config()
     except Exception:
-        ports_roots = ["/usr/ports"]
-    for root in ports_roots:
+        pass
+    return {"paths": {"ports_dir": "/usr/ports", "cache_dir": "/var/cache/zeropkg", "log_dir": "/var/log/zeropkg"}, "cli": {"default_jobs": 4}}
+
+CONFIG = load_config_safe()
+
+# -------------------------
+# Utility helpers
+# -------------------------
+def find_recipe_by_name(name: str) -> Optional[str]:
+    # Try DEPS index first
+    try:
+        if DEPS and hasattr(DEPS, "_recipes_index"):
+            rp = DEPS._recipes_index.get(name)
+            if rp:
+                return rp
+    except Exception:
+        pass
+    # Fallback: naive search in configured ports roots
+    roots = CONFIG.get("repos", {}).get("roots", []) or [CONFIG.get("paths", {}).get("ports_dir", "/usr/ports")]
+    for root in roots:
         p = Path(root)
         if not p.exists():
             continue
-        # naive search: name matches a filename prefix
         for rf in p.rglob("*.toml"):
             if rf.stem.startswith(name):
                 return str(rf)
     return None
 
-# --- Core command implementations ---
+def print_json(obj: Any):
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+
+# -------------------------
+# Command implementations
+# -------------------------
 def cmd_sync(args):
     if not SYNC:
-        print_err("sync module not available")
+        error("sync module not available")
         return 2
     try:
-        # expect sync_mod.sync_repos() existence
+        # Try common function names
         if hasattr(SYNC, "sync_repos"):
-            SYNC.sync_repos()
+            res = SYNC.sync_repos(dry_run=args.dry_run)
         elif hasattr(SYNC, "sync"):
-            SYNC.sync()
+            res = SYNC.sync(dry_run=args.dry_run)
         else:
-            # maybe module exposes function
+            # module might export top-level function
             try:
-                sync_mod.sync_repos()
+                sync_mod.sync_repos(dry_run=args.dry_run)
+                res = {"ok": True}
             except Exception as e:
-                print_err("sync function not found:", e)
-                return 2
-        print("Sync completed")
+                return _fail("sync: function not found: " + str(e))
+        info("sync finished")
         return 0
     except Exception as e:
-        print_err("sync failed:", e)
-        return 1
+        return _fail(f"sync failed: {e}")
 
-def cmd_search(name: str, args):
-    # search recipes and installed packages
+def cmd_search(args):
+    term = args.term
     found = {"recipes": [], "installed": []}
-    # recipes via deps index
     if DEPS and hasattr(DEPS, "_recipes_index"):
         for pkg, path in DEPS._recipes_index.items():
-            if name in pkg:
+            if term in pkg:
                 found["recipes"].append({"name": pkg, "path": path})
-    # fallback scan
-    if not found["recipes"]:
-        # quick scan in configured ports
-        ports_dirs = CONFIG.get("repos", {}).get("roots", [CONFIG.get("paths", {}).get("ports_dir", "/usr/ports")])
-        for root in ports_dirs:
-            rootp = Path(root)
-            if not rootp.exists():
+    else:
+        # quick scan
+        roots = CONFIG.get("repos", {}).get("roots", [CONFIG.get("paths", {}).get("ports_dir", "/usr/ports")])
+        for root in roots:
+            p = Path(root)
+            if not p.exists():
                 continue
-            for rf in rootp.rglob("*.toml"):
-                if name in rf.stem:
+            for rf in p.rglob("*.toml"):
+                if term in rf.stem:
                     found["recipes"].append({"name": rf.stem, "path": str(rf)})
     # installed
     try:
-        if DB:
-            for r in db_mod.list_installed_quick():
-                if name in r["name"]:
+        if DB and hasattr(DB, "list_installed_quick"):
+            for r in DB.list_installed_quick():
+                if term in r["name"]:
                     found["installed"].append(r)
     except Exception:
         pass
-    print(json.dumps(found, indent=2, ensure_ascii=False))
+    print_json(found)
     return 0
 
-def cmd_info(target: str, args):
-    # show recipe info or installed package info
-    # first check installed
-    if DB:
-        m = db_mod.get_package_manifest(target)
-        if m:
-            print(json.dumps(m, indent=2))
-            return 0
-    # try recipe
+def cmd_info(args):
+    target = args.target
+    # installed?
+    try:
+        if DB:
+            m = DB.get_package_manifest(target)
+            if m:
+                print_json(m)
+                return 0
+    except Exception:
+        pass
+    # recipe?
     rp = find_recipe_by_name(target)
     if rp:
         try:
-            # load via toml module if available
             toml_mod = safe_import("zeropkg_toml")
             if toml_mod and hasattr(toml_mod, "load_recipe"):
                 rec = toml_mod.load_recipe(rp)
-                print(json.dumps(rec, indent=2))
+                print_json(rec)
                 return 0
             else:
                 print("Found recipe at:", rp)
                 return 0
         except Exception as e:
-            print_err("failed to load recipe:", e)
-            return 2
-    print_err("no info found for", target)
-    return 1
+            return _fail("failed to load recipe: " + str(e))
+    return _fail("no info found for " + target)
 
 def cmd_revdep(args):
-    pkg = args if isinstance(args, str) else (args.pkg if hasattr(args, "pkg") else None)
-    if not pkg:
-        print_err("revdep needs a package name")
-        return 2
+    pkg = args.pkg
     if DEPS:
         res = DEPS.find_revdeps(pkg)
-        print(json.dumps(res, indent=2))
+        print_json(res)
         return 0
     if DB:
         try:
-            print(json.dumps(db_mod.find_revdeps(pkg), indent=2))
+            print_json(db_mod.find_revdeps(pkg))
             return 0
         except Exception:
             pass
-    print_err("revdep information not available (no deps/db)")
-    return 2
+    return _fail("revdep info not available")
 
 def cmd_graph_deps(args):
-    # export graph to dot/json or print plan
-    out = args.out or None
     if not DEPS:
-        print_err("deps module not available")
-        return 2
+        return _fail("deps module not available")
     if args.packages:
         plan = DEPS.build_plan(args.packages)
-        print(json.dumps(plan, indent=2))
+        print_json(plan)
+        return 0
+    out = args.out
+    if args.format == "dot" or (out and str(out).endswith(".dot")):
+        dest = out or "zeropkg_deps.dot"
+        DEPS.export_dot(dest)
+        info(f"Wrote {dest}")
     else:
-        if args.format == "dot" or out and out.endswith(".dot"):
-            dest = out or "zeropkg_deps.dot"
-            DEPS.export_dot(dest)
-            print("Wrote", dest)
-        else:
-            dest = out or "zeropkg_deps.json"
-            DEPS.export_json(dest)
-            print("Wrote", dest)
+        dest = out or "zeropkg_deps.json"
+        DEPS.export_json(dest)
+        info(f"Wrote {dest}")
     return 0
 
 def cmd_depclean(args):
     if not DEPCLEAN:
-        print_err("depclean module not available")
-        return 2
+        return _fail("depclean module not available")
     only = set(args.only) if args.only else None
     exclude = set(args.exclude) if args.exclude else None
     keep = set(args.keep) if args.keep else None
     protected = set(args.protected) if args.protected else None
     apply_flag = bool(args.apply)
-    dry_run = not apply_flag
-    res = DEPCLEAN.execute(only=only, exclude=exclude, keep=keep, apply=apply_flag, dry_run=dry_run,
-                           backup_before_remove=args.backup, parallel=args.parallel,
-                           protected_extra=protected, report_tag=args.tag)
-    print(json.dumps(res, indent=2, ensure_ascii=False))
-    return 0
-
-def cmd_build(args):
-    # Build packages (resolve deps then build). -i/--install handled elsewhere.
-    pkgs = args.packages or []
-    if not pkgs:
-        print_err("no packages specified to build")
-        return 2
-    # resolve via DEPS if available to get order
-    if DEPS:
-        plan = DEPS.resolve(pkgs)
-        if not plan["ok"]:
-            print_err("dependency resolution failed or cycles found:", plan.get("cycles"))
-            # continue if keep_going
-        build_sequence = list(reversed(plan["order"])) if plan.get("order") else pkgs
+    res = DEPCLEAN.execute(only=only, exclude=exclude, keep=keep, apply=apply_flag, dry_run=not apply_flag,
+                           backup_before_remove=args.backup, parallel=args.parallel, protected_extra=protected, report_tag=args.tag)
+    print_json(res)
+    if res.get("apply"):
+        info("depclean applied")
     else:
-        build_sequence = pkgs
-    results = []
-    for pkg in build_sequence:
-        try:
-            # find recipe path
-            rp = find_recipe_by_name(pkg)
-            if not rp:
-                print_err("recipe not found for", pkg)
-                results.append({"pkg": pkg, "status": "missing_recipe"})
-                continue
-            if not BUILDER:
-                results.append({"pkg": pkg, "status": "no_builder"})
-                continue
-            out = BUILDER.build(rp, dry_run=args.dry_run, dir_install=args.dir_install, jobs=args.jobs)
-            results.append({"pkg": pkg, "result": out})
-        except Exception as e:
-            results.append({"pkg": pkg, "error": str(e)})
-            if not args.keep_going:
-                break
-    print(json.dumps(results, indent=2, ensure_ascii=False))
-    return 0
-
-def cmd_install(args):
-    # install resolves deps, builds and installs into / or LFS root
-    pkgs = args.packages or []
-    if not pkgs:
-        print_err("no packages specified to install")
-        return 2
-    # resolve deps
-    if DEPS:
-        plan = DEPS.resolve(pkgs)
-        if not plan["ok"]:
-            print_err("dependency resolution failed or cycles found:", plan.get("cycles"))
-            if not args.keep_going:
-                return 3
-        build_sequence = list(reversed(plan["order'])) if plan.get("order") else pkgs
-    else:
-        build_sequence = pkgs
-    final_results = []
-    for pkg in build_sequence:
-        rp = find_recipe_by_name(pkg)
-        if not rp:
-            final_results.append({"pkg": pkg, "error": "recipe_not_found"})
-            if not args.keep_going:
-                break
-            else:
-                continue
-        # build
-        if not BUILDER:
-            final_results.append({"pkg": pkg, "error": "builder_not_available"})
-            continue
-        out = BUILDER.build(rp, dry_run=args.dry_run, dir_install=args.dir_install, jobs=args.jobs)
-        if args.dry_run:
-            final_results.append({"pkg": pkg, "build": "planned", "builder_out": out})
-            continue
-        # install using installer module (supports fakeroot)
-        try:
-            if installer_mod and hasattr(installer_mod, "install_pkg"):
-                inst_res = installer_mod.install_pkg(rp, root=args.root, fakeroot=args.fakeroot, dir_install=args.dir_install)
-            elif INSTALLER and hasattr(INSTALLER, "install"):
-                inst_res = INSTALLER.install(pkg, rp, root=args.root, fakeroot=args.fakeroot, dir_install=args.dir_install)
-            else:
-                # fallback: ask builder to dir-install into a temp and then copy into root (not ideal)
-                inst_res = {"status": "no_installer_available"}
-            final_results.append({"pkg": pkg, "install": inst_res})
-            # record in DB if builder returned manifest
-            try:
-                if DB and hasattr(db_mod, "record_install_quick"):
-                    manifest = out.get("manifest") if isinstance(out, dict) else None
-                    db_mod.record_install_quick(pkg, manifest or {"files": []}, deps=out.get("deps") if isinstance(out, dict) else [])
-            except Exception:
-                pass
-        except Exception as e:
-            final_results.append({"pkg": pkg, "error": str(e)})
-            if not args.keep_going:
-                break
-    print(json.dumps(final_results, indent=2, ensure_ascii=False))
+        info("depclean preview (dry-run)")
     return 0
 
 def cmd_remove(args):
-    pkgs = args.packages or []
+    pkgs = args.packages
     if not pkgs:
-        print_err("no packages specified to remove")
-        return 2
+        return _fail("no packages specified to remove")
     results = []
     for pkg in pkgs:
         try:
             if REMOVER:
-                res = REMOVER.remove(pkg, dry_run=args.dry_run)
+                res = REMOVER.remove(pkg, dry_run=args.dry_run, force=args.force, with_dependents=args.with_dependents, no_backup=args.no_backup)
                 results.append({"pkg": pkg, "result": res})
             else:
                 # fallback to DB-only removal
                 ok = False
                 if DB:
-                    ok = db_mod.remove_package_quick(pkg)
+                    ok = DB.remove_package_quick(pkg)
                 results.append({"pkg": pkg, "db_remove": ok})
         except Exception as e:
             results.append({"pkg": pkg, "error": str(e)})
-    print(json.dumps(results, indent=2))
+            if not args.keep_going:
+                break
+    print_json(results)
+    return 0
+
+def cmd_build(args):
+    pkgs = args.packages
+    if not pkgs:
+        return _fail("no packages specified")
+    # resolve
+    if DEPS:
+        plan = DEPS.resolve(pkgs)
+        if not plan["ok"]:
+            warn("dependency resolution had issues (cycles may exist)")
+            # continue only if keep_going
+            if not args.keep_going:
+                return _fail("dependency resolution failed; use --keep-going to force")
+        build_sequence = list(reversed(plan["order"])) if plan.get("order") else pkgs
+    else:
+        build_sequence = pkgs
+    results = []
+    for pkg in build_sequence:
+        rp = find_recipe_by_name(pkg)
+        if not rp:
+            results.append({"pkg": pkg, "error": "recipe_not_found"})
+            if not args.keep_going:
+                break
+            else:
+                continue
+        if not BUILDER:
+            results.append({"pkg": pkg, "error": "builder_not_available"})
+            continue
+        try:
+            out = BUILDER.build(rp, dry_run=args.dry_run, dir_install=args.dir_install, jobs=args.jobs)
+            results.append({"pkg": pkg, "result": out})
+            info(f"build finished for {pkg}")
+        except Exception as e:
+            results.append({"pkg": pkg, "error": str(e)})
+            error(f"build failed for {pkg}: {e}")
+            if not args.keep_going:
+                break
+    print_json(results)
+    return 0
+
+def cmd_install(args):
+    pkgs = args.packages
+    if not pkgs:
+        return _fail("no packages specified to install")
+    # resolve
+    if DEPS:
+        plan = DEPS.resolve(pkgs)
+        if not plan["ok"]:
+            warn("dependency resolution had issues (cycles may exist)")
+            if not args.keep_going:
+                return _fail("dependency resolution failed; use --keep-going to force")
+        build_sequence = list(reversed(plan["order"])) if plan.get("order") else pkgs
+    else:
+        build_sequence = pkgs
+    results = []
+    for pkg in build_sequence:
+        rp = find_recipe_by_name(pkg)
+        if not rp:
+            results.append({"pkg": pkg, "error": "recipe_not_found"})
+            if not args.keep_going:
+                break
+            else:
+                continue
+        if not BUILDER:
+            results.append({"pkg": pkg, "error": "builder_not_available"})
+            continue
+        try:
+            out = BUILDER.build(rp, dry_run=args.dry_run, dir_install=args.dir_install, jobs=args.jobs)
+            if args.dry_run:
+                results.append({"pkg": pkg, "build": "planned", "builder_out": out})
+                info(f"[dry-run] planned build for {pkg}")
+                continue
+            # install via installer module
+            if INSTALLER and hasattr(INSTALLER, "install"):
+                inst_res = INSTALLER.install(pkg, rp, root=args.root, fakeroot=args.fakeroot, dir_install=args.dir_install)
+            elif installer_mod and hasattr(installer_mod, "install_pkg"):
+                inst_res = installer_mod.install_pkg(rp, root=args.root, fakeroot=args.fakeroot, dir_install=args.dir_install)
+            else:
+                inst_res = {"status": "no_installer_available"}
+            results.append({"pkg": pkg, "install": inst_res})
+            info(f"installed {pkg}")
+            # record to DB if manifest present
+            try:
+                manifest = out.get("manifest") if isinstance(out, dict) else None
+                if DB and manifest:
+                    DB.record_install_quick(pkg, manifest, deps=out.get("deps", []), metadata={"installed_by": "zeropkg_cli"})
+            except Exception:
+                pass
+        except Exception as e:
+            results.append({"pkg": pkg, "error": str(e)})
+            error(f"install failed for {pkg}: {e}")
+            if not args.keep_going:
+                break
+    print_json(results)
     return 0
 
 def cmd_upgrade(args):
-    # upgrade specific packages or system-wide
-    pkgs = args.packages or []
-    if UPGRADE and hasattr(UPGRADE, "upgrade"):
-        try:
-            res = UPGRADE.upgrade(pkgs, dry_run=args.dry_run)
-            print(json.dumps(res, indent=2))
-            return 0
-        except Exception as e:
-            print_err("upgrade failed:", e)
-            return 1
-    else:
-        print_err("upgrade module not available")
-        return 2
+    if not UPGRADE or not hasattr(UPGRADE, "upgrade"):
+        return _fail("upgrade module not available")
+    try:
+        res = UPGRADE.upgrade(args.packages or [], dry_run=args.dry_run)
+        print_json(res)
+        info("upgrade completed (dry-run)" if args.dry_run else "upgrade completed")
+        return 0
+    except Exception as e:
+        return _fail(f"upgrade failed: {e}")
 
 def cmd_update(args):
-    # check upstreams and produce notification summary
-    if UPDATE and hasattr(UPDATE, "scan_all"):
-        try:
-            res = UPDATE.scan_all(dry_run=args.dry_run)
-            print(json.dumps(res, indent=2))
-            return 0
-        except Exception as e:
-            print_err("update scan failed:", e)
-            return 1
-    else:
-        print_err("update module not available")
-        return 2
-
-def cmd_sync_repos(args):
-    # wrapper to sync module
-    return cmd_sync(args)
+    if not UPDATE or not hasattr(UPDATE, "scan_all"):
+        return _fail("update module not available")
+    try:
+        res = UPDATE.scan_all(dry_run=args.dry_run)
+        print_json(res)
+        info("update scan completed")
+        return 0
+    except Exception as e:
+        return _fail(f"update scan failed: {e}")
 
 def cmd_patch(args):
     if not PATCHER:
-        print_err("patcher module not available")
-        return 2
-    out = PATCHER.apply_all(args.recipe, target_dir=args.target, dry_run=args.dry_run, use_chroot=not args.no_chroot, fakeroot=args.fakeroot, parallel=args.parallel)
-    print(json.dumps(out, indent=2, ensure_ascii=False))
-    return 0
+        return _fail("patcher module not available")
+    try:
+        out = PATCHER.apply_all(args.recipe, target_dir=args.target, dry_run=args.dry_run, use_chroot=not args.no_chroot, fakeroot=args.fakeroot, parallel=args.parallel)
+        print_json(out)
+        if out.get("ok"):
+            info("patches applied")
+        else:
+            warn("patches applied with issues" if out.get("results") else "no patches applied")
+        return 0
+    except Exception as e:
+        return _fail(f"patch failed: {e}")
 
 def cmd_chroot(args):
     if not CHROOT:
-        print_err("chroot module not available")
-        return 2
+        return _fail("chroot module not available")
     sub = args.subcmd
-    if sub == "prepare":
-        CHROOT.prepare_chroot(args.root, profile=args.profile, mount_proc=True)
-        print("chroot prepared:", args.root)
-    elif sub == "cleanup":
-        CHROOT.cleanup_chroot(args.root, force=args.force)
-        print("chroot cleaned:", args.root)
-    elif sub == "verify":
-        ok = CHROOT.verify_chroot(args.root)
-        print("chroot ok:", ok)
-    else:
-        print_err("Unknown chroot subcommand")
-        return 2
-    return 0
+    try:
+        if sub == "prepare":
+            CHROOT.prepare_chroot(args.root, profile=args.profile, mount_proc=args.mount_proc)
+            info(f"chroot prepared: {args.root}")
+        elif sub == "cleanup":
+            CHROOT.cleanup_chroot(args.root, force=args.force)
+            info(f"chroot cleaned: {args.root}")
+        elif sub == "verify":
+            ok = CHROOT.verify_chroot(args.root)
+            info(f"chroot verify: {ok}")
+        else:
+            return _fail("unknown chroot subcommand")
+        return 0
+    except Exception as e:
+        return _fail(f"chroot op failed: {e}")
 
 def cmd_deps(args):
-    # expose DepsManager quick actions
     if not DEPS:
-        print_err("deps manager not available")
-        return 2
+        return _fail("deps module not available")
     if args.action == "scan":
         DEPS.scan_recipes(force=args.force)
-        print("scanned")
+        info("deps scanned")
     elif args.action == "resolve":
         res = DEPS.resolve(args.packages)
-        print(json.dumps(res, indent=2))
+        print_json(res)
     elif args.action == "graph":
         if args.out:
             if args.out.endswith(".dot"):
                 DEPS.export_dot(args.out)
             else:
                 DEPS.export_json(args.out)
-            print("written", args.out)
+            info(f"graph written to {args.out}")
         else:
             print(DEPS.graph.to_dot())
-    else:
-        print_err("unknown deps action")
-        return 2
     return 0
 
 def cmd_db(args):
     if not DB:
-        print_err("DB module not available")
-        return 2
+        return _fail("DB module not available")
     if args.action == "list":
-        print(json.dumps(db_mod.list_installed_quick(), indent=2))
+        print_json(DB.list_installed_quick())
     elif args.action == "manifest":
-        print(json.dumps(db_mod.get_package_manifest(args.pkg), indent=2))
+        print_json(DB.get_package_manifest(args.pkg))
     elif args.action == "export":
-        p = Path(args.dest or "/tmp/zeropkg-db-export")
         try:
-            path = db_mod.export_db(p, compress=not args.no_compress)
-            print("exported to", path)
+            path = DB.export_db(Path(args.dest or "/tmp/zeropkg-db-export"), compress=not args.no_compress)
+            info(f"DB exported to {path}")
         except Exception as e:
-            print_err("export failed:", e)
-            return 1
-    else:
-        print_err("unknown db action")
-        return 2
+            return _fail(f"db export failed: {e}")
     return 0
 
 def cmd_logger(args):
     if not logger_mod:
-        print_err("logger module not available")
-        return 2
-    if args.action == "list":
-        for s in logger_mod.LOG_DIR.iterdir():
-            if s.is_dir():
-                print(s.name)
-    elif args.action == "cleanup":
-        logger_mod.cleanup_old_logs(args.max_age)
-        print("cleanup triggered")
-    elif args.action == "upload":
-        ok = logger_mod.upload_logs_now()
-        print("upload:", ok)
-    else:
-        print_err("unknown logger action")
-        return 2
+        return _fail("logger module not available")
+    try:
+        if args.action == "list":
+            if hasattr(logger_mod, "list_sessions"):
+                print_json(logger_mod.list_sessions())
+            else:
+                info("logger module has no list_sessions")
+        elif args.action == "cleanup":
+            if hasattr(logger_mod, "cleanup_old_logs"):
+                logger_mod.cleanup_old_logs(args.max_age)
+                info("logger cleanup triggered")
+            else:
+                warn("logger.cleanup not available")
+        elif args.action == "upload":
+            if hasattr(logger_mod, "upload_logs_now"):
+                ok = logger_mod.upload_logs_now()
+                info("upload result: " + str(ok))
+            else:
+                warn("upload function not available")
+    except Exception as e:
+        return _fail(f"logger command failed: {e}")
     return 0
 
-# --- Argparse setup ---
+# -------------------------
+# Helpers & failures
+# -------------------------
+def _fail(msg: str, code: int = 2):
+    error(msg)
+    log_event("cli", "error", msg, level="error")
+    return code
+
+# -------------------------
+# Argparse configuration
+# -------------------------
 def build_parser():
-    parser = argparse.ArgumentParser(prog="zeropkg", description="Zeropkg package manager CLI")
-    parser.add_argument("--config", help="Override config file location")
-    parser.add_argument("--dry-run", action="store_true", help="Global dry-run")
+    parser = argparse.ArgumentParser(prog="zeropkg", description="Zeropkg package manager CLI (integrated)")
+    parser.add_argument("--config", help="Path to alternative config TOML")
+    parser.add_argument("--dry-run", action="store_true", help="Global dry-run toggle")
     parser.add_argument("--jobs", "-j", type=int, default=CONFIG.get("cli", {}).get("default_jobs", 4), help="Parallel jobs")
+
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     # install
-    p_install = sub.add_parser("install", aliases=["-i","-I"], help="Resolve deps, build and install packages")
-    p_install.add_argument("packages", nargs="+")
-    p_install.add_argument("--root", default="/", help="Install root (use /mnt/lfs for LFS)")
-    p_install.add_argument("--dir-install", action="store_true", help="Use dir-install (install to staging dir first)")
-    p_install.add_argument("--fakeroot", action="store_true", help="Use fakeroot for installation")
-    p_install.add_argument("--keep-going", action="store_true", help="Continue on failure")
-    p_install.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("install", aliases=["-i"], help="Resolve deps, build and install packages")
+    p.add_argument("packages", nargs="+")
+    p.add_argument("--root", default="/", help="Install root (use /mnt/lfs for LFS)")
+    p.add_argument("--dir-install", action="store_true")
+    p.add_argument("--fakeroot", action="store_true")
+    p.add_argument("--keep-going", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
 
     # build
-    p_build = sub.add_parser("build", aliases=["-b"], help="Build packages only")
-    p_build.add_argument("packages", nargs="+")
-    p_build.add_argument("--dir-install", action="store_true", help="Produce dir-install")
-    p_build.add_argument("--jobs", "-j", type=int, default=CONFIG.get("cli", {}).get("default_jobs", 4))
-    p_build.add_argument("--dry-run", action="store_true")
-    p_build.add_argument("--keep-going", action="store_true")
+    p = sub.add_parser("build", aliases=["-b"], help="Build packages only")
+    p.add_argument("packages", nargs="+")
+    p.add_argument("--dir-install", action="store_true")
+    p.add_argument("--jobs", "-j", type=int, default=CONFIG.get("cli", {}).get("default_jobs", 4))
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--keep-going", action="store_true")
+
+    # build-world
+    p = sub.add_parser("build-world", help="Build world from config world.base")
+    p.add_argument("--dry-run", action="store_true")
+
+    # build-toolchain
+    p = sub.add_parser("build-toolchain", help="Build LFS bootstrap toolchain (pass1/etc)")
+    p.add_argument("--dry-run", action="store_true")
 
     # remove
-    p_remove = sub.add_parser("remove", aliases=["-r"], help="Remove packages")
-    p_remove.add_argument("packages", nargs="+")
-    p_remove.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("remove", aliases=["-r"], help="Remove packages")
+    p.add_argument("packages", nargs="+")
+    p.add_argument("--do-it", dest="apply", action="store_true", help="Actually remove (default: dry-run)")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--no-backup", action="store_true")
+    p.add_argument("--with-dependents", action="store_true")
+    p.add_argument("--keep-going", action="store_true")
+
+    # clean (depclean)
+    p = sub.add_parser("clean", help="Depclean - find and remove orphaned packages")
+    p.add_argument("--apply", action="store_true", help="Actually remove orphans (default dry-run)")
+    p.add_argument("--only", nargs="+")
+    p.add_argument("--exclude", nargs="+")
+    p.add_argument("--keep", nargs="+")
+    p.add_argument("--protected", nargs="+")
+    p.add_argument("--backup", action="store_true")
+    p.add_argument("--parallel", action="store_true")
+    p.add_argument("--tag", help="Report tag")
 
     # upgrade
-    p_upgrade = sub.add_parser("upgrade", help="Upgrade packages")
-    p_upgrade.add_argument("packages", nargs="*", help="If empty, upgrade all updatable packages")
-    p_upgrade.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("upgrade", help="Upgrade packages")
+    p.add_argument("packages", nargs="*", help="If empty, upgrade all updatable packages")
+    p.add_argument("--dry-run", action="store_true")
 
-    # update (scan upstreams)
-    p_update = sub.add_parser("update", aliases=["--update"], help="Scan upstreams for new versions")
-    p_update.add_argument("--dry-run", action="store_true")
+    # update
+    p = sub.add_parser("update", help="Scan upstreams for updates")
+    p.add_argument("--dry-run", action="store_true")
 
     # sync
-    p_sync = sub.add_parser("sync", aliases=["--sync"], help="Sync repositories")
-    p_sync.add_argument("--dry-run", action="store_true")
-
-    # depclean
-    p_depclean = sub.add_parser("depclean", aliases=["--depclean"], help="Find and remove orphaned packages")
-    p_depclean.add_argument("--apply", action="store_true", help="Actually remove")
-    p_depclean.add_argument("--only", nargs="+")
-    p_depclean.add_argument("--exclude", nargs="+")
-    p_depclean.add_argument("--keep", nargs="+")
-    p_depclean.add_argument("--protected", nargs="+")
-    p_depclean.add_argument("--backup", action="store_true")
-    p_depclean.add_argument("--parallel", action="store_true")
-    p_depclean.add_argument("--tag", help="Report tag")
-
-    # revdep
-    p_revdep = sub.add_parser("revdep", help="List reverse dependencies")
-    p_revdep.add_argument("pkg")
-
-    # search
-    p_search = sub.add_parser("search", help="Search recipes and installed pkgs")
-    p_search.add_argument("term")
-
-    # info
-    p_info = sub.add_parser("info", help="Show recipe or installed package info")
-    p_info.add_argument("target")
+    p = sub.add_parser("sync", help="Sync repositories")
+    p.add_argument("--dry-run", action="store_true")
 
     # patch
-    p_patch = sub.add_parser("patch", help="Apply patches defined in recipe")
-    p_patch.add_argument("recipe")
-    p_patch.add_argument("--target", help="target dir")
-    p_patch.add_argument("--no-chroot", dest="no_chroot", action="store_true")
-    p_patch.add_argument("--fakeroot", action="store_true")
-    p_patch.add_argument("--parallel", action="store_true")
-    p_patch.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("patch", help="Apply patches from recipe")
+    p.add_argument("recipe")
+    p.add_argument("--target")
+    p.add_argument("--no-chroot", action="store_true")
+    p.add_argument("--fakeroot", action="store_true")
+    p.add_argument("--parallel", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
 
-    # deps / graph
-    p_deps = sub.add_parser("deps", help="Dependency operations")
-    p_deps.add_argument("action", choices=["scan","resolve","graph"])
-    p_deps.add_argument("packages", nargs="*", help="packages for resolve")
-    p_deps.add_argument("--out")
-    p_deps.add_argument("--force", action="store_true")
+    # deps
+    p = sub.add_parser("deps", help="Dependency manager actions")
+    p.add_argument("action", choices=["scan", "resolve", "graph"])
+    p.add_argument("packages", nargs="*", help="Packages for resolve")
+    p.add_argument("--out")
+    p.add_argument("--force", action="store_true")
+
+    # graph-deps (alias)
+    p = sub.add_parser("graph-deps", help="Export/show dependency graph")
+    p.add_argument("--out")
+    p.add_argument("--format", choices=["dot","json"], default="json")
+    p.add_argument("--packages", nargs="*")
 
     # chroot
-    p_chroot = sub.add_parser("chroot", help="chroot operations")
-    p_chroot_sub = p_chroot.add_subparsers(dest="subcmd", required=True)
-    p_chroot_prep = p_chroot_sub.add_parser("prepare")
-    p_chroot_prep.add_argument("root")
-    p_chroot_prep.add_argument("--profile", default="lfs")
-    p_chroot_prep.add_argument("--no-mount-proc", dest="mount_proc", action="store_false")
-    p_chroot_cleanup = p_chroot_sub.add_parser("cleanup")
-    p_chroot_cleanup.add_argument("root")
-    p_chroot_cleanup.add_argument("--force", action="store_true")
-    p_chroot_verify = p_chroot_sub.add_parser("verify")
-    p_chroot_verify.add_argument("root")
-
-    # deps graph alternative (graph-deps)
-    p_gd = sub.add_parser("graph-deps", help="Export or show dependency graph")
-    p_gd.add_argument("--out", help="destination (.dot or .json)")
-    p_gd.add_argument("--format", choices=["dot","json"], default="json")
-    p_gd.add_argument("--packages", nargs="*", help="Show plan for these packages")
+    p = sub.add_parser("chroot", help="Chroot operations")
+    chsub = p.add_subparsers(dest="subcmd", required=True)
+    ch_prep = chsub.add_parser("prepare")
+    ch_prep.add_argument("root")
+    ch_prep.add_argument("--profile", default="lfs")
+    ch_prep.add_argument("--no-mount-proc", dest="mount_proc", action="store_false")
+    ch_cleanup = chsub.add_parser("cleanup")
+    ch_cleanup.add_argument("root")
+    ch_cleanup.add_argument("--force", action="store_true")
+    ch_verify = chsub.add_parser("verify")
+    ch_verify.add_argument("root")
 
     # db
-    p_db = sub.add_parser("db", help="DB utilities")
-    p_db.add_argument("action", choices=["list","manifest","export"])
-    p_db.add_argument("--pkg")
-    p_db.add_argument("--dest")
-    p_db.add_argument("--no-compress", action="store_true")
+    p = sub.add_parser("db", help="DB utilities")
+    p.add_argument("action", choices=["list","manifest","export"])
+    p.add_argument("--pkg")
+    p.add_argument("--dest")
+    p.add_argument("--no-compress", action="store_true")
 
     # logger
-    p_log = sub.add_parser("logger", help="Logger utilities")
-    p_log.add_argument("action", choices=["list","cleanup","upload"])
-    p_log.add_argument("--max-age", type=int, default=30)
+    p = sub.add_parser("logger", help="Logger utilities")
+    p.add_argument("action", choices=["list","cleanup","upload"])
+    p.add_argument("--max-age", type=int, default=30)
 
-    # misc: help is default
+    # misc
+    p = sub.add_parser("search", help="Search recipes and installed packages")
+    p.add_argument("term")
+    p_info = sub.add_parser("info", help="Show recipe or package info")
+    p_info.add_argument("target")
+    p_rev = sub.add_parser("revdep", help="Show reverse deps")
+    p_rev.add_argument("pkg")
+
     return parser
 
-def main(argv: Optional[List[str]] = None):
+# -------------------------
+# Main entry
+# -------------------------
+def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    # global dry-run precedence
+
+    # Per-command dry-run precedence
     if getattr(args, "dry_run", False):
-        global_dry = True
+        args_global_dry = True
     else:
-        global_dry = False
+        args_global_dry = False
 
     cmd = args.cmd
 
     try:
-        if cmd in ("install", "-i", "I"):
+        if cmd in ("install", "-i"):
             return cmd_install(args)
-        elif cmd in ("build", "-b"):
+        if cmd in ("build", "-b"):
             return cmd_build(args)
-        elif cmd == "remove" or cmd == "-r":
+        if cmd == "build-world":
+            # convenience: read world.base from config
+            world = CONFIG.get("world", {}).get("base", [])
+            if not world:
+                warn("world.base not defined in config")
+                return 0
+            # call resolve_and_build or build sequence
+            if DEPS:
+                res = DEPS.resolve_and_build(world, dry_run=args.dry_run)
+                print_json(res)
+                return 0
+            else:
+                # fallback: build sequentially
+                for p in world:
+                    ret = cmd_build(argparse.Namespace(packages=[p], dir_install=False, jobs=args.jobs, dry_run=args.dry_run, keep_going=False))
+                return 0
+        if cmd == "build-toolchain":
+            if not BUILDER or not hasattr(BUILDER, "build_toolchain"):
+                return _fail("builder.toolchain not available")
+            out = BUILDER.build_toolchain(dry_run=args.dry_run)
+            print_json(out)
+            return 0
+        if cmd == "remove":
             return cmd_remove(args)
-        elif cmd == "upgrade":
-            return cmd_upgrade(args)
-        elif cmd == "update":
-            return cmd_update(args)
-        elif cmd == "sync":
-            return cmd_sync_repos(args)
-        elif cmd == "search":
-            return cmd_search(args.term, args)
-        elif cmd == "info":
-            return cmd_info(args.target, args)
-        elif cmd == "revdep":
-            return cmd_revdep(args)
-        elif cmd == "depclean":
+        if cmd == "clean":
             return cmd_depclean(args)
-        elif cmd == "patch":
+        if cmd == "upgrade":
+            return cmd_upgrade(args)
+        if cmd == "update":
+            return cmd_update(args)
+        if cmd == "sync":
+            return cmd_sync(args)
+        if cmd == "patch":
             return cmd_patch(args)
-        elif cmd == "chroot":
+        if cmd == "chroot":
             return cmd_chroot(args)
-        elif cmd == "deps":
+        if cmd == "deps":
             return cmd_deps(args)
-        elif cmd == "graph-deps":
+        if cmd == "graph-deps":
             return cmd_graph_deps(args)
-        elif cmd == "db":
+        if cmd == "db":
             return cmd_db(args)
-        elif cmd == "logger":
+        if cmd == "logger":
             return cmd_logger(args)
-        else:
-            parser.print_help()
-            return 1
+        if cmd == "search":
+            return cmd_search(args)
+        if cmd == "info":
+            return cmd_info(args)
+        if cmd == "revdep":
+            return cmd_revdep(args)
+        # unknown
+        parser.print_help()
+        return 0
     except KeyboardInterrupt:
-        print_err("aborted by user")
+        error("aborted by user")
         return 130
     except Exception as e:
-        print_err("unexpected error:", e)
+        error(f"unexpected error: {e}")
         log_event("cli", "error", f"exception: {e}", level="error")
         return 1
+
+# -------------------------
+# Entrypoint fallback to the per-command functions defined above
+# (they must be visible by name)
+# -------------------------
+# map function names to actual function objects used above
+# (these are local defs - so ensure names exist)
+globals().setdefault("cmd_sync", cmd_sync)
+globals().setdefault("cmd_search", cmd_search)
+globals().setdefault("cmd_info", cmd_info)
+globals().setdefault("cmd_revdep", cmd_revdep)
+globals().setdefault("cmd_graph_deps", cmd_graph_deps)
+globals().setdefault("cmd_depclean", cmd_depclean)
+globals().setdefault("cmd_remove", cmd_remove)
+globals().setdefault("cmd_build", cmd_build)
+globals().setdefault("cmd_install", cmd_install)
+globals().setdefault("cmd_upgrade", cmd_upgrade)
+globals().setdefault("cmd_update", cmd_update)
+globals().setdefault("cmd_patch", cmd_patch)
+globals().setdefault("cmd_chroot", cmd_chroot)
+globals().setdefault("cmd_deps", cmd_deps)
+globals().setdefault("cmd_db", cmd_db)
+globals().setdefault("cmd_logger", cmd_logger)
 
 if __name__ == "__main__":
     sys.exit(main())
