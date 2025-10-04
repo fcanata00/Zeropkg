@@ -1,0 +1,57 @@
+[package]
+name = "glibc"
+version = "2.40"
+category = "base"
+description = "GNU C Library — principal biblioteca C para LFS"
+homepage = "https://www.gnu.org/software/libc/"
+license = "LGPL-2.1+ / GPL-2"
+maintainer = "zeropkg"
+
+[sources]
+urls = [
+  "https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz"
+]
+# Você precisa verificar o checksum SHA256 oficial
+checksum = "sha256:<colocar_sha256_real_para_glibc-2.40>"
+extract_to = "glibc-2.40"
+
+[environment]
+LFS = "/mnt/lfs"
+LFS_TGT = "x86_64-lfs-linux-gnu"
+PATH = "/mnt/lfs/tools/bin:/bin:/usr/bin"
+DESTDIR = "@DESTDIR@"
+
+[build]
+chroot = true
+fakeroot = true
+cleanup_sources = true
+commands = [
+  "mkdir -v build",
+  "cd build",
+  "../configure                              \\",
+  "    --prefix=/usr                         \\",
+  "    --host=$LFS_TGT                       \\",
+  "    --build=$(../scripts/config.guess)    \\",
+  "    --enable-kernel=4.19                  \\",
+  "    --with-headers=$LFS/usr/include       \\",
+  "    --disable-nscd                        \\",
+  "    libc_cv_slibdir=/usr/lib",
+
+  "make",
+  "make check",
+  "make DESTDIR=${DESTDIR} install"
+]
+
+[hooks]
+pre_build = "echo '==> Iniciando compilação da Glibc-2.40'"
+post_install = "echo '==> Glibc-2.40 instalada com sucesso'"
+
+[dependencies]
+build = ["linux-headers-6.6.54", "gcc-13.2.0", "binutils-2.43.1"]
+runtime = []
+optional = []
+
+[lfs]
+stage = "toolchain"
+bootstrap = false
+chroot_required = true
