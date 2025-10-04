@@ -1,94 +1,143 @@
 #!/usr/bin/env python3
-# zeropkg_logger.py - Sistema de logging do Zeropkg
 # -*- coding: utf-8 -*-
+"""
+zeropkg_logger.py — Sistema de logging central do Zeropkg
+Integrado com zeropkg_config e zeropkg_db.
+"""
 
 import os
+import sys
+import json
+import time
 import logging
 from logging.handlers import RotatingFileHandler
-from typing import Optional
+from threading import Lock
 
-# Configuração padrão, pode ser sobrescrita pelo config.toml
-LOG_DIR = "/var/log/zeropkg"
-DEFAULT_LOG = "zeropkg.log"
+try:
+    from zeropkg_config import load_config
+except ImportError:
+    load_config = lambda: {"paths": {"log_dir": "/var/log/zeropkg"}, "logging": {"level": "INFO", "json": False}}
 
-# Integração com DBManager
 try:
     from zeropkg_db import DBManager
-    HAS_DB = True
-except Exception:
-    HAS_DB = False
+except ImportError:
+    DBManager = None
 
 
-def setup_logger(pkg_name: Optional[str] = None, stage: Optional[str] = None,
-                 log_dir: Optional[str] = None, level: str = "INFO") -> logging.Logger:
-    """
-    Configura logger para um pacote/estágio específico.
-    """
-    log_dir = log_dir or LOG_DIR
-    os.makedirs(log_dir, exist_ok=True)
-
-    logger_name = "zeropkg"
-    if pkg_name:
-        logger_name += f".{pkg_name}"
-    if stage:
-        logger_name += f".{stage}"
-
-    logger = logging.getLogger(logger_name)
-    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
-
-    if not logger.handlers:
-        # Console handler
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
-        ch_formatter = logging.Formatter("[%(levelname)s] %(message)s")
-        ch.setFormatter(ch_formatter)
-        logger.addHandler(ch)
-
-        # File handler
-        if pkg_name and stage:
-            logfile = os.path.join(log_dir, f"{pkg_name}-{stage}.log")
-        elif pkg_name:
-            logfile = os.path.join(log_dir, f"{pkg_name}.log")
-        else:
-            logfile = os.path.join(log_dir, DEFAULT_LOG)
-
-        fh = RotatingFileHandler(logfile, maxBytes=2*1024*1024, backupCount=3)
-        fh.setLevel(logging.DEBUG)
-        fh_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        fh.setFormatter(fh_formatter)
-        logger.addHandler(fh)
-
-    return logger
+# 🔒 Lock global para acesso thread-safe
+_log_lock = Lock()
+_logger_cache = {}
 
 
-def log_event(pkg_name: Optional[str], stage: Optional[str], message: str,
-              level: str = "info", log_dir: Optional[str] = None):
-    """
-    Loga um evento para um pacote/estágio específico.
-    Também envia para o banco de dados, se disponível.
-    """
-    logger = setup_logger(pkg_name, stage, log_dir=log_dir)
+def _ensure_log_dir(path: str):
+    """Garante que o diretório de logs existe e possui permissões seguras."""
+    if not os.path.exists(path):
+        os.makedirs(path, mode=0o750, exist_ok=True)
+    elif not os.access(path, os.W_OK):
+        raise PermissionError(f"Sem permissão para gravar em {path}")
 
-    level = level.lower()
-    if level not in ("debug", "info", "warning", "error", "critical"):
-        level = "info"
 
-    log_method = getattr(logger, level)
-    log_method(message)
+def get_logger(name: str = "zeropkg", stage: str = None) -> logging.Logger:
+    """Retorna (ou cria) um logger configurado com rotação e formato adequado."""
+    with _log_lock:
+        config = load_config()
+        log_dir = config.get("paths", {}).get("log_dir", "/var/log/zeropkg")
+        log_json = config.get("logging", {}).get("json", False)
+        log_level = getattr(logging, config.get("logging", {}).get("level", "INFO").upper(), logging.INFO)
 
-    # Persistir no DB
-    if HAS_DB and pkg_name:
+        _ensure_log_dir(log_dir)
+        logger_name = f"{name}.{stage}" if stage else name
+
+        if logger_name in _logger_cache:
+            return _logger_cache[logger_name]
+
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(log_level)
+        logger.propagate = False
+
+        # Formato
+        fmt = (
+            json.dumps({"time": "%(asctime)s", "level": "%(levelname)s", "msg": "%(message)s"})
+            if log_json
+            else "%(asctime)s [%(levelname)s] %(message)s"
+        )
+        formatter = logging.Formatter(fmt, "%Y-%m-%d %H:%M:%S")
+
+        # Handler de arquivo rotativo
+        log_path = os.path.join(log_dir, f"{logger_name}.log")
+        file_handler = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+        # Handler de console
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        _logger_cache[logger_name] = logger
+        return logger
+
+
+def log_event(pkg: str, stage: str, message: str, level: str = "info"):
+    """Loga um evento para um pacote e opcionalmente registra no banco de dados."""
+    logger = get_logger(pkg, stage)
+    log_func = getattr(logger, level.lower(), logger.info)
+    log_func(message)
+
+    # Registrar também no banco de dados, se disponível
+    if DBManager:
         try:
-            db = DBManager()
-            db.log_event(pkg_name, stage or "general", message, level.upper())
-            db.close()
+            with DBManager() as db:
+                db.conn.execute(
+                    "INSERT INTO events (pkg_name, stage, event, timestamp) VALUES (?, ?, ?, ?)",
+                    (pkg, stage, message, int(time.time())),
+                )
         except Exception:
-            # não interromper por falha no DB
             pass
 
 
-def get_logger(pkg: Optional[str] = None, stage: Optional[str] = None) -> logging.Logger:
-    """
-    Atalho simples para pegar logger configurado.
-    """
-    return setup_logger(pkg, stage)
+def log_global(message: str, level: str = "info"):
+    """Loga mensagens globais (fora do contexto de pacote)."""
+    logger = get_logger("zeropkg")
+    log_func = getattr(logger, level.lower(), logger.info)
+    log_func(message)
+
+    if DBManager:
+        try:
+            with DBManager() as db:
+                db.conn.execute(
+                    "INSERT INTO events (pkg_name, stage, event, timestamp) VALUES (?, ?, ?, ?)",
+                    ("global", "system", message, int(time.time())),
+                )
+        except Exception:
+            pass
+
+
+def rotate_logs(max_age_days: int = 30):
+    """Remove logs antigos automaticamente."""
+    config = load_config()
+    log_dir = config.get("paths", {}).get("log_dir", "/var/log/zeropkg")
+    now = time.time()
+
+    for fname in os.listdir(log_dir):
+        fpath = os.path.join(log_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        if now - os.path.getmtime(fpath) > max_age_days * 86400:
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+
+
+def get_session_logger():
+    """Cria logger específico para sessões (ex: chamadas CLI)."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    return get_logger(f"session-{ts}")
+
+
+# Exemplo de uso
+if __name__ == "__main__":
+    log_global("Inicializando Zeropkg Logger", "info")
+    log_event("gcc", "build", "Compilando GCC etapa 1", "info")
+    log_event("glibc", "install", "Instalação concluída com sucesso", "info")
