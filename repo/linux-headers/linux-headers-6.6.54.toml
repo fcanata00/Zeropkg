@@ -1,51 +1,87 @@
 [package]
-name = "linux-headers"
-version = "6.6.54"
-category = "lfs"
-description = "Linux API Headers — cabeçalhos expostos pelo kernel usados pela glibc"
+name = "linux-api-headers"
+version = "6.6.32"
+description = "Linux API Headers - Cabeçalhos da API do kernel usados pela glibc"
+category = "system"
+license = "GPLv2"
 homepage = "https://www.kernel.org"
-license = "GPL-2.0-only"
-maintainer = "zeropkg"
+maintainer = "Zeropkg LFS Automation"
+stage = "final"
+priority = "critical"
 
-[sources]
+[source]
 urls = [
-  "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.54.tar.xz"
+  "https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.6.32.tar.xz"
 ]
-checksum = "sha256:bb991b4c1d9ef249e3ab43f8c82c2a46b097417df0ec8239867eec5f418906b8"
-extract_to = "linux-6.6.54"
-
-[environment]
-LFS = "/mnt/lfs"
-DESTDIR = "@DESTDIR@"
-PATH = "/usr/bin:/bin"
+sha256 = [
+  "efaa2b4f3a6e2479e8a8b0b95f5f7cfde2357b3a0de8b7da134f01f94acfc9b0"
+]
+extract_to = "linux-6.6.32"
 
 [build]
-chroot = true
+depends = []
+optional_depends = []
+use_chroot = true
 fakeroot = true
-cleanup_sources = true
+workdir = "linux-6.6.32"
+
+[environment]
+PATH = "/usr/bin:/bin"
+LC_ALL = "POSIX"
+MAKEFLAGS = "-j$(nproc)"
+CFLAGS = "-O2 -pipe"
+CXXFLAGS = "-O2 -pipe"
+
+[prepare]
 commands = [
-  # Limpa a árvore de build
-  "make mrproper",
+  "make mrproper"
+]
 
-  # Gera os cabeçalhos expostos ao espaço de usuário
-  "make headers",
+[compile]
+commands = [
+  "make headers"
+]
 
-  # Remove todos os arquivos que não sejam .h
+[install]
+commands = [
   "find usr/include -type f ! -name '*.h' -delete",
-
-  # Copia os headers para o destino final
-  "mkdir -pv ${DESTDIR}/usr",
-  "cp -rv usr/include ${DESTDIR}/usr"
+  "cp -rv usr/include /usr"
 ]
 
 [hooks]
-pre_build = "echo '==> Iniciando build dos Linux API Headers (LFS)'"
-post_install = "echo '==> Linux headers instalados em ${DESTDIR}/usr/include'"
+pre_build = [
+  "echo '[HOOK] Iniciando build do Linux API Headers 6.6.32...'"
+]
+post_install = [
+  "echo '[HOOK] Headers copiados para /usr/include'"
+]
 
-[dependencies]
-build = []
-runtime = []
+[patches]
+apply = []
+strip = 1
 
-[lfs]
-stage = "toolchain"
-bootstrap = true
+[tests]
+enabled = false
+
+[package.files]
+include = ["/usr/include/linux", "/usr/include/asm"]
+doc = ["/usr/share/doc/linux-api-headers-6.6.32"]
+
+[package.meta]
+provides = ["linux-api-headers"]
+group = "toolchain"
+conflicts = []
+replaces = []
+
+[install]
+root = "/"
+keep_build = false
+safe_chroot = true
+parallel_install = false
+overwrite_existing = true
+
+[notifications]
+notify = true
+urgency = "normal"
+summary = "Linux API Headers 6.6.32 instalados em /usr/include"
+icon = "/usr/share/icons/kernel.png"
