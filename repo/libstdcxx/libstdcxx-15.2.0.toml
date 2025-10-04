@@ -1,0 +1,66 @@
+[package]
+name = "libstdcxx"
+version = "15.2.0"
+category = "lfs"
+description = "Libstdc++ (parte do GCC 15.2.0) — biblioteca padrão C++ para LFS"
+homepage = "https://gcc.gnu.org"
+license = "GPL-3.0-or-later"
+maintainer = "zeropkg"
+
+[sources]
+# note: GCC tarball contém libstdc++ em ./libstdc++-v3
+urls = [
+  "https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz",
+  "https://mirror.kernel.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz"
+]
+# coloque o SHA256 real do tarball aqui (verifique no mirror oficial)
+checksum = "sha256:<COLOQUE_SHA256_OFICIAL_AQUI>"
+# extrai o tarball dentro do build root para criar a pasta gcc-15.2.0/
+extract_to = "gcc-15.2.0"
+
+[environment]
+# variáveis padrão do LFS — o Builder deve passar LFS e LFS_TGT conforme seu fluxo
+LFS = "/mnt/lfs"
+LFS_TGT = "x86_64-lfs-linux-gnu"
+PATH = "/mnt/lfs/tools/bin:/usr/bin:/bin"
+DESTDIR = "@DESTDIR@"
+
+[build]
+# esta construção é feita **dentro** da árvore do gcc: ./libstdc++-v3
+chroot = true
+fakeroot = true
+cleanup_sources = false
+commands = [
+  "mkdir -v build",
+  "cd build",
+  # configurar libstdc++ conforme LFS (obrigatório --with-gxx-include-dir apontando para o diretório do g++)
+  "../libstdc++-v3/configure \\",
+  "    --host=$LFS_TGT \\",
+  "    --build=$(../config.guess) \\",
+  "    --prefix=/usr \\",
+  "    --disable-multilib \\",
+  "    --disable-nls \\",
+  "    --disable-libstdcxx-pch \\",
+  "    --with-gxx-include-dir=/tools/$LFS_TGT/include/c++/15.2.0",
+  "make",
+  "make DESTDIR=${DESTDIR} install",
+  # remover arquivos .la (prejudiciais para cross-compilation)
+  "rm -v ${DESTDIR}/usr/lib/libstdc++{,fs,exp}.la || true",
+  "rm -v ${DESTDIR}/usr/lib/supc++.la || true"
+]
+
+[hooks]
+pre_build = "echo '==> Preparando Libstdc++ (GCC 15.2.0) — build em libstdc++-v3'"
+post_install = "echo '==> Libstdc++ instalada em ${DESTDIR}/usr/lib e headers em /tools/$LFS_TGT/include/c++/15.2.0'"
+
+[dependencies]
+# garantir que gcc-pass1 (ou gcc toolchain que produziu $LFS_TGT-g++) e linux-headers já existam
+build = ["gcc-15.2.0", "linux-headers-6.6.54"]
+runtime = []
+optional = []
+
+[lfs]
+stage = "toolchain"
+toolchain = true
+bootstrap = true
+chroot_required = true
