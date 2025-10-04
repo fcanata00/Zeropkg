@@ -1,391 +1,221 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zeropkg_toml.py — TOML parser / normalizer for Zeropkg recipes
-Pattern B: integrated, lean, functional.
+Zeropkg TOML Parser
+-------------------
+Responsável por carregar, validar, normalizar e expandir receitas (.toml)
+utilizadas em todos os estágios do Zeropkg — desde LFS até BLFS e beyond.
 
-Public API:
-- load_toml(path) -> dict (normalized recipe)
-- validate_recipe(recipe) -> (ok, issues)
-- dump_meta(recipe, outpath)
-- get_package_meta(recipe) -> (name, version)
-- resolve_macros(value, env_map)
+Suporta includes, overlays, múltiplos sources, hooks, environment, etc.
 """
 
-from __future__ import annotations
 import os
-import sys
+import tomllib
+import hashlib
 import json
-import time
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple, Union
-from pathlib import Path
-
-# tomllib in Python 3.11+
-try:
-    import tomllib as _tomllib  # type: ignore
-except Exception:
-    try:
-        import tomli as _tomllib  # type: ignore
-    except Exception:
-        _tomllib = None
-
-# integrate with config/logger if available (non-fatal)
-try:
-    from zeropkg_config import load_config, get_build_root
-except Exception:
-    load_config = lambda *a, **k: {}
-    get_build_root = lambda cfg=None: "/var/zeropkg/build"
-
-try:
-    from zeropkg_logger import log_event, get_logger
-    _log = get_logger("toml")
-    def _log_event(pkg, stage, msg, level="info"):
-        log_event(pkg, stage, msg, level)
-except Exception:
-    import logging
-    _log = logging.getLogger("zeropkg_toml")
-    if not _log.handlers:
-        _log.addHandler(logging.StreamHandler(sys.stdout))
-    def _log_event(pkg, stage, msg, level="info"):
-        getattr(_log, level if hasattr(_log, level) else "info")(f"{pkg}:{stage} {msg}")
-
-# -----------------------
-# Dataclasses for structure
-# -----------------------
-@dataclass
-class SourceEntry:
-    url: str
-    checksum: Optional[str] = None
-    algo: str = "sha256"
-    extract_to: Optional[str] = None
-    method: Optional[str] = None  # e.g., git, http
-    subpath: Optional[str] = None
-
-@dataclass
-class PatchEntry:
-    path: str
-    strip: Optional[int] = 1
-    applied_to: Optional[str] = None
-
-# -----------------------
-# Utilities
-# -----------------------
-def _read_toml(path: str) -> Dict[str, Any]:
-    if _tomllib is None:
-        raise RuntimeError("No TOML parser available (tomllib/tomli).")
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(path)
-    with p.open("rb") as f:
-        data = _tomllib.load(f)
-    return data if isinstance(data, dict) else {}
-
-def _normalize_checksum(c: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Accept formats: "sha256:abcd...", "abcd..." -> default algo sha256
-    Returns (algo, hex)
-    """
-    if not c:
-        return None, None
-    cs = str(c).strip()
-    if ":" in cs:
-        algo, val = cs.split(":", 1)
-        return algo.lower(), val.strip()
-    return "sha256", cs
-
-def _detect_method(url: str) -> str:
-    if url.startswith("git+"):
-        return "git"
-    if url.startswith("file://"):
-        return "file"
-    return "http"
-
-def _ensure_list(v: Any) -> List:
-    if v is None:
-        return []
-    if isinstance(v, list):
-        return v
-    return [v]
-
-def _safe_get(d: Dict, key: str, default=None):
-    return d.get(key, default) if isinstance(d, dict) else default
-
-# Macro substitution: ${VAR} or @VAR@ style
 import re
-_macro_re = re.compile(r"\$\{([^}]+)\}|\@([A-Za-z0-9_]+)\@")
+from pathlib import Path
+from packaging import version
+from zeropkg_logger import log
 
-def resolve_macros(value: Any, env_map: Dict[str, str]) -> Any:
-    if isinstance(value, str):
-        def _rep(m):
-            k = m.group(1) or m.group(2)
-            return str(env_map.get(k, m.group(0)))
-        return _macro_re.sub(_rep, value)
-    if isinstance(value, list):
-        return [resolve_macros(x, env_map) for x in value]
-    if isinstance(value, dict):
-        return {k: resolve_macros(v, env_map) for k, v in value.items()}
-    return value
 
-# -----------------------
-# Core parser/normalizer
-# -----------------------
-def load_toml(path: str, *, resolve_env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """
-    Load a recipe TOML and return a normalized dict with keys:
-      package: {name, version, category}
-      sources: [SourceEntry as dict]
-      patches: [PatchEntry as dict]
-      build: {commands:[], chroot:bool, fakeroot:bool, environment:{}}
-      hooks: {pre_configure, post_build, pre_install, post_install, pre_remove, post_remove}
-      dependencies: [ {name, version_req} ... ]
-      raw: original parsed toml
-    """
-    cfg = load_config()
-    cfg_build_root = get_build_root(cfg)
-    raw = _read_toml(path)
-    meta: Dict[str, Any] = {"raw": raw, "parsed_at": int(time.time()), "source_file": str(path)}
+CACHE_DIR = Path("/var/cache/zeropkg")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_FILE = CACHE_DIR / "recipes.json"
 
-    # package block
-    package = {}
-    package_block = _safe_get(raw, "package", {}) or {}
-    package["name"] = package_block.get("name") or package_block.get("pkg") or Path(path).stem
-    package["version"] = package_block.get("version") or package_block.get("ver") or ""
-    package["category"] = package_block.get("category") or package_block.get("group") or "main"
-    meta["package"] = package
 
-    # environment defaults and macro map
-    env_map = {}
-    env_map.update(os.environ)
-    env_map.update({
-        "PKG_NAME": package["name"],
-        "PKG_VERSION": package["version"],
-        "BUILD_ROOT": cfg_build_root,
-        "LFS": os.environ.get("LFS", "/mnt/lfs"),
-    })
-    # merge recipe environment
-    env_block = _safe_get(raw, "environment", {}) or {}
-    env_block = {k: str(v) for k, v in env_block.items()}
-    env_map.update(env_block)
-    meta["environment"] = env_block
+class ZeropkgTOML:
+    def __init__(self, config=None):
+        self.config = config
+        self.cache = self._load_cache()
 
-    # sources
-    normalized_sources: List[Dict[str, Any]] = []
-    raw_sources = _safe_get(raw, "sources", None) or _safe_get(raw, "source", None) or []
-    raw_sources_list = _ensure_list(raw_sources)
-    for s in raw_sources_list:
-        # Accept string or table with url/checksum/extract_to/method
-        if isinstance(s, str):
-            url = s
-            checksum = None
-            extract_to = None
-            method = None
-        elif isinstance(s, dict):
-            url = s.get("url") or s.get("src") or ""
-            checksum = s.get("checksum") or s.get("hash")
-            extract_to = s.get("extract_to") or s.get("extract_to_dir") or s.get("dst")
-            method = s.get("method")
-        else:
-            continue
-        url = resolve_macros(url, env_map) if url else url
-        method = method or _detect_method(url)
-        algo, chk = _normalize_checksum(checksum)
-        if chk:
-            checksum = chk
-            algo = algo or "sha256"
-        else:
-            checksum = None
-            algo = "sha256"
-        if extract_to:
-            extract_to = resolve_macros(extract_to, env_map)
-        # support subpath specification like url@subdir or url#subdir
-        subpath = None
-        if "@" in url and url.count("@") == 1 and not url.startswith("git+"):
-            # avoid confusing with git+ssh user@host
-            u, sp = url.split("@", 1)
-            if "/" in sp or "." in sp:
-                # heuristic: only accept if looks like path
-                url = u
-                subpath = sp
-        # normalized dict
-        sdict = {
-            "url": url,
-            "checksum": checksum,
-            "algo": algo,
-            "extract_to": extract_to,
-            "method": method,
-            "subpath": subpath,
+    # ===============================================================
+    # Cache de receitas normalizadas
+    # ===============================================================
+    def _load_cache(self):
+        if CACHE_FILE.exists():
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def _save_cache(self):
+        try:
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.cache, f, indent=2)
+        except Exception as e:
+            log(f"⚠️ Falha ao salvar cache de receitas: {e}")
+
+    # ===============================================================
+    # Carregar e normalizar uma receita TOML
+    # ===============================================================
+    def load(self, toml_path: str | Path):
+        toml_path = Path(toml_path)
+        if not toml_path.exists():
+            raise FileNotFoundError(f"Receita TOML não encontrada: {toml_path}")
+
+        mtime = os.path.getmtime(toml_path)
+        cache_key = str(toml_path)
+        if cache_key in self.cache and self.cache[cache_key].get("mtime") == mtime:
+            return self.cache[cache_key]["data"]
+
+        with open(toml_path, "rb") as f:
+            data = tomllib.load(f)
+
+        recipe = self._process_includes(data, toml_path.parent)
+        recipe = self._apply_overlays(recipe)
+        recipe = self._normalize(recipe)
+
+        self.cache[cache_key] = {"mtime": mtime, "data": recipe}
+        self._save_cache()
+        return recipe
+
+    # ===============================================================
+    # Includes (permite receitas modulares)
+    # ===============================================================
+    def _process_includes(self, data, base_dir):
+        includes = data.get("includes", [])
+        for inc in includes:
+            inc_path = Path(base_dir) / inc
+            if inc_path.exists():
+                with open(inc_path, "rb") as f:
+                    inc_data = tomllib.load(f)
+                data.update(inc_data)
+        return data
+
+    # ===============================================================
+    # Overlay (permite camadas locais sobre receitas base)
+    # ===============================================================
+    def _apply_overlays(self, recipe):
+        overlay_dir = Path("/etc/zeropkg/overlays")
+        overlay_file = overlay_dir / f"{recipe.get('package', {}).get('name', '')}.toml"
+        if overlay_file.exists():
+            log(f"🧩 Aplicando overlay local: {overlay_file}")
+            with open(overlay_file, "rb") as f:
+                overlay_data = tomllib.load(f)
+            recipe.update(overlay_data)
+        return recipe
+
+    # ===============================================================
+    # Normalização de estrutura
+    # ===============================================================
+    def _normalize(self, recipe):
+        pkg = recipe.get("package", {})
+        recipe["package"] = {
+            "name": pkg.get("name"),
+            "version": pkg.get("version"),
+            "description": pkg.get("description", ""),
         }
-        normalized_sources.append(sdict)
-    meta["sources"] = normalized_sources
 
-    # patches
-    normalized_patches: List[Dict[str, Any]] = []
-    raw_patches = _safe_get(raw, "patches", None) or []
-    rp_list = _ensure_list(raw_patches)
-    for p in rp_list:
-        if isinstance(p, str):
-            pathp = p
-            strip = 1
-        elif isinstance(p, dict):
-            pathp = p.get("path") or p.get("file")
-            strip = p.get("strip", 1)
-        else:
-            continue
-        if pathp:
-            pathp = resolve_macros(pathp, env_map)
-            normalized_patches.append({"path": pathp, "strip": int(strip)})
-    meta["patches"] = normalized_patches
+        if "sources" in recipe:
+            recipe["sources"] = [self._normalize_source(s) for s in recipe["sources"]]
 
-    # build block: commands, chroot, fakeroot, install options, extract flags
-    build_block = _safe_get(raw, "build", {}) or {}
-    build_commands = build_block.get("commands") or _ensure_list(build_block.get("command")) or []
-    # allow older style keys
-    configure = build_block.get("configure")
-    make = build_block.get("make")
-    install_cmd = build_block.get("install")
-    if not build_commands:
-        if configure:
-            build_commands.append(resolve_macros(configure, env_map))
-        if make:
-            build_commands.append(resolve_macros(make, env_map))
-        if install_cmd:
-            build_commands.append(resolve_macros(install_cmd, env_map))
-    # normalize commands (resolve macros)
-    build_commands = [resolve_macros(c, env_map) for c in build_commands]
-    build_norm = {
-        "commands": build_commands,
-        "chroot": bool(build_block.get("chroot", False)),
-        "fakeroot": bool(build_block.get("fakeroot", True)),
-        "cleanup_sources": bool(build_block.get("cleanup_sources", True)),
-        "dir_install": bool(build_block.get("dir_install", False)),
-        "overlay": build_block.get("overlay", False),
-        "overlay_dir": build_block.get("overlay_dir"),
-    }
-    # attach environment for build (merged)
-    build_env = {}
-    build_env.update(env_block)
-    build_env.update(build_block.get("environment", {}) or {})
-    # resolve macros in environment values
-    build_env = {k: resolve_macros(v, env_map) for k, v in build_env.items()}
-    build_norm["environment"] = build_env
-    meta["build"] = build_norm
+        if "patches" in recipe:
+            recipe["patches"] = [self._normalize_patch(p) for p in recipe["patches"]]
 
-    # hooks
-    hooks_block = _safe_get(raw, "hooks", {}) or {}
-    hooks = {}
-    for key in ("pre_configure", "post_build", "pre_install", "post_install", "pre_remove", "post_remove"):
-        v = hooks_block.get(key) or hooks_block.get(key.replace("_", "-"))
-        if v:
-            hooks[key] = resolve_macros(v, env_map)
-    meta["hooks"] = hooks
+        if "build" in recipe:
+            recipe["build"]["commands"] = recipe["build"].get("commands", [])
+            recipe["build"]["environment"] = recipe["build"].get("environment", {})
 
-    # dependencies
-    deps_block = _safe_get(raw, "dependencies", None) or _safe_get(raw, "requires", None) or []
-    deps_list: List[Dict[str, str]] = []
-    for d in _ensure_list(deps_block):
-        if isinstance(d, str):
-            # support "libc>=2.35" or "pkgname"
-            if any(op in d for op in [">=", "<=", "==", ">", "<", "~="]):
-                # naive split
-                for op in [">=", "<=", "==", ">", "<", "~="]:
-                    if op in d:
-                        name, ver = d.split(op, 1)
-                        deps_list.append({"name": name.strip(), "version_req": op + ver.strip()})
-                        break
-            else:
-                deps_list.append({"name": d.strip(), "version_req": None})
-        elif isinstance(d, dict):
-            nm = d.get("name") or d.get("pkg") or d.get("package")
-            ver = d.get("version") or d.get("version_req")
-            deps_list.append({"name": nm, "version_req": ver})
-    meta["dependencies"] = deps_list
+        if "hooks" in recipe:
+            for stage, cmds in recipe["hooks"].items():
+                if not isinstance(cmds, list):
+                    recipe["hooks"][stage] = [cmds]
 
-    # install block (packaging/install metadata)
-    install_block = _safe_get(raw, "install", {}) or {}
-    meta["install"] = {k: resolve_macros(v, env_map) for k, v in (install_block.items() if isinstance(install_block, dict) else [])}
+        if "dependencies" in recipe:
+            recipe["dependencies"] = self._normalize_deps(recipe["dependencies"])
 
-    # options & misc
-    options = _safe_get(raw, "options", {}) or {}
-    meta["options"] = options
+        self._validate(recipe)
+        return recipe
 
-    # final validation hints
-    ok, issues = validate_recipe(meta)
-    if not ok:
-        _log_event(package["name"], "parse", f"Recipe validation issues: {issues}", "warning")
-    return meta
+    # ===============================================================
+    # Normalização individual de seções
+    # ===============================================================
+    def _normalize_source(self, source):
+        if isinstance(source, str):
+            source = {"url": source}
+        source.setdefault("method", self._infer_method(source.get("url", "")))
+        source.setdefault("extract_to", None)
+        return source
 
-# -----------------------
-# Validation
-# -----------------------
-def validate_recipe(recipe: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    issues: List[str] = []
-    pkg = recipe.get("package", {})
-    if not pkg.get("name"):
-        issues.append("package.name missing")
-    if not pkg.get("version"):
-        issues.append("package.version missing (recommended)")
-    # sources basic checks
-    sources = recipe.get("sources", []) or []
-    if not sources:
-        issues.append("no sources declared")
-    for s in sources:
-        if not s.get("url"):
-            issues.append("a source entry is missing url")
-        else:
-            if s.get("method") == "git" and not s["url"].startswith("git+"):
-                # allow https git urls without git+ but warn
-                issues.append(f"git source probably should use git+ prefix: {s['url']}")
-        # checksum format
-        if s.get("checksum"):
-            algo = s.get("algo", "sha256")
-            if algo not in ("sha256", "sha512", "md5"):
-                issues.append(f"unknown checksum algorithm: {algo}")
-    # patches exist?
-    for p in recipe.get("patches", []) or []:
-        if not p.get("path"):
-            issues.append("patch entry missing path")
-    # build commands
-    build = recipe.get("build", {}) or {}
-    if not build.get("commands"):
-        issues.append("build.commands empty — builder may do nothing")
-    return (len(issues) == 0), issues
+    def _normalize_patch(self, patch):
+        if isinstance(patch, str):
+            patch = {"url": patch}
+        if "url" in patch and patch["url"].startswith(("http://", "https://")):
+            patch.setdefault("sha256", None)
+        return patch
 
-# -----------------------
-# Helpers for external use
-# -----------------------
-def dump_meta(recipe: Dict[str, Any], outpath: str):
-    p = Path(outpath)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(recipe, f, indent=2, ensure_ascii=False)
+    def _normalize_deps(self, deps):
+        result = []
+        for d in deps:
+            if isinstance(d, str):
+                name, _, ver = d.partition(">=")
+                result.append({"name": name.strip(), "version": ver.strip() or None})
+            elif isinstance(d, dict):
+                result.append(d)
+        return result
 
-def get_package_meta(recipe: Dict[str, Any]) -> Tuple[str, str]:
-    pkg = recipe.get("package", {})
-    return pkg.get("name", ""), pkg.get("version", "")
+    def _infer_method(self, url):
+        if url.endswith(".git"):
+            return "git"
+        elif any(url.endswith(ext) for ext in [".tar.gz", ".tar.xz", ".zip", ".bz2"]):
+            return "archive"
+        elif url.startswith("file://"):
+            return "file"
+        return "unknown"
 
-# convenience: read recipe and return package id string
-def package_fullname_from_file(path: str) -> str:
-    recipe = load_toml(path)
-    name, ver = get_package_meta(recipe)
-    return f"{name}-{ver}" if ver else name
+    # ===============================================================
+    # Validação completa da receita
+    # ===============================================================
+    def _validate(self, recipe):
+        pkg = recipe.get("package", {})
+        if not pkg.get("name") or not pkg.get("version"):
+            raise ValueError("Campo obrigatório ausente: package.name ou package.version")
 
-# -----------------------
-# Small CLI/debug helper
-# -----------------------
-def _cli_main():
-    import argparse, json
-    p = argparse.ArgumentParser(prog="zeropkg-toml", description="Parse and normalize Zeropkg TOML")
-    p.add_argument("file", help="recipe toml file")
-    p.add_argument("--dump", help="dump normalized json to path")
-    p.add_argument("--print", action="store_true", help="print normalized json to stdout")
-    args = p.parse_args()
-    meta = load_toml(args.file)
-    if args.dump:
-        dump_meta(meta, args.dump)
-        print("Dumped to", args.dump)
-    if args.print:
-        print(json.dumps(meta, indent=2, ensure_ascii=False))
+        if not re.match(r"^[a-zA-Z0-9._+-]+$", pkg["name"]):
+            raise ValueError(f"Nome de pacote inválido: {pkg['name']}")
 
+        try:
+            version.Version(pkg["version"])
+        except Exception:
+            log(f"⚠️ Versão não semântica detectada em {pkg['name']}: {pkg['version']}")
+
+        if "sources" in recipe:
+            for s in recipe["sources"]:
+                if "url" not in s:
+                    raise ValueError(f"Fonte sem URL definida em {pkg['name']}")
+
+        if "dependencies" in recipe:
+            for dep in recipe["dependencies"]:
+                if not dep.get("name"):
+                    raise ValueError(f"Dependência sem nome em {pkg['name']}")
+
+    # ===============================================================
+    # Substituição de variáveis / macros
+    # ===============================================================
+    @staticmethod
+    def resolve_macros(value, env=None):
+        if not isinstance(value, str):
+            return value
+        env = env or os.environ
+        for k, v in env.items():
+            value = value.replace(f"${{{k}}}", v).replace(f"@{k}@", v)
+        return value
+
+
+# ===============================================================
+# Função utilitária global (para compatibilidade com módulos antigos)
+# ===============================================================
+def resolve_macros(value, env=None):
+    return ZeropkgTOML.resolve_macros(value, env)
+
+
+# ===============================================================
+# Execução direta
+# ===============================================================
 if __name__ == "__main__":
-    _cli_main()
+    parser = ZeropkgTOML()
+    example = parser.load("/usr/ports/gcc/gcc-13.2.0.toml")
+    print(json.dumps(example, indent=2))
