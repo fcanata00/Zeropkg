@@ -1,6 +1,6 @@
 [package]
 name = "gawk"
-version = "5.3.1"
+version = "5.3.2"
 category = "lfs"
 description = "Gawk — GNU awk, para manipulação de texto (LFS capítulo 6.9)"
 homepage = "https://www.gnu.org/software/gawk/"
@@ -9,10 +9,10 @@ maintainer = "zeropkg"
 
 [sources]
 urls = [
-  "https://ftp.gnu.org/gnu/gawk/gawk-5.3.1.tar.xz"
+  "https://ftp.gnu.org/gnu/gawk/gawk-5.3.2.tar.xz"
 ]
 checksum = "sha256:<COLOQUE_SHA256_REAL_DO_TARBALL>"
-extract_to = "gawk-5.3.1"
+extract_to = "gawk-5.3.2"
 
 [environment]
 LFS = "/mnt/lfs"
