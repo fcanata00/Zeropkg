@@ -1,424 +1,507 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zeropkg_config.py — Config loader/validator/utilities for Zeropkg
-Pattern B: integrated, lean, functional.
+zeropkg_config.py — Config loader and validator for Zeropkg
 
-Features:
-- load_config(path) with caching
-- support `include = [ ... ]` in TOML
-- support repo-local config scanning (e.g. /usr/ports/*/config.toml)
-- apply_cli_overrides(args) to let CLI flags override config safely
-- ensure_dirs(cfg) to create/validate required directories
-- getters: get_build_root(), get_cache_dir(), get_ports_dirs(), get_db_path(), get_packages_dir()
-- validate_config(cfg) to verify required fields and protect dangerous overrides
-- reload capability via reload_config_if_changed()
-- simple safe defaults if config absent
-- integrates with zeropkg_logger if available
+Features implemented:
+ - hierarchical config load (file, env, CLI overrides)
+ - persistent cache at /var/lib/zeropkg/config.cache.json
+ - repo validation (checks for ports layout)
+ - security block support with defaults
+ - build profiles support (default, minimal, custom)
+ - host distro auto-detection (/etc/os-release)
+ - permissions checks for key dirs
+ - helpers: get_ports_roots, get_distfiles_dir, get_cache_dir, get_db_path, ensure_dirs
+ - atomic cache writes and robust fallbacks
+ - integrates with zeropkg_logger and zeropkg_db when available
 """
 
 from __future__ import annotations
 import os
 import sys
-import time
-import tomllib as _tomllib  # python 3.11+
-from typing import Any, Dict, List, Optional, Tuple
+import json
+import errno
+import shutil
+import stat
+import tempfile
+import logging
 from pathlib import Path
-import threading
+from typing import Any, Dict, List, Optional, Tuple
 
-# tomli fallback for older environments (shouldn't be necessary, but safe)
-try:
-    import tomli as _tomli  # type: ignore
-except Exception:
-    _tomli = None
-
-# try to use zeropkg_logger if present
-try:
-    from zeropkg_logger import log_event, get_logger
-    _logger = get_logger("config")
-except Exception:
-    import logging
-    _logger = logging.getLogger("zeropkg_config")
-    if not _logger.handlers:
-        _logger.addHandler(logging.StreamHandler(sys.stdout))
-
-
-# ---------------------------
-# Defaults
-# ---------------------------
-_DEFAULT_PATHS = {
-    "db_path": "/var/lib/zeropkg/installed.sqlite3",
-    "ports_dir": "/usr/ports",
-    "build_root": "/var/zeropkg/build",
-    "cache_dir": "/usr/ports/distfiles",
-    "packages_dir": "/var/zeropkg/packages",
-    "root": "/",
-}
-_DEFAULT_OPTIONS = {
-    "jobs": 4,
-    "fakeroot": True,
-    "chroot_enabled": True,
-}
-
-# internal cache & file timestamps
-_cached_config: Optional[Dict[str, Any]] = None
-_config_mtime: Dict[str, float] = {}
-_config_lock = threading.RLock()
-
-
-# ---------------------------
-# Helpers
-# ---------------------------
-def _read_toml_file(path: str) -> Dict[str, Any]:
-    p = Path(path)
-    if not p.exists():
-        return {}
-    data = p.read_bytes()
+# safe imports
+def _safe_import(name: str):
     try:
-        # prefer tomllib
-        return _tomllib.loads(data.decode("utf-8"))
+        return __import__(name, fromlist=["*"])
     except Exception:
-        if _tomli:
-            return _tomli.loads(data)
-        else:
-            raise
-
-
-def _merge_dict(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    """Deep-ish merge: values in b override a. Only handles dicts/lists/primitives."""
-    out = dict(a)
-    for k, v in b.items():
-        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
-            out[k] = _merge_dict(out[k], v)
-        else:
-            out[k] = v
-    return out
-
-
-def _safe_path(p: Optional[str]) -> Optional[str]:
-    if not p:
         return None
-    return str(Path(p).expanduser().resolve())
 
+logger_mod = _safe_import("zeropkg_logger")
+db_mod = _safe_import("zeropkg_db")
 
-# ---------------------------
-# Core: load_config()
-# ---------------------------
-def load_config(path: Optional[str] = None, *, reload_if_changed: bool = True) -> Dict[str, Any]:
-    """
-    Load and return the merged configuration.
-    Order of precedence (lowest -> highest):
-      1. built-in defaults
-      2. /usr/lib/zeropkg/config.toml (packaged defaults)
-      3. /etc/zeropkg/config.toml (system config)
-      4. per-repo configs under ports_dir/*/config.toml
-      5. user config ~/.config/zeropkg/config.toml
-      6. specified path argument (highest precedence)
-    Supports "include = [ '/path/a.toml', ... ]" within any config file.
-    Caches result for subsequent calls unless reload_if_changed is True.
-    """
-    global _cached_config, _config_mtime
-    with _config_lock:
-        if path:
-            config_files = [str(Path(path).expanduser().resolve())]
-        else:
-            config_files = [
-                "/usr/lib/zeropkg/config.toml",
-                "/etc/zeropkg/config.toml",
-                str(Path.home() / ".config" / "zeropkg" / "config.toml"),
-                "./zeropkg.config.toml",
-            ]
-
-        merged: Dict[str, Any] = {}
-        file_list: List[str] = []
-
-        # Start from defaults
-        merged["paths"] = dict(_DEFAULT_PATHS)
-        merged["options"] = dict(_DEFAULT_OPTIONS)
-        merged["repos"] = []  # list of repo definitions
-
-        # Helper to load and process includes
-        def _load_file(fp: str):
-            fp = str(fp)
-            if not os.path.exists(fp):
-                return {}
-            try:
-                mtime = os.path.getmtime(fp)
-            except Exception:
-                mtime = 0.0
-            prev_mtime = _config_mtime.get(fp)
-            if prev_mtime is None or mtime != prev_mtime:
-                _config_mtime[fp] = mtime
-            raw = _read_toml_file(fp)
-            # process includes
-            includes = raw.get("include", []) if isinstance(raw, dict) else []
-            if isinstance(includes, str):
-                includes = [includes]
-            inc_merged = {}
-            for inc in includes:
-                try:
-                    incp = _safe_path(inc)
-                    if incp and os.path.exists(incp):
-                        inc_merged = _merge_dict(inc_merged, _load_file(incp))
-                except Exception as e:
-                    _logger.warning(f"include '{inc}' failed: {e}")
-            # merge included then this file
-            return _merge_dict(inc_merged, raw if isinstance(raw, dict) else {})
-
-        # load main config files
-        for cf in config_files:
-            try:
-                cfg_piece = _load_file(cf)
-                merged = _merge_dict(merged, cfg_piece)
-                if os.path.exists(cf):
-                    file_list.append(cf)
-            except Exception as e:
-                _logger.warning(f"Failed reading config {cf}: {e}")
-
-        # if ports_dir present, load per-repo config files
-        ports_dir = _safe_path(merged.get("paths", {}).get("ports_dir") or _DEFAULT_PATHS["ports_dir"])
-        if ports_dir and os.path.isdir(ports_dir):
-            try:
-                for entry in sorted(os.listdir(ports_dir)):
-                    repo_cfg = os.path.join(ports_dir, entry, "config.toml")
-                    if os.path.exists(repo_cfg):
-                        try:
-                            rc = _load_file(repo_cfg)
-                            # attach repo metadata
-                            repo_meta = rc.get("repo", {}) if isinstance(rc, dict) else {}
-                            repo_meta.setdefault("path", os.path.join(ports_dir, entry))
-                            merged.setdefault("repos", []).append(_merge_dict({"name": entry}, repo_meta))
-                            merged = _merge_dict(merged, rc)
-                            file_list.append(repo_cfg)
-                        except Exception as e:
-                            _logger.warning(f"Failed load repo config {repo_cfg}: {e}")
-            except Exception:
-                pass
-
-        # Final normalization & safe paths
-        paths = merged.get("paths", {}) or {}
-        for k, defv in _DEFAULT_PATHS.items():
-            val = paths.get(k, defv)
-            paths[k] = _safe_path(val) or defv
-        merged["paths"] = paths
-
-        # options normalization
-        options = merged.get("options", {}) or {}
-        options.setdefault("jobs", int(options.get("jobs", _DEFAULT_OPTIONS["jobs"])))
-        options.setdefault("fakeroot", bool(options.get("fakeroot", _DEFAULT_OPTIONS["fakeroot"])))
-        options.setdefault("chroot_enabled", bool(options.get("chroot_enabled", _DEFAULT_OPTIONS["chroot_enabled"])))
-        merged["options"] = options
-
-        # Validate minimal structure
-        try:
-            validate_config(merged)
-        except Exception as e:
-            _logger.warning(f"Configuration validation warning: {e}")
-
-        # cache and return
-        _cached_config = merged
-        return merged
-
-
-# ---------------------------
-# Validation & safety
-# ---------------------------
-def validate_config(cfg: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """
-    Validate configuration fields and return (ok, issues).
-    Raises on fatal issues.
-    """
-    issues: List[str] = []
-    paths = cfg.get("paths", {})
-    # required keys
-    for k in ("db_path", "ports_dir", "build_root", "cache_dir", "packages_dir"):
-        if not paths.get(k):
-            issues.append(f"Missing path: {k}")
-
-    # Do not allow root="/" override unless explicit flag set in options.allow_root_override
-    root = paths.get("root", "/")
-    if root != "/" and root in ("/", ""):
-        issues.append("Invalid root path")
-    # prevent accidental dangerous root targets
-    if root == "/":
-        if not cfg.get("options", {}).get("allow_root_install", False):
-            # not fatal but warn
-            issues.append("root is '/' — ensure you know what you're doing (set options.allow_root_install=True to confirm)")
-
-    # ports_dir must exist
-    ports_dir = paths.get("ports_dir")
-    if ports_dir and not os.path.isdir(ports_dir):
-        issues.append(f"ports_dir {ports_dir} does not exist")
-
-    # check jobs
-    jobs = cfg.get("options", {}).get("jobs", 1)
+# logger fallback
+if logger_mod and hasattr(logger_mod, "get_logger"):
+    log = logger_mod.get_logger("config")
     try:
-        jobs = int(jobs)
-        if jobs <= 0:
-            issues.append("jobs must be > 0")
+        log_event = logger_mod.log_event
     except Exception:
-        issues.append("jobs must be integer")
+        def log_event(*a, **k): pass
+else:
+    import logging as _logging
+    _logging.basicConfig(level=_logging.INFO)
+    log = _logging.getLogger("zeropkg.config")
+    def log_event(*a, **k):
+        pass
 
-    ok = len(issues) == 0
-    if not ok:
-        _logger.warning("Config validation issues: " + "; ".join(issues))
-    return ok, issues
+# default locations (can be overridden by config file or env)
+DEFAULT_SYS_CONFIG = Path("/etc/zeropkg/config.toml")
+DEFAULT_USER_CONFIG = Path.home() / ".config" / "zeropkg" / "config.toml"
+DEFAULT_PORTS_DIR = Path("/usr/ports")
+DEFAULT_DISTFILES_DIR = DEFAULT_PORTS_DIR / "distfiles"
+DEFAULT_CACHE = Path("/var/cache/zeropkg")
+DEFAULT_STATE = Path("/var/lib/zeropkg")
+DEFAULT_LOGDIR = Path("/var/log/zeropkg")
+DEFAULT_DB = DEFAULT_STATE / "zeropkg.db"
+CACHE_CONFIG_JSON = DEFAULT_STATE / "config.cache.json"
 
+# default config skeleton
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "paths": {
+        "ports_dir": str(DEFAULT_PORTS_DIR),
+        "distfiles_dir": str(DEFAULT_DISTFILES_DIR),
+        "cache_dir": str(DEFAULT_CACHE),
+        "state_dir": str(DEFAULT_STATE),
+        "log_dir": str(DEFAULT_LOGDIR),
+        "db_path": str(DEFAULT_DB),
+    },
+    "repos": {
+        "roots": [str(DEFAULT_PORTS_DIR)]
+    },
+    "security": {
+        "gpg_required": False,
+        "sandbox_builds": True,
+        "verify_signatures_on_fetch": False
+    },
+    "cli": {
+        "default_jobs": 4,
+        "prompt_confirm": True
+    },
+    "profiles": {
+        "default": {"jobs": 4, "fakeroot": True, "parallel_install": True},
+        "minimal": {"jobs": 1, "fakeroot": False, "parallel_install": False}
+    },
+    "vuln": {
+        "sources": []
+    }
+}
 
-# ---------------------------
-# Apply CLI overrides (safe)
-# ---------------------------
-def apply_cli_overrides(cfg: Dict[str, Any], args: Any) -> Dict[str, Any]:
-    """
-    Apply CLI flags to the loaded config in a controlled manner.
-    Supported overrides:
-      --root -> paths.root
-      --ports-dir -> paths.ports_dir
-      --cache-dir -> paths.cache_dir
-      --build-root -> paths.build_root
-      --db-path -> paths.db_path
-      --jobs -> options.jobs
-      --fakeroot/--no-fakeroot -> options.fakeroot
-      --chroot-enabled/--no-chroot -> options.chroot_enabled
-      --repo -> additional repo path to be added to repos (non-destructive)
-    Returns new merged config dict.
-    """
-    cfg = dict(cfg)  # shallow copy
-    paths = dict(cfg.get("paths", {}))
-    options = dict(cfg.get("options", {}))
-    # mapping of common CLI attributes (some may not exist on args)
-    if hasattr(args, "root") and getattr(args, "root", None):
-        new_root = _safe_path(getattr(args, "root"))
-        if new_root and new_root != "/":
-            # prevent accidental setting of critical root to host root unless explicit confirmation
-            if new_root == "/" and not options.get("allow_root_install"):
-                raise ValueError("Refusing to override root to '/' via CLI unless allow_root_install is True in config")
-        paths["root"] = new_root or paths.get("root", "/")
-    if hasattr(args, "ports_dir") and getattr(args, "ports_dir", None):
-        paths["ports_dir"] = _safe_path(getattr(args, "ports_dir"))
-    if hasattr(args, "cache_dir") and getattr(args, "cache_dir", None):
-        paths["cache_dir"] = _safe_path(getattr(args, "cache_dir"))
-    if hasattr(args, "build_root") and getattr(args, "build_root", None):
-        paths["build_root"] = _safe_path(getattr(args, "build_root"))
-    if hasattr(args, "db_path") and getattr(args, "db_path", None):
-        paths["db_path"] = _safe_path(getattr(args, "db_path"))
-    if hasattr(args, "jobs") and getattr(args, "jobs", None) is not None:
-        try:
-            options["jobs"] = int(getattr(args, "jobs"))
-        except Exception:
-            pass
-    # boolean toggles
-    if hasattr(args, "fakeroot") and getattr(args, "fakeroot", None) is not None:
-        options["fakeroot"] = bool(getattr(args, "fakeroot"))
-    if hasattr(args, "chroot_enabled") and getattr(args, "chroot_enabled", None) is not None:
-        options["chroot_enabled"] = bool(getattr(args, "chroot_enabled"))
+# atomic write helper
+def _atomic_write_text(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
 
-    # add repo if provided
-    if hasattr(args, "repo") and getattr(args, "repo", None):
-        repo_path = _safe_path(getattr(args, "repo"))
-        if os.path.isdir(repo_path):
-            repos = list(cfg.get("repos", []) or [])
-            repos.append({"path": repo_path, "name": os.path.basename(repo_path)})
-            cfg["repos"] = repos
+# read cache if exists
+def _read_cache(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning("failed to read config cache %s: %s", path, e)
+    return None
 
-    cfg["paths"] = paths
-    cfg["options"] = options
-    # validate after override
-    validate_config(cfg)
-    return cfg
+# detect host distro
+def detect_host_distro() -> Dict[str, str]:
+    info = {}
+    try:
+        p = Path("/etc/os-release")
+        if p.exists():
+            for line in p.read_text(encoding="utf-8").splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    info[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return info
 
+# minimal toml loader if tomllib or toml available; else fallback to json (if user supplied)
+try:
+    import tomllib  # py3.11+
+    def _load_toml_text(path: Path) -> Dict[str, Any]:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+except Exception:
+    try:
+        import toml
+        def _load_toml_text(path: Path) -> Dict[str, Any]:
+            return toml.load(str(path))
+    except Exception:
+        def _load_toml_text(path: Path) -> Dict[str, Any]:
+            # last resort: try json (not ideal)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                raise RuntimeError("No toml support available; install 'toml' package")
 
-# ---------------------------
-# Ensure directories and basic environment
-# ---------------------------
-def ensure_dirs(cfg: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Create and validate directories used by Zeropkg.
-    This is idempotent and safe to call before running build/install.
-    """
-    if cfg is None:
-        cfg = load_config()
-    paths = cfg.get("paths", {})
-    required = [
-        paths.get("db_path"),
-        paths.get("ports_dir"),
-        paths.get("build_root"),
-        paths.get("cache_dir"),
-        paths.get("packages_dir"),
-    ]
-    for p in required:
-        if not p:
-            continue
-        d = Path(p)
-        # if path is a file (db_path), ensure parent
-        if "." in d.name and not d.is_dir():
-            d.parent.mkdir(parents=True, exist_ok=True)
+# merge deep util
+def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    for k, v in b.items():
+        if k in a and isinstance(a[k], dict) and isinstance(v, dict):
+            a[k] = _deep_merge(a[k], v)
         else:
-            d.mkdir(parents=True, exist_ok=True)
-    _logger.debug("ensure_dirs completed")
+            a[k] = v
+    return a
 
-
-# ---------------------------
-# Simple getters for convenience
-# ---------------------------
-def get_build_root(cfg: Optional[Dict[str, Any]] = None) -> str:
-    return (cfg or load_config())["paths"]["build_root"]
-
-def get_cache_dir(cfg: Optional[Dict[str, Any]] = None) -> str:
-    return (cfg or load_config())["paths"]["cache_dir"]
-
-def get_ports_dirs(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
-    cfg = cfg or load_config()
-    ports_dir = cfg["paths"]["ports_dir"]
-    # also include per-repo paths declared in cfg.repos
-    repos = cfg.get("repos", []) or []
-    extras = [r.get("path") for r in repos if r.get("path")]
-    return [ports_dir] + extras
-
-def get_db_path(cfg: Optional[Dict[str, Any]] = None) -> str:
-    return (cfg or load_config())["paths"]["db_path"]
-
-def get_packages_dir(cfg: Optional[Dict[str, Any]] = None) -> str:
-    return (cfg or load_config())["paths"]["packages_dir"]
-
-
-# ---------------------------
-# Reload support (manual or timestamp check)
-# ---------------------------
-def reload_config_if_changed(path: Optional[str] = None) -> bool:
+# validate repo path heuristics
+def _validate_ports_root(path: Path) -> Tuple[bool, str]:
     """
-    If any of the known config files have changed mtime, reload into cache and return True.
-    Otherwise return False.
+    Returns (ok, reason) — ok True means path looks like a ports tree (best-effort).
+    Checks minimal: exists, contains subdirs, has at least one .toml file or Makefile.in or distfiles dir.
     """
-    global _cached_config
-    with _config_lock:
-        # build candidate list similar to load_config
-        cfg = load_config(path)  # this will refresh and cache regardless
-        _cached_config = cfg
-        return True
+    if not path.exists():
+        return False, "missing"
+    if not path.is_dir():
+        return False, "not-a-dir"
+    # check typical structure quickly
+    try:
+        # distfiles subdir
+        dist = path / "distfiles"
+        if dist.exists() and dist.is_dir():
+            return True, "ok"
+        # find any .toml recursively up to depth 3
+        found = False
+        depth = 0
+        for p in path.iterdir():
+            if p.is_dir():
+                for f in p.rglob("*.toml"):
+                    found = True
+                    break
+            if found:
+                break
+        if found:
+            return True, "ok"
+        # check for Makefile at top-level
+        if any((path / n).exists() for n in ("Makefile", "mk")):
+            return True, "ok"
+    except Exception:
+        pass
+    return False, "structure-not-recognized"
 
+# permission check helper
+def _check_directory_perms(path: Path, want_writable: bool = True) -> Tuple[bool, str]:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # parent creation fail: continue to check existence
+        pass
+    if not path.exists():
+        return False, "missing"
+    if want_writable:
+        try:
+            testfile = path / ".zeropkg_write_test"
+            with open(testfile, "w", encoding="utf-8") as f:
+                f.write("x")
+            testfile.unlink(missing_ok=True)
+            return True, "ok"
+        except Exception:
+            return False, "not-writable"
+    else:
+        return True, "ok"
 
-# ---------------------------
-# Small CLI / debug entry
-# ---------------------------
-def _cli_main():
+# main ConfigManager
+class ConfigManager:
+    def __init__(self, sys_config: Optional[Path] = None, user_config: Optional[Path] = None):
+        self.sys_config = Path(sys_config) if sys_config else DEFAULT_SYS_CONFIG
+        self.user_config = Path(user_config) if user_config else DEFAULT_USER_CONFIG
+        self.cache_path = CACHE_CONFIG_JSON
+        self.config: Dict[str, Any] = {}
+        self.host_info = detect_host_distro()
+        self.loaded_from: List[Path] = []
+        # load on init
+        self.load()
+
+    def load(self, force_reload: bool = False):
+        """
+        Load config from:
+          1) cache (fast)
+          2) system config (/etc/zeropkg/config.toml)
+          3) user config (~/.config/zeropkg/config.toml)
+          4) env overrides (ZEROPKG_*)
+        Applies deep merges and stores final config in self.config.
+        """
+        # try cache
+        if not force_reload:
+            cached = _read_cache(self.cache_path)
+            if cached:
+                self.config = cached
+                log.info("config: loaded from cache %s", self.cache_path)
+                return self.config
+
+        cfg = {}
+        # start from default skeleton
+        cfg = _deep_merge({}, DEFAULT_CONFIG)
+
+        # load system config if exists
+        try:
+            if self.sys_config.exists():
+                log.info("loading system config: %s", self.sys_config)
+                loaded = _load_toml_text(self.sys_config)
+                cfg = _deep_merge(cfg, loaded or {})
+                self.loaded_from.append(self.sys_config)
+        except Exception as e:
+            log.warning("failed load sys config %s: %s", self.sys_config, e)
+
+        # load user config
+        try:
+            if self.user_config.exists():
+                log.info("loading user config: %s", self.user_config)
+                loaded = _load_toml_text(self.user_config)
+                cfg = _deep_merge(cfg, loaded or {})
+                self.loaded_from.append(self.user_config)
+        except Exception as e:
+            log.warning("failed load user config %s: %s", self.user_config, e)
+
+        # environment overrides: variables prefixed with ZEROPKG_
+        for k, v in os.environ.items():
+            if not k.startswith("ZEROPKG_"):
+                continue
+            # convert name ZEROPKG_PATHS_CACHE_DIR -> paths.cache_dir
+            key = k[len("ZEROPKG_"):].lower()
+            parts = key.split("__") if "__" in key else key.split("_")
+            d = cfg
+            for p in parts[:-1]:
+                if p not in d or not isinstance(d[p], dict):
+                    d[p] = {}
+                d = d[p]
+            d[parts[-1]] = v
+
+        # annotate with host info
+        cfg["_host"] = {"os_release": self.host_info}
+
+        # make sure mandatory paths are absolute and present
+        paths = cfg.get("paths", {})
+        # ensure types are str
+        for k in ("ports_dir", "distfiles_dir", "cache_dir", "state_dir", "log_dir", "db_path"):
+            if k not in paths:
+                paths[k] = str(DEFAULT_CONFIG["paths"][k])
+            else:
+                paths[k] = str(paths[k])
+        cfg["paths"] = paths
+
+        # normalize repos roots
+        repos = cfg.get("repos", {})
+        roots = repos.get("roots") or [paths["ports_dir"]]
+        # ensure absolute
+        roots_norm = []
+        for r in roots:
+            rp = str(r)
+            if not Path(rp).is_absolute():
+                rp = os.path.abspath(rp)
+            roots_norm.append(rp)
+        repos["roots"] = roots_norm
+        cfg["repos"] = repos
+
+        # apply defaults for security and profiles if missing
+        if "security" not in cfg:
+            cfg["security"] = DEFAULT_CONFIG["security"]
+        else:
+            for k,v in DEFAULT_CONFIG["security"].items():
+                cfg["security"].setdefault(k, v)
+
+        if "profiles" not in cfg:
+            cfg["profiles"] = DEFAULT_CONFIG["profiles"]
+        else:
+            # ensure default exists
+            if "default" not in cfg["profiles"]:
+                cfg["profiles"]["default"] = DEFAULT_CONFIG["profiles"]["default"]
+
+        # persist cache atomically
+        try:
+            txt = json.dumps(cfg, indent=2, ensure_ascii=False)
+            _atomic_write = _atomic_write_text
+            _atomic_write(self.cache_path, txt)
+        except Exception as e:
+            log.warning("failed to persist config cache: %s", e)
+
+        self.config = cfg
+        log.info("config loaded: %s (from %s)", self.cache_path, self.loaded_from or "defaults")
+        return self.config
+
+    def reload(self):
+        return self.load(force_reload=True)
+
+    # CLI override application (simple)
+    def apply_cli_overrides(self, args: Any):
+        """
+        args: argparse Namespace from CLI. Supports:
+          --config (path) pointer, --jobs/-j, --profile (profile name), --ports-dir, --cache-dir
+        """
+        if not args:
+            return
+        try:
+            if getattr(args, "config", None):
+                p = Path(args.config)
+                if p.exists():
+                    try:
+                        loaded = _load_toml_text(p)
+                        self.config = _deep_merge(self.config, loaded or {})
+                        log.info("applied CLI config override %s", p)
+                    except Exception as e:
+                        log.warning("failed to apply CLI config file %s: %s", p, e)
+            if getattr(args, "jobs", None):
+                self.config.setdefault("cli", {})["default_jobs"] = int(args.jobs)
+            if getattr(args, "profile", None):
+                prof = args.profile
+                if prof in self.config.get("profiles", {}):
+                    self.config["_active_profile"] = prof
+                else:
+                    log.warning("profile %s not found in config", prof)
+            if getattr(args, "ports_dir", None):
+                self.config["paths"]["ports_dir"] = str(args.ports_dir)
+                # update repos
+                roots = self.config.get("repos", {}).get("roots", [])
+                if str(args.ports_dir) not in roots:
+                    roots.insert(0, str(args.ports_dir))
+                    self.config["repos"]["roots"] = roots
+            if getattr(args, "cache_dir", None):
+                self.config["paths"]["cache_dir"] = str(args.cache_dir)
+        except Exception as e:
+            log.warning("apply_cli_overrides exception: %s", e)
+
+    # helpers
+    def get(self, *keys, default=None):
+        cfg = self.config
+        for k in keys:
+            if not cfg or k not in cfg:
+                return default
+            cfg = cfg[k]
+        return cfg
+
+    def get_ports_roots(self) -> List[Path]:
+        roots = self.config.get("repos", {}).get("roots", [])
+        return [Path(r) for r in roots]
+
+    def get_distfiles_dir(self) -> Path:
+        return Path(self.config["paths"].get("distfiles_dir", DEFAULT_DISTFILES_DIR))
+
+    def get_cache_dir(self) -> Path:
+        return Path(self.config["paths"].get("cache_dir", DEFAULT_CACHE))
+
+    def get_state_dir(self) -> Path:
+        return Path(self.config["paths"].get("state_dir", DEFAULT_STATE))
+
+    def get_log_dir(self) -> Path:
+        return Path(self.config["paths"].get("log_dir", DEFAULT_LOGDIR))
+
+    def get_db_path(self) -> Path:
+        return Path(self.config["paths"].get("db_path", DEFAULT_DB))
+
+    def ensure_dirs(self) -> Dict[str, Tuple[bool, str]]:
+        """
+        Create and check main directories; returns dict of checks
+        e.g. {"cache": (True,"ok"), "state": (False,"not-writable"), ...}
+        """
+        results: Dict[str, Tuple[bool, str]] = {}
+        checks = [
+            ("ports", Path(self.config["paths"].get("ports_dir"))),
+            ("distfiles", self.get_distfiles_dir()),
+            ("cache", self.get_cache_dir()),
+            ("state", self.get_state_dir()),
+            ("log", self.get_log_dir()),
+        ]
+        for name, path in checks:
+            ok, reason = _check_directory_perms(path, want_writable=(name != "ports"))
+            results[name] = (ok, reason)
+            if not ok:
+                log.warning("ensure_dirs: %s -> %s (%s)", name, path, reason)
+        return results
+
+    def validate_repos(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Validate each configured ports root and return a map:
+          { "/usr/ports": {"ok": True, "reason":"ok"}, ...}
+        """
+        roots = self.get_ports_roots()
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in roots:
+            ok, reason = _validate_ports_root(r)
+            out[str(r)] = {"ok": ok, "reason": reason}
+            if not ok:
+                log.warning("repo validation: %s -> %s", r, reason)
+        return out
+
+    def get_active_profile(self) -> Dict[str, Any]:
+        prof = self.config.get("_active_profile") or "default"
+        profiles = self.config.get("profiles", {})
+        return profiles.get(prof, profiles.get("default", {}))
+
+    def set_active_profile(self, name: str) -> bool:
+        if name in self.config.get("profiles", {}):
+            self.config["_active_profile"] = name
+            return True
+        return False
+
+    def security_settings(self) -> Dict[str, Any]:
+        return self.config.get("security", DEFAULT_CONFIG["security"])
+
+    def summary(self) -> Dict[str, Any]:
+        s = {
+            "loaded_from": [str(p) for p in self.loaded_from],
+            "ports_roots": [str(p) for p in self.get_ports_roots()],
+            "distfiles_dir": str(self.get_distfiles_dir()),
+            "cache_dir": str(self.get_cache_dir()),
+            "state_dir": str(self.get_state_dir()),
+            "log_dir": str(self.get_log_dir()),
+            "db_path": str(self.get_db_path()),
+            "profiles": list(self.config.get("profiles", {}).keys()),
+            "active_profile": self.config.get("_active_profile", "default"),
+            "security": self.security_settings()
+        }
+        return s
+
+# single instance convenience
+_DEFAULT_MANAGER: Optional[ConfigManager] = None
+
+def get_config_manager(force_reload: bool = False) -> ConfigManager:
+    global _DEFAULT_MANAGER
+    if _DEFAULT_MANAGER is None or force_reload:
+        _DEFAULT_MANAGER = ConfigManager()
+    if force_reload:
+        _DEFAULT_MANAGER.reload()
+    return _DEFAULT_MANAGER
+
+# immediate ensure of directories (best-effort)
+if __name__ != "__main__":
+    try:
+        mgr = get_config_manager()
+        mgr.ensure_dirs()
+    except Exception:
+        pass
+
+# simple CLI for config inspection
+def _cli():
     import argparse
-    p = argparse.ArgumentParser(prog="zeropkg-config", description="Debug helper for zeropkg_config")
-    p.add_argument("--path", help="Specific config file to load")
-    p.add_argument("--print", action="store_true", help="Print merged config")
-    p.add_argument("--ensure-dirs", action="store_true", help="Ensure directories exist")
+    p = argparse.ArgumentParser(prog="zeropkg-config", description="Zeropkg configuration inspector")
+    p.add_argument("--reload", action="store_true", help="Reload config from files (ignore cache)")
+    p.add_argument("--profile", help="Set active profile (temporary)")
+    p.add_argument("--show", action="store_true", help="Print final merged config as JSON")
+    p.add_argument("--validate-repos", action="store_true", help="Validate ports roots and print results")
     args = p.parse_args()
-    cfg = load_config(args.path)
-    if args.print:
-        import json
-        print(json.dumps(cfg, indent=2))
-    if args.ensure_dirs:
-        ensure_dirs(cfg)
-    print("Done.")
+    mgr = get_config_manager(force_reload=args.reload)
+    if args.profile:
+        ok = mgr.set_active_profile(args.profile)
+        print("profile set->", ok)
+    if args.show:
+        print(json.dumps(mgr.config, indent=2, ensure_ascii=False))
+    if args.validate_repos:
+        vr = mgr.validate_repos()
+        print(json.dumps(vr, indent=2, ensure_ascii=False))
 
-
-# ---------------------------
-# Module quick test
-# ---------------------------
 if __name__ == "__main__":
-    _cli_main()
+    _cli()
